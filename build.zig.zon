@@ -1,0 +1,16 @@
+.{
+    .name = .flo,
+    .version = "0.1.0",
+    .fingerprint = 0xa75e36e29f89071e,
+    .minimum_zig_version = "0.15.0",
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+    },
+}
