@@ -102,15 +102,40 @@ pub const ActionContext = struct {
     pub fn touch(self: *ActionContext, extend_ms: u32) !void {
         try self.actions.touch(
             self.worker_id,
+            self.action_name,
             self.task_id,
             .{ .namespace = self.namespace, .extend_ms = extend_ms },
         );
     }
+
+    /// Create an ActionResult with a named outcome.
+    /// The value is serialized to JSON bytes. Caller owns the returned data.
+    pub fn result(self: *ActionContext, outcome: []const u8, value: anytype) !types.ActionResult {
+        const data = try self.toBytes(value);
+        return types.ActionResult{
+            .outcome = outcome,
+            .data = data,
+            .owned = true,
+        };
+    }
+};
+
+/// Error set for non-retryable action failures.
+/// When a handler returns `error.NonRetryable`, the task is failed with retry=false.
+pub const NonRetryableError = error{NonRetryable};
+
+/// Result type for action handlers.
+pub const ActionHandlerResult = union(enum) {
+    /// Raw result bytes (outcome defaults to "success")
+    bytes: []const u8,
+    /// Result with named outcome for workflow routing
+    result: types.ActionResult,
 };
 
 /// Action handler function type.
-/// Returns the result bytes on success, or an error.
-pub const ActionHandler = *const fn (*ActionContext) anyerror![]const u8;
+/// Returns bytes or ActionResult on success, or an error.
+/// Return error.NonRetryable to fail without retry.
+pub const ActionHandler = *const fn (*ActionContext) anyerror!ActionHandlerResult;
 
 /// High-level worker for executing actions.
 /// Includes automatic heartbeat, drain support, and graceful deregistration.
@@ -348,6 +373,7 @@ pub const ActionWorker = struct {
             std.log.err("[flo-worker] No handler for action: {s}", .{task.task_type});
             self.actions.fail(
                 self.worker_id,
+                task.task_type,
                 task.task_id,
                 "No handler registered",
                 .{ .namespace = self.config.namespace },
@@ -369,34 +395,58 @@ pub const ActionWorker = struct {
         };
 
         // Execute handler
-        if (handler(&ctx)) |result| {
-            defer self.allocator.free(result);
+        if (handler(&ctx)) |handler_result| {
+            switch (handler_result) {
+                .bytes => |data| {
+                    defer self.allocator.free(data);
 
-            // Success - complete the task
-            self.actions.complete(
-                self.worker_id,
-                task.task_id,
-                result,
-                .{ .namespace = self.config.namespace },
-            ) catch |err| {
-                std.log.err("[flo-worker] Failed to report completion: {}", .{err});
-            };
+                    // Raw bytes — complete with default outcome
+                    self.actions.complete(
+                        self.worker_id,
+                        task.task_type,
+                        task.task_id,
+                        data,
+                        .{ .namespace = self.config.namespace },
+                    ) catch |err| {
+                        std.log.err("[flo-worker] Failed to report completion: {}", .{err});
+                    };
+                },
+                .result => |ar| {
+                    if (ar.owned) {
+                        defer self.allocator.free(ar.data);
+                    }
+
+                    // Named outcome
+                    self.actions.complete(
+                        self.worker_id,
+                        task.task_type,
+                        task.task_id,
+                        ar.data,
+                        .{ .namespace = self.config.namespace, .outcome = ar.outcome },
+                    ) catch |err| {
+                        std.log.err("[flo-worker] Failed to report completion: {}", .{err});
+                    };
+                },
+            }
 
             std.log.info("[flo-worker] Action completed: {s}", .{task.task_type});
         } else |err| {
-            // Failure
+            // Failure — check if non-retryable
             var error_buf: [256]u8 = undefined;
             const error_msg = std.fmt.bufPrint(&error_buf, "{}", .{err}) catch "Unknown error";
+
+            const retry = err != error.NonRetryable;
 
             std.log.err("[flo-worker] Action failed: {s} - {s}", .{ task.task_type, error_msg });
 
             self.actions.fail(
                 self.worker_id,
+                task.task_type,
                 task.task_id,
                 error_msg,
                 .{
                     .namespace = self.config.namespace,
-                    .retry = true,
+                    .retry = retry,
                 },
             ) catch |fail_err| {
                 std.log.err("[flo-worker] Failed to report failure: {}", .{fail_err});

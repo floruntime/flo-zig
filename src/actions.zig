@@ -31,10 +31,6 @@ pub const Actions = struct {
     // =========================================================================
 
     /// Register an action (task type) that workers can process.
-    /// Wire format: [action_type:u8][timeout_ms:u32][max_retries:u32]
-    ///              [has_desc:u8][desc_len:u16]?[desc]?
-    ///              [has_wasm_module:u8]...[has_wasm_entrypoint:u8]...[has_wasm_memory_limit:u8]...
-    ///              [has_trigger_stream:u8][has_trigger_group:u8]
     pub fn registerAction(
         self: *Self,
         action_name: []const u8,
@@ -488,20 +484,35 @@ pub const Actions = struct {
     pub fn complete(
         self: *Self,
         worker_id: []const u8,
+        action_name: []const u8,
         task_id: []const u8,
         result_data: []const u8,
         options: types.WorkerCompleteOptions,
     ) FloError!void {
         const ns = self.client.getNamespace(options.namespace);
 
-        // Wire format: [task_id_len:u16][task_id][result...]
+        // Wire format: [action_name_len:u16][action_name][task_id_len:u16][task_id][outcome_len:u16][outcome][result_len:u16][result]
         var value_buf: [8192]u8 = undefined;
         var offset: usize = 0;
+
+        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(action_name.len), .little);
+        offset += 2;
+        @memcpy(value_buf[offset..][0..action_name.len], action_name);
+        offset += action_name.len;
 
         std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(task_id.len), .little);
         offset += 2;
         @memcpy(value_buf[offset..][0..task_id.len], task_id);
         offset += task_id.len;
+
+        const outcome = options.outcome;
+        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(outcome.len), .little);
+        offset += 2;
+        @memcpy(value_buf[offset..][0..outcome.len], outcome);
+        offset += outcome.len;
+
+        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(result_data.len), .little);
+        offset += 2;
         @memcpy(value_buf[offset..][0..result_data.len], result_data);
         offset += result_data.len;
 
@@ -523,27 +534,30 @@ pub const Actions = struct {
     pub fn fail(
         self: *Self,
         worker_id: []const u8,
+        action_name: []const u8,
         task_id: []const u8,
         error_message: []const u8,
         options: types.WorkerFailOptions,
     ) FloError!void {
         const ns = self.client.getNamespace(options.namespace);
 
-        var opts_buf: [8]u8 = undefined;
-        var builder = wire.OptionsBuilder.init(&opts_buf);
-
-        if (options.retry) {
-            try builder.addU8(.retry, 1);
-        }
-
-        // Wire format: [task_id_len:u16][task_id][error_message...]
+        // Wire format: [action_name_len:u16][action_name][task_id_len:u16][task_id][retry:u8][error_message...]
         var value_buf: [4096]u8 = undefined;
         var offset: usize = 0;
+
+        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(action_name.len), .little);
+        offset += 2;
+        @memcpy(value_buf[offset..][0..action_name.len], action_name);
+        offset += action_name.len;
 
         std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(task_id.len), .little);
         offset += 2;
         @memcpy(value_buf[offset..][0..task_id.len], task_id);
         offset += task_id.len;
+
+        value_buf[offset] = if (options.retry) 1 else 0;
+        offset += 1;
+
         @memcpy(value_buf[offset..][0..error_message.len], error_message);
         offset += error_message.len;
 
@@ -552,7 +566,7 @@ pub const Actions = struct {
             ns,
             worker_id,
             value_buf[0..offset],
-            builder.getOptions(),
+            "",
         );
         defer response.deinit();
 
@@ -565,16 +579,22 @@ pub const Actions = struct {
     pub fn touch(
         self: *Self,
         worker_id: []const u8,
+        action_name: []const u8,
         task_id: []const u8,
         options: types.WorkerTouchOptions,
     ) FloError!void {
         const ns = self.client.getNamespace(options.namespace);
 
-        // Wire format: [task_id_len:u16][task_id][extend_ms:u32]
+        // Wire format: [action_name_len:u16][action_name][task_id_len:u16][task_id][extend_ms:u32]
         const extend_ms: u32 = options.extend_ms orelse 30000;
 
         var value_buf: [512]u8 = undefined;
         var offset: usize = 0;
+
+        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(action_name.len), .little);
+        offset += 2;
+        @memcpy(value_buf[offset..][0..action_name.len], action_name);
+        offset += action_name.len;
 
         std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(task_id.len), .little);
         offset += 2;

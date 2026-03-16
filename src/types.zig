@@ -623,8 +623,8 @@ pub const StreamAppendResult = struct {
 
 /// Stream info/metadata
 pub const StreamInfo = struct {
-    first_id: StreamID = .{},
-    last_id: StreamID = .{},
+    first_seq: u64,
+    last_seq: u64,
     count: u64,
     bytes: u64,
     partition_count: u32 = 1,
@@ -897,6 +897,8 @@ pub const WorkerAwaitOptions = struct {
 pub const WorkerCompleteOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+    /// Named outcome for workflow routing (default: "success")
+    outcome: []const u8 = "success",
 };
 
 /// Options for worker fail task
@@ -913,4 +915,104 @@ pub const WorkerTouchOptions = struct {
     namespace: ?[]const u8 = null,
     /// Lease extension time in ms
     extend_ms: ?u32 = null,
+};
+
+// =============================================================================
+// Action Result
+// =============================================================================
+
+/// Result of an action handler with optional named outcome.
+/// Return this from an action handler to route workflows by outcome.
+pub const ActionResult = struct {
+    /// Named outcome for workflow routing (e.g. "approved", "rejected")
+    outcome: []const u8,
+    /// Result data bytes
+    data: []const u8,
+    /// Whether `data` was allocated and should be freed
+    owned: bool = false,
+};
+
+// =============================================================================
+// Workflow Types
+// =============================================================================
+
+pub const WorkflowCreateOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const WorkflowGetDefinitionOptions = struct {
+    namespace: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+};
+
+pub const WorkflowStartOptions = struct {
+    namespace: ?[]const u8 = null,
+    idempotency_key: ?[]const u8 = null,
+    run_id: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+};
+
+pub const WorkflowStatusOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const WorkflowStatusResult = struct {
+    run_id: []const u8,
+    workflow: []const u8,
+    version: []const u8,
+    status: []const u8,
+    current_step: []const u8,
+    input: []const u8,
+    created_at: i64,
+    started_at: ?i64 = null,
+    completed_at: ?i64 = null,
+    wait_signal: ?[]const u8 = null,
+
+    /// Free all allocated fields.
+    pub fn deinit(self: *const WorkflowStatusResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.run_id);
+        allocator.free(self.workflow);
+        allocator.free(self.version);
+        allocator.free(self.status);
+        allocator.free(self.current_step);
+        allocator.free(self.input);
+        if (self.wait_signal) |ws| allocator.free(ws);
+    }
+};
+
+pub const WorkflowSignalOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const WorkflowCancelOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const WorkflowHistoryOptions = struct {
+    namespace: ?[]const u8 = null,
+    limit: u32 = 100,
+};
+
+pub const WorkflowListRunsOptions = struct {
+    namespace: ?[]const u8 = null,
+    workflow_name: ?[]const u8 = null,
+    status_filter: ?[]const u8 = null,
+    limit: u32 = 100,
+};
+
+pub const WorkflowListDefinitionsOptions = struct {
+    namespace: ?[]const u8 = null,
+    limit: u32 = 100,
+};
+
+pub const WorkflowDisableOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const WorkflowEnableOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const WorkflowSyncOptions = struct {
+    namespace: ?[]const u8 = null,
 };

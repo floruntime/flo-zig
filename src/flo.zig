@@ -46,6 +46,9 @@ pub const Stream = @import("stream.zig").Stream;
 // Low-level Actions API
 pub const Actions = @import("actions.zig").Actions;
 
+// Workflow API
+pub const Workflow = @import("workflow.zig").Workflow;
+
 // High-level Worker API
 const worker_mod = @import("worker.zig");
 pub const ActionWorker = worker_mod.ActionWorker;
@@ -53,6 +56,8 @@ pub const Worker = worker_mod.Worker; // backwards-compatible alias
 pub const WorkerConfig = worker_mod.WorkerConfig;
 pub const ActionContext = worker_mod.ActionContext;
 pub const ActionHandler = worker_mod.ActionHandler;
+pub const ActionHandlerResult = worker_mod.ActionHandlerResult;
+pub const NonRetryableError = worker_mod.NonRetryableError;
 
 // High-level Stream Worker API
 const stream_worker_mod = @import("stream_worker.zig");
@@ -86,6 +91,7 @@ pub const WorkerType = types.WorkerType;
 pub const WorkerStatus = types.WorkerStatus;
 pub const ProcessKind = types.ProcessKind;
 pub const ProcessEntry = types.ProcessEntry;
+pub const ActionResult = types.ActionResult;
 
 // Option types - KV
 pub const PutOptions = types.PutOptions;
@@ -121,6 +127,21 @@ pub const WorkerTouchOptions = types.WorkerTouchOptions;
 pub const WorkerHeartbeatOptions = types.WorkerHeartbeatOptions;
 pub const WorkerDeregisterOptions = types.WorkerDeregisterOptions;
 pub const WorkerDrainOptions = types.WorkerDrainOptions;
+
+// Option types - Workflow
+pub const WorkflowCreateOptions = types.WorkflowCreateOptions;
+pub const WorkflowGetDefinitionOptions = types.WorkflowGetDefinitionOptions;
+pub const WorkflowStartOptions = types.WorkflowStartOptions;
+pub const WorkflowStatusOptions = types.WorkflowStatusOptions;
+pub const WorkflowStatusResult = types.WorkflowStatusResult;
+pub const WorkflowSignalOptions = types.WorkflowSignalOptions;
+pub const WorkflowCancelOptions = types.WorkflowCancelOptions;
+pub const WorkflowHistoryOptions = types.WorkflowHistoryOptions;
+pub const WorkflowListRunsOptions = types.WorkflowListRunsOptions;
+pub const WorkflowListDefinitionsOptions = types.WorkflowListDefinitionsOptions;
+pub const WorkflowDisableOptions = types.WorkflowDisableOptions;
+pub const WorkflowEnableOptions = types.WorkflowEnableOptions;
+pub const WorkflowSyncOptions = types.WorkflowSyncOptions;
 
 // Protocol constants
 pub const MAGIC = types.MAGIC;

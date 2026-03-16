@@ -39,7 +39,7 @@ const NotificationRequest = struct {
 // =============================================================================
 
 /// Process an order - demonstrates long-running tasks with Touch.
-fn processOrder(ctx: *flo.ActionContext) anyerror![]const u8 {
+fn processOrder(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
     // Parse input
     const parsed = try ctx.json(OrderRequest);
     defer parsed.deinit();
@@ -81,11 +81,11 @@ fn processOrder(ctx: *flo.ActionContext) anyerror![]const u8 {
         .processed_by = ctx.task_id,
     };
 
-    return ctx.toBytes(result);
+    return .{ .bytes = try ctx.toBytes(result) };
 }
 
 /// Send a notification - demonstrates simple action.
-fn sendNotification(ctx: *flo.ActionContext) anyerror![]const u8 {
+fn sendNotification(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
     const parsed = try ctx.json(NotificationRequest);
     defer parsed.deinit();
     const req = parsed.value;
@@ -105,11 +105,11 @@ fn sendNotification(ctx: *flo.ActionContext) anyerror![]const u8 {
         .user_id = req.user_id,
     };
 
-    return ctx.toBytes(result);
+    return .{ .bytes = try ctx.toBytes(result) };
 }
 
 /// Generate a report - demonstrates context usage.
-fn generateReport(ctx: *flo.ActionContext) anyerror![]const u8 {
+fn generateReport(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
     const ReportRequest = struct {
         type: []const u8 = "summary",
         date_range: []const u8 = "last_7_days",
@@ -146,18 +146,18 @@ fn generateReport(ctx: *flo.ActionContext) anyerror![]const u8 {
         .rows = @as(u32, 1500),
     };
 
-    return ctx.toBytes(result);
+    return .{ .bytes = try ctx.toBytes(result) };
 }
 
 /// Simple health check action.
-fn healthCheck(ctx: *flo.ActionContext) anyerror![]const u8 {
+fn healthCheck(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
     const result = .{
         .status = "healthy",
         .worker_id = ctx.task_id,
         .timestamp = ctx.created_at,
     };
 
-    return ctx.toBytes(result);
+    return .{ .bytes = try ctx.toBytes(result) };
 }
 
 // =============================================================================
