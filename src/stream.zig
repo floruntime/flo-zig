@@ -500,12 +500,14 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
         const key_present = data[pos];
         pos += 1;
 
-        // Skip key if present
+        // Read key (stream name) if present
+        var stream_name: []const u8 = "";
         if (key_present != 0) {
             if (pos + 4 > data.len) return FloError.IncompleteResponse;
             const key_len = std.mem.readInt(u32, data[pos..][0..4], .little);
             pos += 4;
             if (pos + key_len > data.len) return FloError.IncompleteResponse;
+            stream_name = allocator.dupe(u8, data[pos..][0..key_len]) catch return FloError.OutOfMemory;
             pos += key_len;
         }
 
@@ -518,12 +520,48 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
         const payload = allocator.dupe(u8, data[pos..][0..payload_len]) catch return FloError.OutOfMemory;
         pos += payload_len;
 
-        // Skip header_count (TODO: parse headers)
+        // Read headers: [header_count:u32]([key_len:u32][key][val_len:u32][val])*
         if (pos + 4 > data.len) {
             allocator.free(payload);
             return FloError.IncompleteResponse;
         }
+        const header_count = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
+
+        var headers: ?[]const u8 = null;
+        if (header_count > 0) {
+            // Capture raw header bytes for zero-copy access
+            const headers_start = pos;
+            var h: u32 = 0;
+            while (h < header_count) : (h += 1) {
+                if (pos + 4 > data.len) {
+                    allocator.free(payload);
+                    return FloError.IncompleteResponse;
+                }
+                const hkey_len = std.mem.readInt(u32, data[pos..][0..4], .little);
+                pos += 4;
+                if (pos + hkey_len > data.len) {
+                    allocator.free(payload);
+                    return FloError.IncompleteResponse;
+                }
+                pos += hkey_len;
+                if (pos + 4 > data.len) {
+                    allocator.free(payload);
+                    return FloError.IncompleteResponse;
+                }
+                const hval_len = std.mem.readInt(u32, data[pos..][0..4], .little);
+                pos += 4;
+                if (pos + hval_len > data.len) {
+                    allocator.free(payload);
+                    return FloError.IncompleteResponse;
+                }
+                pos += hval_len;
+            }
+            headers = allocator.dupe(u8, data[headers_start..pos]) catch {
+                allocator.free(payload);
+                return FloError.OutOfMemory;
+            };
+        }
 
         records[i] = .{
             .id = .{
@@ -531,8 +569,9 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
                 .sequence = sequence,
             },
             .tier = tier,
+            .stream = stream_name,
             .payload = payload,
-            .headers = null,
+            .headers = headers,
         };
     }
 

@@ -16,208 +16,209 @@ pub const MAX_KEY_SIZE: usize = 64 * 1024; // 64 KB
 pub const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024; // 16 MB practical limit
 
 /// Operation codes
-pub const OpCode = enum(u8) {
-    // System Operations (0x00 - 0x0F)
-    ping = 0x00,
-    pong = 0x01,
-    error_response = 0x02,
-    auth = 0x03,
-    set_durability = 0x04,
-    ok = 0x05,
+///
+/// Three-layer layout: Infra(0x000-0x0FF), Data(0x100-0x2FF), Compute(0x300-0x3FF)
+pub const OpCode = enum(u16) {
+    // ── System (0x000 – 0x00F) ──
+    ping = 0x000,
+    pong = 0x001,
+    error_response = 0x002,
+    auth = 0x003,
+    set_durability = 0x004,
+    ok = 0x005,
 
-    // Streams (0x10 - 0x1F)
-    stream_append = 0x10,
-    stream_read = 0x11,
-    stream_trim = 0x12,
-    stream_info = 0x13,
-    stream_append_response = 0x14,
-    stream_read_response = 0x15,
-    stream_event = 0x16, // Server-push for subscriptions
-    stream_subscribe = 0x17, // Subscribe to stream (WebSocket continuous push)
-    stream_unsubscribe = 0x18, // Unsubscribe from stream
-    stream_subscribed = 0x19, // Response: subscription confirmed
-    stream_unsubscribed = 0x1A, // Response: unsubscription confirmed
-    stream_list = 0x1B, // List all streams in namespace
-    stream_list_response = 0x1C,
-    stream_create = 0x1D, // Create stream with partition count
-    stream_create_response = 0x1E,
-    stream_alter = 0x1F, // Alter stream configuration (retention policy)
+    // ── Namespace (0x010 – 0x02F) ──
+    namespace_create = 0x010,
+    namespace_delete = 0x011,
+    namespace_list = 0x012,
+    namespace_info = 0x013,
+    namespace_config_set = 0x014,
+    namespace_config_get = 0x015,
+    namespace_create_response = 0x020,
+    namespace_delete_response = 0x021,
+    namespace_list_response = 0x022,
+    namespace_info_response = 0x023,
+    namespace_config_set_response = 0x024,
+    namespace_config_get_response = 0x025,
 
-    // Stream Consumer Groups (0x20 - 0x2F)
-    stream_group_create = 0x20, // Create consumer group with configuration
-    stream_group_join = 0x21,
-    stream_group_leave = 0x22,
-    stream_group_read = 0x23,
-    stream_group_ack = 0x24,
-    stream_group_claim = 0x25,
-    stream_group_pending = 0x26,
-    stream_group_configure_sweeper = 0x27,
-    stream_group_read_response = 0x28,
-    stream_group_nack = 0x29,
-    stream_group_touch = 0x2A, // Extend ack deadline for pending messages
-    stream_group_info = 0x2B, // Get consumer group info (config + consumers)
-    stream_group_delete = 0x2C, // Delete consumer group
+    // ── Cluster (0x030 – 0x04F) ──
+    cluster_status = 0x030,
+    cluster_members = 0x031,
+    cluster_join = 0x032,
+    cluster_leave = 0x033,
+    cluster_transfer_leader = 0x034,
+    cluster_add_node = 0x035,
+    cluster_remove_node = 0x036,
+    cluster_status_response = 0x040,
+    cluster_members_response = 0x041,
+    cluster_join_response = 0x042,
 
-    // KV Operations (0x30 - 0x3F)
-    kv_put = 0x30,
-    kv_get = 0x31,
-    kv_delete = 0x32,
-    kv_scan = 0x33,
-    kv_history = 0x34,
-    kv_get_response = 0x35,
-    kv_put_response = 0x36,
-    kv_scan_response = 0x37,
-    kv_history_response = 0x38,
+    // ── KV + Transactions + Snapshots (0x100 – 0x12F) ──
+    kv_put = 0x100,
+    kv_get = 0x101,
+    kv_mget = 0x102,
+    kv_delete = 0x103,
+    kv_scan = 0x104,
+    kv_history = 0x105,
+    kv_get_response = 0x106,
+    kv_mget_response = 0x107,
+    kv_put_response = 0x108,
+    kv_scan_response = 0x109,
+    kv_history_response = 0x10A,
+    kv_begin_txn = 0x110,
+    kv_commit_txn = 0x111,
+    kv_rollback_txn = 0x112,
+    kv_snapshot_create = 0x120,
+    kv_snapshot_get = 0x121,
+    kv_snapshot_release = 0x122,
+    kv_snapshot_create_response = 0x123,
 
-    // Transactions (0x39 - 0x3B)
-    kv_begin_txn = 0x39,
-    kv_commit_txn = 0x3A,
-    kv_rollback_txn = 0x3B,
+    // ── Streams (0x130 – 0x14F) ──
+    stream_append = 0x130,
+    stream_read = 0x131,
+    stream_trim = 0x132,
+    stream_info = 0x133,
+    stream_append_response = 0x134,
+    stream_read_response = 0x135,
+    stream_event = 0x136,
+    stream_subscribe = 0x137,
+    stream_unsubscribe = 0x138,
+    stream_subscribed = 0x139,
+    stream_unsubscribed = 0x13A,
+    stream_list = 0x13B,
+    stream_list_response = 0x13C,
+    stream_create = 0x13D,
+    stream_create_response = 0x13E,
+    stream_alter = 0x13F,
 
-    // Snapshots (0x3C - 0x3F)
-    kv_snapshot_create = 0x3C,
-    kv_snapshot_get = 0x3D,
-    kv_snapshot_release = 0x3E,
-    kv_snapshot_create_response = 0x3F,
+    // ── Stream Consumer Groups (0x150 – 0x16F) ──
+    stream_group_create = 0x150,
+    stream_group_join = 0x151,
+    stream_group_leave = 0x152,
+    stream_group_read = 0x153,
+    stream_group_ack = 0x154,
+    stream_group_claim = 0x155,
+    stream_group_pending = 0x156,
+    stream_group_configure_sweeper = 0x157,
+    stream_group_read_response = 0x158,
+    stream_group_nack = 0x159,
+    stream_group_touch = 0x15A,
+    stream_group_info = 0x15B,
+    stream_group_delete = 0x15C,
 
-    // Queues (0x40 - 0x5F)
-    queue_enqueue = 0x40,
-    queue_dequeue = 0x41,
-    queue_complete = 0x42,
-    queue_extend_lease = 0x43,
-    queue_fail = 0x44,
-    queue_fail_auto = 0x45,
-    queue_dlq_list = 0x46,
-    queue_dlq_delete = 0x47,
-    queue_dlq_requeue = 0x48,
-    queue_dlq_stats = 0x49,
-    queue_promote_due = 0x4A,
-    queue_stats = 0x4B,
-    queue_peek = 0x4C,
-    queue_touch = 0x4D,
-    queue_batch_enqueue = 0x4E,
-    queue_purge = 0x4F,
+    // ── Queues (0x170 – 0x19F) ──
+    queue_enqueue = 0x170,
+    queue_dequeue = 0x171,
+    queue_complete = 0x172,
+    queue_extend_lease = 0x173,
+    queue_fail = 0x174,
+    queue_fail_auto = 0x175,
+    queue_dlq_list = 0x176,
+    queue_dlq_delete = 0x177,
+    queue_dlq_requeue = 0x178,
+    queue_dlq_stats = 0x179,
+    queue_promote_due = 0x17A,
+    queue_stats = 0x17B,
+    queue_peek = 0x17C,
+    queue_touch = 0x17D,
+    queue_batch_enqueue = 0x17E,
+    queue_purge = 0x17F,
+    queue_enqueue_response = 0x190,
+    queue_dequeue_response = 0x191,
+    queue_dlq_list_response = 0x192,
+    queue_stats_response = 0x193,
+    queue_peek_response = 0x194,
+    queue_touch_response = 0x195,
+    queue_batch_enqueue_response = 0x196,
+    queue_purge_response = 0x197,
+    queue_list = 0x198,
+    queue_list_response = 0x199,
 
-    // Queue responses (0x50 - 0x5F)
-    queue_enqueue_response = 0x50,
-    queue_dequeue_response = 0x51,
-    queue_dlq_list_response = 0x52,
-    queue_stats_response = 0x53,
-    queue_peek_response = 0x54,
-    queue_touch_response = 0x55,
-    queue_batch_enqueue_response = 0x56,
-    queue_purge_response = 0x57,
-    queue_list = 0x58, // List all queues in namespace
-    queue_list_response = 0x59,
+    // ── Time-Series (0x1A0 – 0x1BF) ──
+    ts_write = 0x1A0,
+    ts_read = 0x1A1,
+    ts_query = 0x1A2,
+    ts_floql = 0x1A3,
+    ts_list = 0x1A4,
+    ts_delete = 0x1A5,
+    ts_retention = 0x1A6,
+    ts_write_response = 0x1A7,
+    ts_read_response = 0x1A8,
+    ts_query_response = 0x1A9,
+    ts_floql_response = 0x1AA,
+    ts_list_response = 0x1AB,
+    ts_delete_response = 0x1AC,
+    ts_retention_response = 0x1AD,
 
-    // Actions (0x60 - 0x6D)
-    action_register = 0x60,
-    action_invoke = 0x61,
-    action_status = 0x62,
-    action_list = 0x63,
-    action_delete = 0x64,
-    action_await = 0x65,
-    action_complete = 0x66,
-    action_fail = 0x67,
-    action_touch = 0x68,
-    action_register_response = 0x69,
-    action_invoke_response = 0x6A,
-    action_status_response = 0x6B,
-    action_list_response = 0x6C,
-    action_task_assignment = 0x6D,
+    // ── Actions (0x300 – 0x31F) ──
+    action_register = 0x300,
+    action_invoke = 0x301,
+    action_status = 0x302,
+    action_list = 0x303,
+    action_list_runs = 0x304,
+    action_delete = 0x305,
+    action_await = 0x306,
+    action_complete = 0x307,
+    action_fail = 0x308,
+    action_touch = 0x309,
+    action_register_response = 0x310,
+    action_invoke_response = 0x311,
+    action_status_response = 0x312,
+    action_list_response = 0x313,
+    action_list_runs_response = 0x314,
+    action_task_assignment = 0x315,
 
-    // Workers (0x70 - 0x78)
-    worker_register = 0x70,
-    worker_heartbeat = 0x71,
-    worker_deregister = 0x72,
-    worker_list = 0x73,
-    worker_info = 0x74,
-    worker_register_response = 0x75,
-    worker_list_response = 0x76,
-    worker_info_response = 0x77,
-    worker_drain = 0x78,
+    // ── Workers (0x320 – 0x33F) ──
+    worker_register = 0x320,
+    worker_heartbeat = 0x321,
+    worker_deregister = 0x322,
+    worker_list = 0x323,
+    worker_info = 0x324,
+    worker_drain = 0x325,
+    worker_register_response = 0x330,
+    worker_list_response = 0x331,
+    worker_info_response = 0x332,
+    worker_drain_response = 0x333,
 
-    // Workflows (0x80 - 0x93)
-    workflow_create = 0x80, // Create workflow from YAML definition
-    workflow_start = 0x81, // Start a workflow run
-    workflow_signal = 0x82, // Send signal to running workflow
-    workflow_cancel = 0x83, // Cancel a workflow run
-    workflow_status = 0x84, // Get workflow run status
-    workflow_history = 0x85, // Get workflow run history
-    workflow_list_runs = 0x86, // List workflow runs
-    workflow_get_definition = 0x87, // Get workflow definition
-    workflow_create_response = 0x88,
-    workflow_start_response = 0x89,
-    workflow_status_response = 0x8A,
-    workflow_history_response = 0x8B,
-    workflow_list_runs_response = 0x8C,
-    workflow_get_definition_response = 0x8D,
-    workflow_disable = 0x8E,
-    workflow_enable = 0x8F,
-    workflow_disable_response = 0x90,
-    workflow_enable_response = 0x91,
-    workflow_list_definitions = 0x92,
-    workflow_list_definitions_response = 0x93,
+    // ── Workflows (0x340 – 0x35F) ──
+    workflow_create = 0x340,
+    workflow_start = 0x341,
+    workflow_signal = 0x342,
+    workflow_cancel = 0x343,
+    workflow_status = 0x344,
+    workflow_history = 0x345,
+    workflow_list_runs = 0x346,
+    workflow_get_definition = 0x347,
+    workflow_disable = 0x348,
+    workflow_enable = 0x349,
+    workflow_list_definitions = 0x34A,
+    workflow_create_response = 0x350,
+    workflow_start_response = 0x351,
+    workflow_status_response = 0x352,
+    workflow_history_response = 0x353,
+    workflow_list_runs_response = 0x354,
+    workflow_get_definition_response = 0x355,
+    workflow_disable_response = 0x356,
+    workflow_enable_response = 0x357,
+    workflow_list_definitions_response = 0x358,
 
-    // Cluster Management (0xA0 - 0xAF)
-    cluster_status = 0xA0, // Get cluster status (leader, term, health)
-    cluster_members = 0xA1, // List cluster members
-    cluster_join = 0xA2, // Request to join cluster
-    cluster_leave = 0xA3, // Request to leave cluster gracefully
-    cluster_transfer_leader = 0xA4, // Transfer leadership to another node
-    cluster_add_node = 0xA5, // Admin: add node to cluster (leader only)
-    cluster_remove_node = 0xA6, // Admin: remove node from cluster (leader only)
-    cluster_status_response = 0xA8,
-    cluster_members_response = 0xA9,
-    cluster_join_response = 0xAA,
-
-    // Namespace Management (0xB0 - 0xBF)
-    namespace_create = 0xB0, // Create a new namespace
-    namespace_delete = 0xB1, // Delete an existing namespace
-    namespace_list = 0xB2, // List all namespaces
-    namespace_info = 0xB3, // Get namespace info/config
-    namespace_create_response = 0xB4,
-    namespace_delete_response = 0xB5,
-    namespace_list_response = 0xB6,
-    namespace_info_response = 0xB7,
-    namespace_config_set = 0xB8,
-    namespace_config_get = 0xB9,
-    namespace_config_set_response = 0xBA,
-    namespace_config_get_response = 0xBB,
-
-    // Processing / Stream Processing (0xC0 - 0xD1)
-    processing_submit = 0xC0, // Submit a processing job
-    processing_stop = 0xC1, // Gracefully stop a processing job
-    processing_cancel = 0xC2, // Force cancel a processing job
-    processing_status = 0xC3, // Get processing job status
-    processing_list = 0xC4, // List processing jobs
-    processing_savepoint = 0xC6, // Trigger a savepoint
-    processing_restore = 0xC7, // Restore from a savepoint
-    processing_rescale = 0xC8, // Rescale job parallelism
-    processing_submit_response = 0xC9,
-    processing_stop_response = 0xCA,
-    processing_cancel_response = 0xCB,
-    processing_status_response = 0xCC,
-    processing_list_response = 0xCD,
-    processing_savepoint_response = 0xCF,
-    processing_restore_response = 0xD0,
-    processing_rescale_response = 0xD1,
-
-    // Time-Series Operations (0xE0 - 0xED)
-    ts_write = 0xE0, // Write data point(s) to a time-series
-    ts_read = 0xE1, // Read raw data points from a time-series
-    ts_query = 0xE2, // Aggregated query over a time range
-    ts_floql = 0xE3, // FloQL query string
-    ts_list = 0xE4, // List measurements or series
-    ts_delete = 0xE5, // Delete a series and its metadata
-    ts_retention = 0xE6, // Configure retention / downsampling policy
-    ts_write_response = 0xE7,
-    ts_read_response = 0xE8,
-    ts_query_response = 0xE9,
-    ts_floql_response = 0xEA,
-    ts_list_response = 0xEB,
-    ts_delete_response = 0xEC,
-    ts_retention_response = 0xED,
+    // ── Processing (0x360 – 0x37F) ──
+    processing_submit = 0x360,
+    processing_stop = 0x361,
+    processing_cancel = 0x362,
+    processing_status = 0x363,
+    processing_list = 0x364,
+    processing_savepoint = 0x365,
+    processing_restore = 0x366,
+    processing_rescale = 0x367,
+    processing_submit_response = 0x370,
+    processing_stop_response = 0x371,
+    processing_cancel_response = 0x372,
+    processing_status_response = 0x373,
+    processing_list_response = 0x374,
+    processing_savepoint_response = 0x375,
+    processing_restore_response = 0x376,
+    processing_rescale_response = 0x377,
 
     _,
 };
@@ -374,6 +375,9 @@ pub const FloError = error{
     Conflict,
     Unauthorized,
     Overloaded,
+    RateLimited,
+    InternalError,
+    UnexpectedResponse,
 
     // Memory errors
     OutOfMemory,
@@ -594,11 +598,13 @@ pub const StorageTier = enum(u8) {
 pub const StreamRecord = struct {
     id: StreamID = .{},
     tier: StorageTier = .hot,
+    stream: []const u8 = "",
     payload: []const u8,
     headers: ?[]const u8 = null,
 
     pub fn deinit(self: *StreamRecord, allocator: std.mem.Allocator) void {
         allocator.free(self.payload);
+        if (self.stream.len > 0) allocator.free(self.stream);
         if (self.headers) |h| allocator.free(h);
     }
 };
@@ -718,8 +724,6 @@ pub const StreamGroupNackOptions = struct {
 pub const ActionType = enum(u8) {
     /// User-defined action (external worker processes tasks)
     user = 0,
-    /// WASM action (executed inline by the server)
-    wasm = 1,
 };
 
 /// Run status for action invocations
@@ -739,12 +743,16 @@ pub const TaskAssignment = struct {
     payload: []const u8,
     created_at: i64,
     attempt: u32,
+    caller_run_id: ?[]const u8 = null,
+    caller_workflow_name: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *TaskAssignment) void {
         self.allocator.free(self.task_id);
         self.allocator.free(self.task_type);
         self.allocator.free(self.payload);
+        if (self.caller_run_id) |v| self.allocator.free(v);
+        if (self.caller_workflow_name) |v| self.allocator.free(v);
     }
 };
 
@@ -770,12 +778,10 @@ pub const ActionRunStatus = struct {
 /// Result of an action invocation
 pub const ActionInvokeResult = struct {
     run_id: []const u8,
-    output: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ActionInvokeResult) void {
         self.allocator.free(self.run_id);
-        if (self.output) |o| self.allocator.free(o);
     }
 };
 
@@ -789,12 +795,6 @@ pub const ActionRegisterOptions = struct {
     timeout_ms: ?u64 = null,
     /// Maximum retries on failure
     max_retries: ?u8 = null,
-    /// WASM module bytes (for ActionTypeWASM)
-    wasm_module: ?[]const u8 = null,
-    /// Custom WASM entrypoint function (default: "handle")
-    wasm_entrypoint: ?[]const u8 = null,
-    /// WASM memory limit in MB
-    memory_limit_mb: ?u32 = null,
 };
 
 /// Options for action invocation
@@ -1003,6 +1003,7 @@ pub const WorkflowListRunsOptions = struct {
 pub const WorkflowListDefinitionsOptions = struct {
     namespace: ?[]const u8 = null,
     limit: u32 = 100,
+    cursor: ?[]const u8 = null,
 };
 
 pub const WorkflowDisableOptions = struct {
@@ -1015,4 +1016,104 @@ pub const WorkflowEnableOptions = struct {
 
 pub const WorkflowSyncOptions = struct {
     namespace: ?[]const u8 = null,
+};
+
+// =============================================================================
+// Processing Types
+// =============================================================================
+
+pub const ProcessingSubmitOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const ProcessingStatusOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const ProcessingListOptions = struct {
+    namespace: ?[]const u8 = null,
+    limit: u32 = 100,
+    cursor: ?[]const u8 = null,
+};
+
+pub const ProcessingStopOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const ProcessingCancelOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const ProcessingSavepointOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const ProcessingRestoreOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const ProcessingRescaleOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+pub const ProcessingSyncOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
+/// Result of a processing status query.
+pub const ProcessingStatusResult = struct {
+    job_id: []const u8,
+    name: []const u8,
+    status: []const u8,
+    parallelism: u32,
+    batch_size: u32,
+    records_processed: u64,
+    created_at: i64,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ProcessingStatusResult) void {
+        self.allocator.free(self.job_id);
+        self.allocator.free(self.name);
+        self.allocator.free(self.status);
+    }
+};
+
+/// Entry in a processing job list.
+pub const ProcessingListEntry = struct {
+    name: []const u8,
+    job_id: []const u8,
+    status: []const u8,
+    parallelism: u32,
+    created_at: i64,
+
+    pub fn deinit(self: *ProcessingListEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.job_id);
+        allocator.free(self.status);
+    }
+};
+
+/// Result of a processing list operation.
+pub const ProcessingListResult = struct {
+    entries: []ProcessingListEntry,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ProcessingListResult) void {
+        for (self.entries) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.allocator.free(self.entries);
+    }
+};
+
+/// Result of a processing sync operation.
+pub const ProcessingSyncResult = struct {
+    name: []const u8,
+    job_id: []const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ProcessingSyncResult) void {
+        self.allocator.free(self.name);
+        self.allocator.free(self.job_id);
+    }
 };
