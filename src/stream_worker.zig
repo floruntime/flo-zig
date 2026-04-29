@@ -44,8 +44,10 @@ pub const StreamWorkerConfig = struct {
     endpoint: []const u8,
     /// Namespace for operations
     namespace: []const u8 = "default",
-    /// Stream to consume from (required)
-    stream: []const u8,
+    /// Stream to consume from (use this for single-stream, or `streams` for multi-stream)
+    stream: []const u8 = "",
+    /// Multiple streams to consume from (alternative to `stream`)
+    streams: ?[]const []const u8 = null,
     /// Consumer group name
     group: []const u8 = "default",
     /// Consumer name within the group (defaults to worker_id)
@@ -64,6 +66,13 @@ pub const StreamWorkerConfig = struct {
     metadata: ?[]const u8 = null,
     /// Optional machine ID
     machine_id: ?[]const u8 = null,
+
+    /// Get the list of streams to consume from.
+    pub fn getStreams(self: *const StreamWorkerConfig) []const []const u8 {
+        if (self.streams) |s| return s;
+        if (self.stream.len > 0) return @as(*const [1][]const u8, &self.stream);
+        return &.{};
+    }
 };
 
 /// Context passed to stream record handlers.
@@ -154,13 +163,16 @@ pub const StreamWorker = struct {
 
     /// Deinitialize the stream worker and free resources.
     pub fn deinit(self: *Self) void {
-        // Best-effort leave group and deregister
-        self.stream.groupLeave(
-            self.config.stream,
-            self.config.group,
-            self.consumer_name,
-            .{ .namespace = self.config.namespace },
-        ) catch {};
+        // Best-effort leave group and deregister for all streams
+        const stream_list = self.config.getStreams();
+        for (stream_list) |stream_name| {
+            self.stream.groupLeave(
+                stream_name,
+                self.config.group,
+                self.consumer_name,
+                .{ .namespace = self.config.namespace },
+            ) catch {};
+        }
 
         self.actions.deregister(self.worker_id, .{
             .namespace = self.config.namespace,
@@ -174,34 +186,46 @@ pub const StreamWorker = struct {
     /// Start consuming stream records.
     /// This function blocks until stop() is called or drain completes.
     pub fn start(self: *Self) !void {
-        std.log.info("[flo-stream-worker] Starting (id={s}, stream={s}, group={s}, consumer={s})", .{
+        const stream_list = self.config.getStreams();
+
+        std.log.info("[flo-stream-worker] Starting (id={s}, streams={d}, group={s}, consumer={s})", .{
             self.worker_id,
-            self.config.stream,
+            stream_list.len,
             self.config.group,
             self.consumer_name,
         });
 
-        // Join consumer group
-        try self.stream.groupJoin(
-            self.config.stream,
-            self.config.group,
-            self.consumer_name,
-            .{ .namespace = self.config.namespace },
-        );
+        // Join consumer group for each stream
+        for (stream_list) |stream_name| {
+            try self.stream.groupJoin(
+                stream_name,
+                self.config.group,
+                self.consumer_name,
+                .{ .namespace = self.config.namespace },
+            );
+        }
 
-        // Register in worker registry
-        const process_name = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{s}",
-            .{ self.config.stream, self.config.group },
-        );
-        defer self.allocator.free(process_name);
+        // Register in worker registry with all streams as processes
+        var process_names = try self.allocator.alloc([]u8, stream_list.len);
+        defer {
+            for (process_names) |name| self.allocator.free(name);
+            self.allocator.free(process_names);
+        }
 
-        const process = types.ProcessEntry{
-            .name = process_name,
-            .kind = .stream_consumer,
-        };
-        var processes = [_]types.ProcessEntry{process};
+        var process_entries = try self.allocator.alloc(types.ProcessEntry, stream_list.len);
+        defer self.allocator.free(process_entries);
+
+        for (stream_list, 0..) |stream_name, i| {
+            process_names[i] = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}/{s}",
+                .{ stream_name, self.config.group },
+            );
+            process_entries[i] = .{
+                .name = process_names[i],
+                .kind = .stream_consumer,
+            };
+        }
 
         self.actions.register(
             self.worker_id,
@@ -210,7 +234,7 @@ pub const StreamWorker = struct {
                 .namespace = self.config.namespace,
                 .worker_type = .stream,
                 .max_concurrency = self.config.concurrency,
-                .processes = &processes,
+                .processes = process_entries,
                 .metadata = self.config.metadata,
                 .machine_id = self.config.machine_id,
             },
@@ -220,6 +244,8 @@ pub const StreamWorker = struct {
 
         self.running = true;
         self.last_heartbeat_ns = std.time.nanoTimestamp();
+
+        var stream_idx: usize = 0;
 
         // Main polling loop
         while (self.running) {
@@ -239,10 +265,13 @@ pub const StreamWorker = struct {
                 continue;
             }
 
-            self.pollAndProcess() catch |err| {
+            self.pollAndProcess(stream_list[stream_idx]) catch |err| {
                 std.log.err("[flo-stream-worker] GroupRead error: {}, retrying...", .{err});
                 std.Thread.sleep(1 * std.time.ns_per_s);
             };
+
+            // Round-robin across streams
+            stream_idx = (stream_idx + 1) % stream_list.len;
         }
 
         std.log.info("[flo-stream-worker] Worker stopped (processed={d}, failed={d})", .{
@@ -295,9 +324,9 @@ pub const StreamWorker = struct {
     }
 
     /// Poll for records and process them.
-    fn pollAndProcess(self: *Self) !void {
+    fn pollAndProcess(self: *Self, stream_name: []const u8) !void {
         var result = try self.stream.groupRead(
-            self.config.stream,
+            stream_name,
             self.config.group,
             self.consumer_name,
             .{
@@ -315,16 +344,16 @@ pub const StreamWorker = struct {
         for (result.records) |record| {
             self.active_tasks += 1;
             defer self.active_tasks -= 1;
-            self.processRecord(record);
+            self.processRecord(stream_name, record);
         }
     }
 
     /// Process a single record with auto-ack/nack.
-    fn processRecord(self: *Self, record: StreamRecord) void {
+    fn processRecord(self: *Self, stream_name: []const u8, record: StreamRecord) void {
         var ctx = StreamContext{
             .record = record,
             .namespace = self.config.namespace,
-            .stream_name = self.config.stream,
+            .stream_name = stream_name,
             .group = self.config.group,
             .consumer = self.consumer_name,
             .allocator = self.allocator,
@@ -335,7 +364,7 @@ pub const StreamWorker = struct {
             self.messages_processed += 1;
             var ids = [_]StreamID{record.id};
             self.stream.groupAck(
-                self.config.stream,
+                stream_name,
                 self.config.group,
                 &ids,
                 .{ .namespace = self.config.namespace },
@@ -348,7 +377,7 @@ pub const StreamWorker = struct {
             std.log.err("[flo-stream-worker] Record {} failed: {}", .{ record.id, err });
             var ids = [_]StreamID{record.id};
             self.stream.groupNack(
-                self.config.stream,
+                stream_name,
                 self.config.group,
                 &ids,
                 .{ .namespace = self.config.namespace },
@@ -391,6 +420,24 @@ test "StreamWorkerConfig defaults" {
     try std.testing.expectEqual(@as(u32, 30_000), config.block_ms);
     try std.testing.expectEqual(@as(u64, 30_000), config.heartbeat_interval_ms);
     try std.testing.expectEqualStrings("default", config.group);
+
+    // getStreams returns single-stream list
+    const streams = config.getStreams();
+    try std.testing.expectEqual(@as(usize, 1), streams.len);
+    try std.testing.expectEqualStrings("events", streams[0]);
+}
+
+test "StreamWorkerConfig multi-stream" {
+    const stream_list = [_][]const u8{ "events", "orders", "logs" };
+    const config = StreamWorkerConfig{
+        .endpoint = "localhost:3000",
+        .streams = &stream_list,
+    };
+    const streams = config.getStreams();
+    try std.testing.expectEqual(@as(usize, 3), streams.len);
+    try std.testing.expectEqualStrings("events", streams[0]);
+    try std.testing.expectEqualStrings("orders", streams[1]);
+    try std.testing.expectEqualStrings("logs", streams[2]);
 }
 
 test "generateStreamWorkerId" {

@@ -459,14 +459,21 @@ pub const Workflow = struct {
     ) FloError![]u8 {
         const ns = self.client.getNamespace(options.namespace);
 
-        var value_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &value_buf, options.limit, .little);
+        // Wire format: [limit:u32][cursor...]
+        const cursor = options.cursor orelse &[_]u8{};
+        var value_buf: [4 + 64]u8 = undefined; // 4 bytes limit + up to 64 bytes cursor
+        std.mem.writeInt(u32, value_buf[0..4], options.limit, .little);
+        if (cursor.len > 0) {
+            const copy_len = @min(cursor.len, value_buf.len - 4);
+            @memcpy(value_buf[4 .. 4 + copy_len], cursor[0..copy_len]);
+        }
+        const value_len = 4 + @min(cursor.len, value_buf.len - 4);
 
         var response = try self.client.sendRequest(
             .workflow_list_definitions,
             ns,
             "",
-            &value_buf,
+            value_buf[0..value_len],
             "",
         );
         defer response.deinit();
@@ -521,4 +528,116 @@ pub const Workflow = struct {
             return mapStatusToError(response.status);
         }
     }
+
+    // =========================================================================
+    // Declarative Sync
+    // =========================================================================
+
+    /// Result of a workflow sync operation.
+    pub const SyncResult = struct {
+        name: []const u8,
+        version: []const u8,
+        description: []const u8,
+        action: []const u8, // "created", "updated", or "unchanged"
+        allocator: Allocator,
+
+        pub fn deinit(self: *SyncResult) void {
+            self.allocator.free(self.name);
+            self.allocator.free(self.version);
+            self.allocator.free(self.description);
+            // action is a static string, not allocated
+        }
+    };
+
+    /// Sync a workflow from raw YAML bytes. Performs version-aware comparison:
+    /// - If the workflow doesn't exist, creates it (action = "created")
+    /// - If the version differs, updates it (action = "updated")
+    /// - If the version matches, does nothing (action = "unchanged")
+    ///
+    /// Caller owns the result; call deinit() when done.
+    pub fn syncBytes(
+        self: *Self,
+        allocator: Allocator,
+        yaml: []const u8,
+        options: types.WorkflowSyncOptions,
+    ) FloError!SyncResult {
+        const name = extractYamlField(yaml, "name") orelse return FloError.BadRequest;
+        const version = extractYamlField(yaml, "version") orelse "1";
+        const description = extractYamlField(yaml, "description") orelse "";
+
+        // Check if workflow already exists with this version
+        const existing = self.getDefinition(allocator, name, .{
+            .namespace = options.namespace,
+        }) catch |err| switch (err) {
+            FloError.NotFound => null,
+            else => return err,
+        };
+
+        var action: []const u8 = "created";
+
+        if (existing) |existing_yaml| {
+            defer allocator.free(existing_yaml);
+            // Check if version matches
+            const existing_version = extractYamlField(existing_yaml, "version") orelse "1";
+            if (std.mem.eql(u8, version, existing_version)) {
+                // Version unchanged
+                const name_owned = allocator.dupe(u8, name) catch return FloError.OutOfMemory;
+                errdefer allocator.free(name_owned);
+                const version_owned = allocator.dupe(u8, version) catch return FloError.OutOfMemory;
+                errdefer allocator.free(version_owned);
+                const desc_owned = allocator.dupe(u8, description) catch return FloError.OutOfMemory;
+                return .{
+                    .name = name_owned,
+                    .version = version_owned,
+                    .description = desc_owned,
+                    .action = "unchanged",
+                    .allocator = allocator,
+                };
+            }
+            action = "updated";
+        }
+
+        // Create/update the workflow
+        try self.create(name, yaml, .{ .namespace = options.namespace });
+
+        const name_owned = allocator.dupe(u8, name) catch return FloError.OutOfMemory;
+        errdefer allocator.free(name_owned);
+        const version_owned = allocator.dupe(u8, version) catch return FloError.OutOfMemory;
+        errdefer allocator.free(version_owned);
+        const desc_owned = allocator.dupe(u8, description) catch return FloError.OutOfMemory;
+
+        return .{
+            .name = name_owned,
+            .version = version_owned,
+            .description = desc_owned,
+            .action = action,
+            .allocator = allocator,
+        };
+    }
 };
+
+/// Extract a field value from YAML content (simple line-based extraction).
+fn extractYamlField(data: []const u8, field: []const u8) ?[]const u8 {
+    var start: usize = 0;
+    while (start < data.len) {
+        // Find end of line
+        var end = start;
+        while (end < data.len and data[end] != '\n') : (end += 1) {}
+
+        const line = data[start..end];
+        const trimmed = std.mem.trimLeft(u8, line, " \t");
+
+        // Check if line starts with "field:"
+        if (trimmed.len > field.len and
+            std.mem.eql(u8, trimmed[0..field.len], field) and
+            trimmed[field.len] == ':')
+        {
+            const after_colon = trimmed[field.len + 1 ..];
+            const value = std.mem.trim(u8, after_colon, " \t\r\"'");
+            if (value.len > 0) return value;
+        }
+
+        start = if (end < data.len) end + 1 else end;
+    }
+    return null;
+}

@@ -73,6 +73,8 @@ pub const ActionContext = struct {
     attempt: u32,
     created_at: i64,
     namespace: []const u8,
+    caller_run_id: ?[]const u8 = null,
+    caller_workflow_name: ?[]const u8 = null,
     allocator: Allocator,
     actions: *Actions,
     worker_id: []const u8,
@@ -80,6 +82,11 @@ pub const ActionContext = struct {
     /// Get the raw input payload.
     pub fn input(self: *const ActionContext) []const u8 {
         return self.payload;
+    }
+
+    /// Returns true if this action was invoked by a workflow.
+    pub fn isCalledByWorkflow(self: *const ActionContext) bool {
+        return self.caller_run_id != null;
     }
 
     /// Parse the input payload as JSON into the given type.
@@ -389,6 +396,8 @@ pub const ActionWorker = struct {
             .attempt = task.attempt,
             .created_at = task.created_at,
             .namespace = self.config.namespace,
+            .caller_run_id = task.caller_run_id,
+            .caller_workflow_name = task.caller_workflow_name,
             .allocator = self.allocator,
             .actions = &self.actions,
             .worker_id = self.worker_id,

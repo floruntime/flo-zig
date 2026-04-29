@@ -15,6 +15,10 @@ const StatusCode = types.StatusCode;
 pub const ClientOptions = struct {
     /// Default namespace for operations (can be overridden per-operation)
     namespace: []const u8 = "default",
+    /// Connection/operation timeout in milliseconds (0 = no timeout, default: 5000)
+    timeout_ms: u32 = 5_000,
+    /// Enable debug logging
+    debug: bool = false,
 };
 
 /// Flo client for communicating with the server
@@ -24,6 +28,8 @@ pub const Client = struct {
     namespace: []const u8,
     stream: ?std.net.Stream = null,
     request_id: u64 = 1,
+    timeout_ms: u32 = 5_000,
+    debug: bool = false,
 
     const Self = @This();
 
@@ -33,6 +39,8 @@ pub const Client = struct {
             .allocator = allocator,
             .endpoint = endpoint,
             .namespace = options.namespace,
+            .timeout_ms = options.timeout_ms,
+            .debug = options.debug,
         };
     }
 
@@ -79,6 +87,40 @@ pub const Client = struct {
             s.close();
             self.stream = null;
         }
+    }
+
+    /// Forcibly close the TCP connection (unblocks any blocking operations).
+    pub fn interrupt(self: *Self) void {
+        self.disconnect();
+    }
+
+    /// Reconnect with exponential backoff.
+    /// Retries up to ~5 minutes with delays: 1s, 2s, 4s, 8s, 16s, 30s (cap).
+    pub fn reconnect(self: *Self) FloError!void {
+        self.disconnect();
+
+        const max_delay_ms: u64 = 30_000;
+        const max_total_ms: u64 = 5 * 60 * 1_000;
+        var delay_ms: u64 = 1_000;
+        var total_ms: u64 = 0;
+
+        while (total_ms < max_total_ms) {
+            self.connect() catch {
+                if (self.debug) {
+                    std.log.info("[flo] Reconnect failed, retrying in {d}ms...", .{delay_ms});
+                }
+                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                total_ms += delay_ms;
+                delay_ms = @min(delay_ms * 2, max_delay_ms);
+                continue;
+            };
+            if (self.debug) {
+                std.log.info("[flo] Reconnected successfully", .{});
+            }
+            return;
+        }
+
+        return FloError.ConnectionFailed;
     }
 
     /// Check if connected
