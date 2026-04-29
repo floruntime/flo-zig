@@ -40,29 +40,30 @@ pub fn main() !void {
     var kv = flo.KV.init(&client);
 
     // Put a value (uses default namespace "demo")
-    kv.put("greeting", "Hello, Flo!", .{}) catch |err| {
+    _ = kv.put("greeting", "Hello, Flo!", .{}) catch |err| {
         std.debug.print("PUT failed: {}\n", .{err});
         return;
     };
     std.debug.print("PUT greeting = 'Hello, Flo!' (namespace: demo)\n", .{});
 
     // Get the value back
-    if (kv.get("greeting", .{}) catch null) |value| {
-        defer allocator.free(value);
-        std.debug.print("GET greeting = '{s}'\n", .{value});
+    if (kv.get("greeting", .{}) catch null) |result_const| {
+        var result = result_const;
+        defer result.deinit(allocator);
+        std.debug.print("GET greeting = '{s}' (v{d})\n", .{ result.value, result.version });
     } else {
         std.debug.print("GET greeting = (not found)\n", .{});
     }
 
     // Put with TTL
-    kv.put("temp", "expires soon", .{ .ttl_seconds = 60 }) catch |err| {
+    _ = kv.put("temp", "expires soon", .{ .ttl_seconds = 60 }) catch |err| {
         std.debug.print("PUT with TTL failed: {}\n", .{err});
         return;
     };
     std.debug.print("PUT temp = 'expires soon' (TTL: 60s)\n", .{});
 
     // Put to a different namespace (override default)
-    kv.put("config-key", "config-value", .{ .namespace = "config" }) catch |err| {
+    _ = kv.put("config-key", "config-value", .{ .namespace = "config" }) catch |err| {
         std.debug.print("PUT to config namespace failed: {}\n", .{err});
         return;
     };

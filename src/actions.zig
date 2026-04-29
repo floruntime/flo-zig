@@ -71,42 +71,13 @@ pub const Actions = struct {
             offset += 1;
         }
 
-        // WASM module (optional)
-        if (options.wasm_module) |wasm| {
-            value_buf[offset] = 1;
-            offset += 1;
-            std.mem.writeInt(u32, value_buf[offset..][0..4], @intCast(wasm.len), .little);
-            offset += 4;
-            @memcpy(value_buf[offset..][0..wasm.len], wasm);
-            offset += wasm.len;
-        } else {
-            value_buf[offset] = 0;
-            offset += 1;
-        }
-
-        // WASM entrypoint (optional)
-        if (options.wasm_entrypoint) |ep| {
-            value_buf[offset] = 1;
-            offset += 1;
-            std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(ep.len), .little);
-            offset += 2;
-            @memcpy(value_buf[offset..][0..ep.len], ep);
-            offset += ep.len;
-        } else {
-            value_buf[offset] = 0;
-            offset += 1;
-        }
-
-        // WASM memory limit (optional)
-        if (options.memory_limit_mb) |limit| {
-            value_buf[offset] = 1;
-            offset += 1;
-            std.mem.writeInt(u32, value_buf[offset..][0..4], limit, .little);
-            offset += 4;
-        } else {
-            value_buf[offset] = 0;
-            offset += 1;
-        }
+        // WASM fields (reserved, always zero for wire compat)
+        value_buf[offset] = 0; // no wasm_module
+        offset += 1;
+        value_buf[offset] = 0; // no wasm_entrypoint
+        offset += 1;
+        value_buf[offset] = 0; // no wasm_memory_limit
+        offset += 1;
 
         // Trigger stream / group (not yet supported)
         value_buf[offset] = 0; // has_trigger_stream
@@ -129,7 +100,7 @@ pub const Actions = struct {
     }
 
     /// Invoke an action (create a task for workers to process).
-    /// Returns an ActionInvokeResult with run_id and optional output (for WASM actions).
+    /// Returns an ActionInvokeResult with run_id.
     /// **Caller owns the returned `ActionInvokeResult` and must call `result.deinit()`.**
     pub fn invoke(
         self: *Self,
@@ -647,20 +618,16 @@ fn parseActionInvokeResult(allocator: std.mem.Allocator, data: []const u8) FloEr
     errdefer allocator.free(run_id);
     pos += run_id_len;
 
-    // Read optional output
-    var output: ?[]const u8 = null;
+    // Skip optional output field (wire compat — always empty now)
     if (pos < data.len and data[pos] == 1) {
         pos += 1;
         if (pos + 4 <= data.len) {
             const output_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-            pos += 4;
-            if (pos + output_len <= data.len) {
-                output = allocator.dupe(u8, data[pos..][0..output_len]) catch return FloError.OutOfMemory;
-            }
+            pos += 4 + output_len;
         }
     }
 
-    return types.ActionInvokeResult{ .run_id = run_id, .output = output, .allocator = allocator };
+    return types.ActionInvokeResult{ .run_id = run_id, .allocator = allocator };
 }
 
 /// Parse task assignment from wire format
@@ -701,6 +668,36 @@ fn parseTaskAssignment(allocator: std.mem.Allocator, data: []const u8) FloError!
     const attempt = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
 
+    // caller block: [has_caller:u8][run_id_len:u16][run_id][wf_name_len:u16][wf_name]
+    var caller_run_id: ?[]const u8 = null;
+    var caller_workflow_name: ?[]const u8 = null;
+
+    if (pos + 1 <= data.len) {
+        const has_caller = data[pos];
+        pos += 1;
+        if (has_caller == 1) {
+            // caller_run_id
+            if (pos + 2 > data.len) return FloError.IncompleteResponse;
+            const crid_len = std.mem.readInt(u16, data[pos..][0..2], .little);
+            pos += 2;
+            if (pos + crid_len > data.len) return FloError.IncompleteResponse;
+            if (crid_len > 0) {
+                caller_run_id = allocator.dupe(u8, data[pos..][0..crid_len]) catch return FloError.OutOfMemory;
+            }
+            pos += crid_len;
+
+            // caller_workflow_name
+            if (pos + 2 > data.len) return FloError.IncompleteResponse;
+            const cwn_len = std.mem.readInt(u16, data[pos..][0..2], .little);
+            pos += 2;
+            if (pos + cwn_len > data.len) return FloError.IncompleteResponse;
+            if (cwn_len > 0) {
+                caller_workflow_name = allocator.dupe(u8, data[pos..][0..cwn_len]) catch return FloError.OutOfMemory;
+            }
+            pos += cwn_len;
+        }
+    }
+
     // payload (rest of data)
     var payload: []const u8 = "";
     if (pos < data.len) {
@@ -713,6 +710,8 @@ fn parseTaskAssignment(allocator: std.mem.Allocator, data: []const u8) FloError!
         .payload = payload,
         .created_at = created_at,
         .attempt = attempt,
+        .caller_run_id = caller_run_id,
+        .caller_workflow_name = caller_workflow_name,
         .allocator = allocator,
     };
 }

@@ -1,7 +1,7 @@
 //! Flo Wire Protocol
 //!
 //! Binary serialization/deserialization for the Flo protocol.
-//! Header: 24 bytes, little-endian, CRC32 validated.
+//! Header: 32 bytes, little-endian, CRC32 validated.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -16,16 +16,16 @@ const FloError = types.FloError;
 // Headers
 // =============================================================================
 
-/// Request header (24 bytes)
+/// Request header (32 bytes)
 pub const RequestHeader = extern struct {
     magic: u32,
     payload_length: u32,
     request_id: u64,
     crc32: u32,
+    op_code: u16,
     version: u8,
-    op_code: u8,
     flags: u8,
-    reserved: u8,
+    reserved: [8]u8,
 
     pub fn validate(self: RequestHeader) FloError!void {
         if (self.magic != types.MAGIC) {
@@ -33,9 +33,6 @@ pub const RequestHeader = extern struct {
         }
         if (self.version != types.VERSION) {
             return FloError.UnsupportedVersion;
-        }
-        if (self.reserved != 0) {
-            return FloError.InvalidReservedField;
         }
         if (self.payload_length > 100 * 1024 * 1024) {
             return FloError.PayloadTooLarge;
@@ -47,13 +44,13 @@ pub const RequestHeader = extern struct {
         var hasher = std.hash.Crc32.init();
         const header_bytes = std.mem.asBytes(&self);
         hasher.update(header_bytes[0..16]);
-        hasher.update(header_bytes[20..24]);
+        hasher.update(header_bytes[20..32]);
         hasher.update(payload);
         return hasher.final();
     }
 };
 
-/// Response header (24 bytes)
+/// Response header (32 bytes)
 pub const ResponseHeader = extern struct {
     magic: u32,
     data_len: u32,
@@ -62,7 +59,8 @@ pub const ResponseHeader = extern struct {
     version: u8,
     status: u8,
     flags: u8,
-    reserved: u8,
+    _pad: u8,
+    reserved: [8]u8,
 
     pub fn validate(self: ResponseHeader) FloError!void {
         if (self.magic != types.MAGIC) {
@@ -77,7 +75,7 @@ pub const ResponseHeader = extern struct {
         var hasher = std.hash.Crc32.init();
         const header_bytes = std.mem.asBytes(&self);
         hasher.update(header_bytes[0..16]);
-        hasher.update(header_bytes[20..24]);
+        hasher.update(header_bytes[20..32]);
         hasher.update(data);
         return hasher.final();
     }
@@ -88,11 +86,11 @@ pub const ResponseHeader = extern struct {
 };
 
 comptime {
-    if (@sizeOf(RequestHeader) != 24) {
-        @compileError("RequestHeader must be exactly 24 bytes");
+    if (@sizeOf(RequestHeader) != 32) {
+        @compileError("RequestHeader must be exactly 32 bytes");
     }
-    if (@sizeOf(ResponseHeader) != 24) {
-        @compileError("ResponseHeader must be exactly 24 bytes");
+    if (@sizeOf(ResponseHeader) != 32) {
+        @compileError("ResponseHeader must be exactly 32 bytes");
     }
 }
 
@@ -292,10 +290,10 @@ pub fn serializeRequest(
         .payload_length = @intCast(payload_size),
         .request_id = request_id,
         .crc32 = 0,
-        .version = types.VERSION,
         .op_code = @intFromEnum(op_code),
+        .version = types.VERSION,
         .flags = 0,
-        .reserved = 0,
+        .reserved = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
 
     // Compute CRC32
@@ -508,7 +506,7 @@ test "serializeRequest basic" {
         "",
     );
 
-    try std.testing.expect(serialized.len > 24);
+    try std.testing.expect(serialized.len > 32);
 
     // Verify header
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;

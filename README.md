@@ -85,11 +85,24 @@ defer client.deinit();
 // Or use "default" namespace
 var client = flo.Client.init(allocator, "localhost:9000", .{});
 
+// With timeout and debug logging
+var client = flo.Client.init(allocator, "localhost:9000", .{
+    .namespace = "myapp",
+    .timeout_ms = 10_000,  // 10 second timeout
+    .debug = true,
+});
+
 // Connect to server
 try client.connect();
 
 // Check connection status
 if (client.isConnected()) { ... }
+
+// Reconnect with exponential backoff (retries up to 5 minutes)
+try client.reconnect();
+
+// Forcibly close connection (unblocks blocking operations)
+client.interrupt();
 
 // Disconnect
 client.disconnect();
@@ -314,16 +327,98 @@ while (true) {
 try worker.touch("worker-1", task.task_id, .{ .extend_ms = 30000 });
 ```
 
+### Workflow Operations
+
+```zig
+var workflow = flo.Workflow.init(&client);
+
+// Create workflow from YAML
+try workflow.create("my-workflow", yaml_bytes, .{});
+
+// Start a workflow run
+const run_id = try workflow.start(allocator, "my-workflow", input_json, .{});
+defer allocator.free(run_id);
+
+// Get run status
+var status = try workflow.status(allocator, run_id, .{});
+defer status.deinit(allocator);
+
+// Send a signal to a running workflow
+try workflow.signal(run_id, "approval", "{\"approved\": true}", .{});
+
+// Cancel a running workflow
+try workflow.cancel(run_id, "no longer needed", .{});
+
+// Disable/enable workflow definitions
+try workflow.disable("my-workflow", .{});
+try workflow.enable("my-workflow", .{});
+
+// Declarative sync (version-aware create/update)
+var result = try workflow.syncBytes(allocator, yaml_bytes, .{});
+defer result.deinit();
+std.debug.print("Workflow {s}: {s}\n", .{ result.name, result.action });
+```
+
+### Processing (Stream Processing)
+
+```zig
+var processing = flo.Processing.init(&client);
+
+// Submit a processing job from YAML
+const job_id = try processing.submit(allocator, yaml_bytes, .{});
+defer allocator.free(job_id);
+
+// Get job status
+var status = try processing.status(allocator, job_id, .{});
+defer status.deinit();
+std.debug.print("Job {s}: {s} (processed {d} records)\n", .{
+    status.name, status.status, status.records_processed,
+});
+
+// List all processing jobs
+var jobs = try processing.list(allocator, .{ .limit = 50 });
+defer jobs.deinit();
+for (jobs.entries) |entry| {
+    std.debug.print("{s}: {s}\n", .{ entry.name, entry.status });
+}
+
+// Gracefully stop a job
+try processing.stop(job_id, .{});
+
+// Force-cancel a job
+try processing.cancel(job_id, .{});
+
+// Create a savepoint
+const sp_id = try processing.savepoint(allocator, job_id, .{});
+defer allocator.free(sp_id);
+
+// Restore from savepoint
+try processing.restore(job_id, sp_id, .{});
+
+// Change parallelism
+try processing.rescale(job_id, 8, .{});
+
+// Declarative sync (submit from YAML bytes)
+var result = try processing.syncBytes(allocator, yaml_bytes, .{});
+defer result.deinit();
+std.debug.print("Job {s} submitted as {s}\n", .{ result.name, result.job_id });
+```
+
 ## Error Handling
 
 All operations return `flo.FloError` which includes:
 
 - `NotConnected` - Client not connected
 - `ConnectionFailed` - TCP connection failed
-- `NotFound` - Key/queue not found
+- `NotFound` - Key/queue/stream not found
 - `BadRequest` - Invalid request
 - `Conflict` - CAS conflict
-- `ServerError` - Internal server error
+- `Unauthorized` - Authentication required
+- `Overloaded` - Server overloaded
+- `RateLimited` - Request rate limit exceeded
+- `InternalError` - Internal server error
+- `UnexpectedResponse` - Unexpected response format
+- `ServerError` - Generic server error
 
 ## Building
 
