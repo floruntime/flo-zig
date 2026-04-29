@@ -40,6 +40,7 @@ pub const wire = @import("wire.zig");
 // Re-export main components
 pub const Client = @import("client.zig").Client;
 pub const KV = @import("kv.zig").KV;
+pub const Transaction = @import("kv.zig").Transaction;
 pub const Queue = @import("queue.zig").Queue;
 pub const Stream = @import("stream.zig").Stream;
 
@@ -48,6 +49,9 @@ pub const Actions = @import("actions.zig").Actions;
 
 // Workflow API
 pub const Workflow = @import("workflow.zig").Workflow;
+
+// Processing API
+pub const Processing = @import("processing.zig").Processing;
 
 // High-level Worker API
 const worker_mod = @import("worker.zig");
@@ -77,6 +81,10 @@ pub const KVEntry = types.KVEntry;
 pub const Message = types.Message;
 pub const DequeueResult = types.DequeueResult;
 pub const VersionEntry = types.VersionEntry;
+pub const PutResult = types.PutResult;
+pub const GetResult = types.GetResult;
+pub const KVBeginResult = types.KVBeginResult;
+pub const KVCommitResult = types.KVCommitResult;
 pub const StreamRecord = types.StreamRecord;
 pub const StreamReadResult = types.StreamReadResult;
 pub const StreamAppendResult = types.StreamAppendResult;
@@ -92,6 +100,12 @@ pub const WorkerStatus = types.WorkerStatus;
 pub const ProcessKind = types.ProcessKind;
 pub const ProcessEntry = types.ProcessEntry;
 pub const ActionResult = types.ActionResult;
+
+// Processing result types
+pub const ProcessingStatusResult = types.ProcessingStatusResult;
+pub const ProcessingListEntry = types.ProcessingListEntry;
+pub const ProcessingListResult = types.ProcessingListResult;
+pub const ProcessingSyncResult = types.ProcessingSyncResult;
 
 // Option types - KV
 pub const PutOptions = types.PutOptions;
@@ -142,6 +156,17 @@ pub const WorkflowListDefinitionsOptions = types.WorkflowListDefinitionsOptions;
 pub const WorkflowDisableOptions = types.WorkflowDisableOptions;
 pub const WorkflowEnableOptions = types.WorkflowEnableOptions;
 pub const WorkflowSyncOptions = types.WorkflowSyncOptions;
+
+// Option types - Processing
+pub const ProcessingSubmitOptions = types.ProcessingSubmitOptions;
+pub const ProcessingStatusOptions = types.ProcessingStatusOptions;
+pub const ProcessingListOptions = types.ProcessingListOptions;
+pub const ProcessingStopOptions = types.ProcessingStopOptions;
+pub const ProcessingCancelOptions = types.ProcessingCancelOptions;
+pub const ProcessingSavepointOptions = types.ProcessingSavepointOptions;
+pub const ProcessingRestoreOptions = types.ProcessingRestoreOptions;
+pub const ProcessingRescaleOptions = types.ProcessingRescaleOptions;
+pub const ProcessingSyncOptions = types.ProcessingSyncOptions;
 
 // Protocol constants
 pub const MAGIC = types.MAGIC;

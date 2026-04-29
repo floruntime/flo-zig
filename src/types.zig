@@ -65,13 +65,23 @@ pub const OpCode = enum(u16) {
     kv_put_response = 0x108,
     kv_scan_response = 0x109,
     kv_history_response = 0x10A,
+    // KV extended (atomic counters, JSON ops)
+    kv_incr = 0x10B,
+    kv_json_get = 0x10C,
+    kv_json_set = 0x10D,
+    kv_json_del = 0x10E,
+    // KV per-shard transactions
     kv_begin_txn = 0x110,
     kv_commit_txn = 0x111,
     kv_rollback_txn = 0x112,
-    kv_snapshot_create = 0x120,
-    kv_snapshot_get = 0x121,
-    kv_snapshot_release = 0x122,
-    kv_snapshot_create_response = 0x123,
+    // KV extended (TTL lifecycle, exists)
+    kv_touch = 0x113,
+    kv_persist = 0x114,
+    kv_exists = 0x115,
+    kv_incr_response = 0x116,
+    kv_json_response = 0x117,
+    kv_exists_response = 0x118,
+    kv_txn_response = 0x119,
 
     // ── Streams (0x130 – 0x14F) ──
     stream_append = 0x130,
@@ -271,6 +281,7 @@ pub const OptionTag = enum(u8) {
     keys_only = 0x06, // u8: Skip values in scan response (0/1)
     cursor = 0x07, // bytes: Pagination cursor (ShardWalker format)
     routing_key = 0x08, // string: Explicit routing key for shard co-location
+    txn_id = 0x09, // u64: Transaction ID for per-shard transactions
 
     // Queue Options (0x10 - 0x1F)
     priority = 0x10, // u8: Message priority (0-255, higher = more urgent)
@@ -379,6 +390,10 @@ pub const FloError = error{
     InternalError,
     UnexpectedResponse,
 
+    // Transaction errors
+    TxnUnsupportedOp,
+    TxnFinished,
+
     // Memory errors
     OutOfMemory,
 };
@@ -426,6 +441,71 @@ pub const VersionEntry = struct {
 
     pub fn deinit(self: *VersionEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.value);
+    }
+};
+
+/// Result of a successful KV put.
+///
+/// `version` is the new version assigned by the server, suitable for CAS on
+/// the next write via `PutOptions.cas_version`.
+pub const PutResult = struct {
+    version: u64,
+};
+
+/// Result of a successful KV transaction begin.
+///
+/// `txn_id` is the server-assigned transaction handle. `pinned_hash` is the
+/// partition hash this transaction is bound to — every key written or read
+/// inside the transaction must hash to the same partition.
+pub const KVBeginResult = struct {
+    txn_id: u64,
+    pinned_hash: u64,
+};
+
+/// Result of a successful KV transaction commit.
+///
+/// `commit_index` is the Raft log index of the committed batch and
+/// `op_count` is the number of buffered operations applied atomically.
+pub const KVCommitResult = struct {
+    commit_index: u64,
+    op_count: u16,
+};
+
+/// Result of a KV get that found a key.
+///
+/// `KV.get` returns `null` when the key is missing; callers must check before
+/// dereferencing. Caller owns `value` and must free it with `allocator.free`.
+pub const GetResult = struct {
+    value: []const u8,
+    version: u64,
+
+    pub fn deinit(self: *GetResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.value);
+    }
+};
+
+/// One entry in a `KV.mget` response. `found = false` indicates the key did
+/// not exist; in that case `value` is empty and `version` is 0. Memory for
+/// `key` and `value` is owned by the parent `MGetResult`.
+pub const MGetEntry = struct {
+    key: []const u8,
+    value: []const u8,
+    version: u64,
+    found: bool,
+};
+
+/// Result of a `KV.mget` call. Owns the backing memory for all entries; free
+/// with `deinit`.
+pub const MGetResult = struct {
+    entries: []MGetEntry,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *MGetResult) void {
+        for (self.entries) |entry| {
+            self.allocator.free(entry.key);
+            self.allocator.free(entry.value);
+        }
+        self.allocator.free(self.entries);
     }
 };
 
@@ -494,6 +574,38 @@ pub const HistoryOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
     limit: ?u32 = null,
+};
+
+/// Options for KV incr operations
+pub const KVIncrOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Defaults to +1 when null. Negative values decrement.
+    delta: ?i64 = null,
+};
+
+/// Options for KV touch / persist operations
+pub const KVTouchOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+};
+
+/// Options for KV exists operations
+pub const KVExistsOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+};
+
+/// Options for KV JSON.* operations
+pub const KVJsonOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+};
+
+/// Options for KV mget operations
+pub const KVMGetOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
 };
 
 /// Options for queue enqueue operations
