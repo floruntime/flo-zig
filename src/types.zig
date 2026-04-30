@@ -558,6 +558,10 @@ pub const PutOptions = struct {
 pub const DeleteOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+    /// CAS guard — when set, the delete only succeeds if the current key
+    /// version equals `if_match`. Returns `FloError.Conflict` otherwise.
+    /// Use this for race-free "only the owner deletes" patterns.
+    if_match: ?u64 = null,
 };
 
 /// Options for KV scan operations
@@ -588,6 +592,9 @@ pub const KVIncrOptions = struct {
 pub const KVTouchOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+    /// CAS guard — when set, the touch/persist only succeeds if the current
+    /// key version equals `if_match`. Use this for race-free lease renewal.
+    if_match: ?u64 = null,
 };
 
 /// Options for KV exists operations

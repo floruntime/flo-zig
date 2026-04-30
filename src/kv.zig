@@ -101,13 +101,20 @@ pub const KV = struct {
         return types.PutResult{ .version = std.mem.readInt(u64, response.data[0..8], .little) };
     }
 
-    /// Delete a key
+    /// Delete a key. Succeeds for both OK and NOT_FOUND unless `if_match`
+    /// is set, in which case a missing key surfaces `FloError.Conflict`.
     pub fn delete(self: *KV, key: []const u8, options: types.DeleteOptions) FloError!void {
         const ns = self.client.getNamespace(options.namespace);
-        var response = try self.client.sendRequest(.kv_delete, ns, key, "", "");
+
+        var opts_buf: [16]u8 = undefined;
+        var builder = wire.OptionsBuilder.init(&opts_buf);
+        if (options.if_match) |v| try builder.addU64(.cas_version, v);
+
+        var response = try self.client.sendRequest(.kv_delete, ns, key, "", builder.getOptions());
         defer response.deinit();
 
-        if (response.status != .ok and response.status != .not_found) {
+        const allow_not_found = options.if_match == null;
+        if (response.status != .ok and !(allow_not_found and response.status == .not_found)) {
             return mapStatusToError(response.status);
         }
     }
@@ -312,6 +319,9 @@ pub const KV = struct {
     }
 
     /// Update the TTL on an existing key. `ttl_seconds = 0` clears the TTL.
+    ///
+    /// When `options.if_match` is set, the touch only succeeds if the current
+    /// key version equals it — enabling race-free lease renewal.
     pub fn touch(
         self: *KV,
         key: []const u8,
@@ -321,7 +331,10 @@ pub const KV = struct {
         const ns = self.client.getNamespace(options.namespace);
         var value_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &value_buf, ttl_seconds, .little);
-        var response = try self.client.sendRequest(.kv_touch, ns, key, value_buf[0..8], "");
+        var opts_buf: [16]u8 = undefined;
+        var builder = wire.OptionsBuilder.init(&opts_buf);
+        if (options.if_match) |v| try builder.addU64(.cas_version, v);
+        var response = try self.client.sendRequest(.kv_touch, ns, key, value_buf[0..8], builder.getOptions());
         defer response.deinit();
         if (response.status != .ok) {
             return mapStatusToError(response.status);
@@ -329,9 +342,15 @@ pub const KV = struct {
     }
 
     /// Clear the TTL on an existing key, making it permanent.
+    ///
+    /// When `options.if_match` is set, the persist only succeeds if the
+    /// current key version equals it.
     pub fn persist(self: *KV, key: []const u8, options: types.KVTouchOptions) FloError!void {
         const ns = self.client.getNamespace(options.namespace);
-        var response = try self.client.sendRequest(.kv_persist, ns, key, "", "");
+        var opts_buf: [16]u8 = undefined;
+        var builder = wire.OptionsBuilder.init(&opts_buf);
+        if (options.if_match) |v| try builder.addU64(.cas_version, v);
+        var response = try self.client.sendRequest(.kv_persist, ns, key, "", builder.getOptions());
         defer response.deinit();
         if (response.status != .ok) {
             return mapStatusToError(response.status);
