@@ -72,6 +72,7 @@ pub const StreamRecordHandler = stream_worker_mod.StreamRecordHandler;
 
 // Re-export commonly used types
 pub const FloError = types.FloError;
+pub const MAX_BLOCK_MS = types.MAX_BLOCK_MS;
 pub const StatusCode = types.StatusCode;
 pub const OpCode = types.OpCode;
 

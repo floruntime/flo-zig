@@ -14,6 +14,25 @@ pub const VERSION: u8 = 0x01;
 pub const MAX_NAMESPACE_SIZE: usize = 255;
 pub const MAX_KEY_SIZE: usize = 64 * 1024; // 64 KB
 pub const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024; // 16 MB practical limit
+/// Longest blocking wait (block_ms / wait_ms) the server accepts: 5 minutes.
+/// 0 means don't wait; the server refuses anything longer with bad_request.
+pub const MAX_BLOCK_MS: u32 = 300_000;
+/// Long-poll wait a worker uses when its config says 0. A worker always
+/// long-polls, since 0 (don't wait) would spin its poll loop against the server.
+pub const DEFAULT_WORKER_BLOCK_MS: u32 = 30_000;
+
+/// Refuse a blocking wait the server would refuse, before the round trip.
+pub fn checkBlockMs(block_ms: u32) FloError!void {
+    if (block_ms > MAX_BLOCK_MS) return FloError.BlockTooLong;
+}
+
+/// Resolve a worker's block_ms: 0 means DEFAULT_WORKER_BLOCK_MS, and anything
+/// over MAX_BLOCK_MS is refused.
+pub fn workerBlockMs(block_ms: u32) FloError!u32 {
+    if (block_ms == 0) return DEFAULT_WORKER_BLOCK_MS;
+    try checkBlockMs(block_ms);
+    return block_ms;
+}
 
 /// Operation codes
 ///
@@ -291,8 +310,8 @@ pub const OptionTag = enum(u8) {
     max_retries = 0x14, // u8: Maximum retry attempts before DLQ
     count = 0x15, // u32: Number of messages to dequeue
     send_to_dlq = 0x16, // u8: Whether to send failed messages to DLQ (0/1)
-    block_ms = 0x17, // u32: Block timeout - wait until exists (0=forever)
-    wait_ms = 0x18, // u32: Watch timeout - wait for NEXT version change (0=forever)
+    block_ms = 0x17, // u32: Block timeout - wait until exists (0=don't wait, max 300000)
+    wait_ms = 0x18, // u32: Watch timeout - wait for NEXT version change (0=don't wait, max 300000)
 
     // Stream Options (0x20 - 0x2F) - StreamID-native ONLY
     // 0x20 reserved
@@ -378,6 +397,8 @@ pub const FloError = error{
     ValueTooLarge,
     OptionsBufferTooSmall,
     OptionValueTooLarge,
+    /// block_ms / wait_ms over MAX_BLOCK_MS (300000 ms, 5 minutes)
+    BlockTooLong,
 
     // Server errors
     ServerError,
@@ -1008,7 +1029,7 @@ pub const WorkerAwaitOptions = struct {
     namespace: ?[]const u8 = null,
     /// Task execution timeout (lease duration) in ms
     timeout_ms: ?u64 = null,
-    /// Block waiting for task (0 = infinite, null = no blocking)
+    /// Block waiting for task (null or 0 = don't wait, max 300000)
     block_ms: ?u32 = null,
 };
 

@@ -52,7 +52,8 @@ pub const WorkerConfig = struct {
     concurrency: u32 = 10,
     /// Action timeout in milliseconds (default: 5 minutes)
     action_timeout_ms: u64 = 300_000,
-    /// Block timeout for awaiting tasks in milliseconds
+    /// Long-poll wait per await in milliseconds, at most 300000. 0 means the
+    /// 30000 default. Worker.init returns error.BlockTooLong for more.
     block_ms: u32 = 30_000,
     /// Heartbeat interval in milliseconds (default: 30s)
     heartbeat_interval_ms: u64 = 30_000,
@@ -174,7 +175,10 @@ pub const ActionWorker = struct {
     const Self = @This();
 
     /// Initialize a new ActionWorker.
-    pub fn init(allocator: Allocator, config: WorkerConfig) !Self {
+    pub fn init(allocator: Allocator, config_in: WorkerConfig) !Self {
+        var config = config_in;
+        config.block_ms = try types.workerBlockMs(config.block_ms);
+
         var client = Client.init(allocator, config.endpoint, .{
             .namespace = config.namespace,
         });

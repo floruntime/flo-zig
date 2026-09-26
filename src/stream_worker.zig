@@ -58,7 +58,8 @@ pub const StreamWorkerConfig = struct {
     concurrency: u32 = 10,
     /// Number of messages to read per poll (default: 10)
     batch_size: u32 = 10,
-    /// Block timeout for reading in milliseconds (default: 30000)
+    /// Long-poll wait per read in milliseconds, at most 300000 (default: 30000).
+    /// 0 means the default. StreamWorker.init returns error.BlockTooLong for more.
     block_ms: u32 = 30_000,
     /// Heartbeat interval in milliseconds (default: 30s)
     heartbeat_interval_ms: u64 = 30_000,
@@ -131,7 +132,10 @@ pub const StreamWorker = struct {
     const Self = @This();
 
     /// Initialize a new StreamWorker.
-    pub fn init(allocator: Allocator, config: StreamWorkerConfig, handler: StreamRecordHandler) !Self {
+    pub fn init(allocator: Allocator, config_in: StreamWorkerConfig, handler: StreamRecordHandler) !Self {
+        var config = config_in;
+        config.block_ms = try types.workerBlockMs(config.block_ms);
+
         var client = Client.init(allocator, config.endpoint, .{
             .namespace = config.namespace,
         });

@@ -300,7 +300,7 @@ while (true) {
     // Await task (blocks until task available or timeout)
     if (try worker.awaitTask("worker-1", &[_][]const u8{ "send-email" }, .{
         .timeout_ms = 30000,  // Task lease duration
-        .block_ms = 0,        // Block forever until task arrives
+        .block_ms = 30000,    // Wait up to 30s (0 = don't wait, max 300000)
     })) |*task| {
         defer task.deinit();
 
