@@ -58,8 +58,9 @@ pub const StreamWorkerConfig = struct {
     concurrency: u32 = 10,
     /// Number of messages to read per poll (default: 10)
     batch_size: u32 = 10,
-    /// Block timeout for reading in milliseconds (default: 30000)
-    block_ms: u32 = 30_000,
+    /// Long-poll wait per read in ms. 0 means DEFAULT_WORKER_BLOCK_MS; over
+    /// MAX_BLOCK_MS, StreamWorker.init returns error.BlockTooLong.
+    block_ms: u32 = types.DEFAULT_WORKER_BLOCK_MS,
     /// Heartbeat interval in milliseconds (default: 30s)
     heartbeat_interval_ms: u64 = 30_000,
     /// Optional metadata for this worker
@@ -131,7 +132,10 @@ pub const StreamWorker = struct {
     const Self = @This();
 
     /// Initialize a new StreamWorker.
-    pub fn init(allocator: Allocator, config: StreamWorkerConfig, handler: StreamRecordHandler) !Self {
+    pub fn init(allocator: Allocator, config_in: StreamWorkerConfig, handler: StreamRecordHandler) !Self {
+        var config = config_in;
+        config.block_ms = try types.workerBlockMs(config.block_ms);
+
         var client = Client.init(allocator, config.endpoint, .{
             .namespace = config.namespace,
         });
@@ -447,4 +451,15 @@ test "generateStreamWorkerId" {
 
     try std.testing.expect(id.len > 0);
     try std.testing.expect(std.mem.startsWith(u8, id, "sw-"));
+}
+
+test "StreamWorker.init refuses block_ms over MAX_BLOCK_MS before connecting" {
+    const handler = struct {
+        fn handle(_: *StreamContext) anyerror!void {}
+    }.handle;
+    try std.testing.expectError(error.BlockTooLong, StreamWorker.init(std.testing.allocator, .{
+        .endpoint = "localhost:1",
+        .stream = "events",
+        .block_ms = types.MAX_BLOCK_MS + 1,
+    }, handler));
 }
