@@ -329,6 +329,7 @@ pub const StreamWorker = struct {
 
     /// Poll for records and process them.
     fn pollAndProcess(self: *Self, stream_name: []const u8) !void {
+        const polled = std.time.nanoTimestamp();
         var result = try self.stream.groupRead(
             stream_name,
             self.config.group,
@@ -342,6 +343,7 @@ pub const StreamWorker = struct {
         defer result.deinit();
 
         if (result.records.len == 0) {
+            types.pauseAfterEmptyPoll(polled, self.config.block_ms);
             return;
         }
 

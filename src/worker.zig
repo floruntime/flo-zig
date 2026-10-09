@@ -353,6 +353,7 @@ pub const ActionWorker = struct {
     /// Poll for a task and execute it.
     fn pollAndExecute(self: *Self) !void {
         // Await task from server
+        const polled = std.time.nanoTimestamp();
         const task_opt = try self.actions.awaitTask(
             self.worker_id,
             self.action_names.items,
@@ -362,13 +363,14 @@ pub const ActionWorker = struct {
             },
         );
 
-        if (task_opt) |task| {
-            var task_mut = task;
-            defer task_mut.deinit();
-            self.active_tasks += 1;
-            defer self.active_tasks -= 1;
-            self.executeTask(&task_mut);
-        }
+        var task = task_opt orelse {
+            types.pauseAfterEmptyPoll(polled, self.config.block_ms);
+            return;
+        };
+        defer task.deinit();
+        self.active_tasks += 1;
+        defer self.active_tasks -= 1;
+        self.executeTask(&task);
     }
 
     /// Execute a task with error handling.

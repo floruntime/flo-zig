@@ -32,6 +32,26 @@ pub fn workerBlockMs(block_ms: u32) FloError!u32 {
     return block_ms;
 }
 
+/// How long a worker waits before polling again after a blocking poll came
+/// back empty well before its block_ms. The server answers a blocking read
+/// empty at once when it has no room to park it, so polling again straight
+/// away would spin against a server that is already full.
+pub const EMPTY_POLL_PAUSE_MS: u64 = 100;
+
+/// The pause after an empty poll that took `elapsed_ns` with `block_ms`:
+/// EMPTY_POLL_PAUSE_MS if it returned in under half of block_ms, else 0.
+pub fn emptyPollPauseMs(elapsed_ns: u64, block_ms: u32) u64 {
+    if (elapsed_ns >= @as(u64, block_ms) * std.time.ns_per_ms / 2) return 0;
+    return EMPTY_POLL_PAUSE_MS;
+}
+
+/// Sleep for emptyPollPauseMs after an empty poll started at `polled_ns`
+/// (std.time.nanoTimestamp).
+pub fn pauseAfterEmptyPoll(polled_ns: i128, block_ms: u32) void {
+    const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - polled_ns));
+    std.Thread.sleep(emptyPollPauseMs(elapsed, block_ms) * std.time.ns_per_ms);
+}
+
 /// Operation codes
 ///
 /// Three-layer layout: Infra(0x000-0x0FF), Data(0x100-0x2FF), Compute(0x300-0x3FF)
@@ -1255,6 +1275,13 @@ pub const ProcessingSyncResult = struct {
         self.allocator.free(self.job_id);
     }
 };
+
+test "emptyPollPauseMs pauses only after an early empty poll" {
+    try std.testing.expectEqual(EMPTY_POLL_PAUSE_MS, emptyPollPauseMs(0, 30_000));
+    try std.testing.expectEqual(EMPTY_POLL_PAUSE_MS, emptyPollPauseMs(14_999 * std.time.ns_per_ms, 30_000));
+    try std.testing.expectEqual(@as(u64, 0), emptyPollPauseMs(15_000 * std.time.ns_per_ms, 30_000));
+    try std.testing.expectEqual(@as(u64, 0), emptyPollPauseMs(30_000 * std.time.ns_per_ms, 30_000));
+}
 
 test "workerBlockMs: 0 means the default, over MAX_BLOCK_MS is refused" {
     try std.testing.expectEqual(@as(u32, 30000), try workerBlockMs(0));
