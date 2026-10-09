@@ -18,9 +18,10 @@ pub const ClientOptions = struct {
     namespace: []const u8 = "default",
     /// The longest a request may go without the socket accepting or
     /// delivering any bytes, in milliseconds, plus its block_ms / wait_ms for
-    /// blocking requests. It bounds silence, not the whole request. On expiry
-    /// the call returns error.Timeout and the client disconnects. 0 = no
-    /// timeout. Not applied on Windows.
+    /// blocking requests (an action await without block_ms counts as 30 s).
+    /// It bounds silence, not the whole request. On expiry the call returns
+    /// error.Timeout and the client disconnects. 0 = no timeout. Not applied
+    /// on Windows.
     timeout_ms: u32 = 5_000,
     /// Enable debug logging
     debug: bool = false,
@@ -158,18 +159,16 @@ pub const Client = struct {
         self.request_id += 1;
 
         const timeout_ms: u64 = if (self.timeout_ms == 0) 0 else @as(u64, self.timeout_ms) + blockingWaitMs(op_code, options);
-        setSocketTimeout(stream.handle, timeout_ms) catch return FloError.ConnectionFailed;
-
-        // Send
-        stream.writeAll(serialized) catch |err| {
-            // Part of the frame may be on the wire; the next request would
-            // be read as its remainder.
+        setSocketTimeout(stream.handle, timeout_ms) catch {
             self.disconnect();
-            return if (err == error.WouldBlock) FloError.Timeout else FloError.ConnectionFailed;
+            return FloError.ConnectionFailed;
         };
 
+        // Send
+        stream.writeAll(serialized) catch |err| return self.sendFailed(err);
+
         // Read response header
-        var header_buf: [24]u8 = undefined;
+        var header_buf: [@sizeOf(wire.ResponseHeader)]u8 = undefined;
         readExact(stream, &header_buf) catch |err| return self.readFailed(err);
 
         const response_header = @as(*align(1) const wire.ResponseHeader, @ptrCast(&header_buf)).*;
@@ -188,6 +187,13 @@ pub const Client = struct {
             .data = data,
             .allocator = self.allocator,
         };
+    }
+
+    fn sendFailed(self: *Self, err: anyerror) FloError {
+        // Part of the frame may be on the wire; the next request would be
+        // read as its remainder.
+        self.disconnect();
+        return if (err == error.WouldBlock) FloError.Timeout else FloError.ConnectionFailed;
     }
 
     fn readFailed(self: *Self, err: anyerror) FloError {
@@ -221,6 +227,13 @@ fn readExact(stream: std.net.Stream, buf: []u8) !void {
     }
 }
 
+/// Whether err leaves the connection unusable, so the caller has to
+/// reconnect before its next request.
+pub fn isConnectionError(err: anyerror) bool {
+    return err == FloError.Timeout or err == FloError.NotConnected or
+        err == FloError.UnexpectedEof or err == FloError.ConnectionFailed;
+}
+
 /// How long the server may hold a request on purpose: the longest block_ms /
 /// wait_ms in its options, or for an action await without block_ms the
 /// server's 30 s default; 0 if none.
@@ -247,8 +260,12 @@ fn setSocketTimeout(handle: std.posix.socket_t, ms: u64) !void {
         .sec = @intCast(ms / std.time.ms_per_s),
         .usec = @intCast((ms % std.time.ms_per_s) * std.time.us_per_ms),
     };
-    try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
-    try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+    // Not posix.setsockopt: it treats EINVAL as unreachable, and macOS
+    // returns EINVAL for a socket the peer has reset.
+    for ([_]u32{ posix.SO.RCVTIMEO, posix.SO.SNDTIMEO }) |opt| {
+        const rc = posix.system.setsockopt(handle, posix.SOL.SOCKET, opt, std.mem.asBytes(&tv), @sizeOf(posix.timeval));
+        if (posix.errno(rc) != .SUCCESS) return error.SetSockOptFailed;
+    }
 }
 
 /// Resolve hostname or IP to address
@@ -418,4 +435,108 @@ test "a response body that stalls partway fails with Timeout" {
 
     try std.testing.expectError(FloError.Timeout, client.sendRequest(.kv_get, "default", "k", "", ""));
     try std.testing.expect(!client.isConnected());
+}
+
+/// Accepts one connection and never reads from it. Closes it when `release`
+/// is set or after hold_ms, with zero linger if `reset` so the peer sees a
+/// reset, then sets `closed`.
+const HoldServer = struct {
+    server: std.net.Server,
+    hold_ms: u64 = 5_000,
+    reset: bool = false,
+    release: std.Thread.ResetEvent = .{},
+    closed: std.Thread.ResetEvent = .{},
+    thread: std.Thread = undefined,
+    endpoint_buf: [32]u8 = undefined,
+    endpoint: []const u8 = "",
+
+    fn listen() !HoldServer {
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+        return .{ .server = try addr.listen(.{}) };
+    }
+
+    fn start(self: *HoldServer) !void {
+        self.endpoint = try std.fmt.bufPrint(&self.endpoint_buf, "127.0.0.1:{d}", .{self.server.listen_address.getPort()});
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn serve(self: *HoldServer) void {
+        const conn = self.server.accept() catch return;
+        self.release.timedWait(self.hold_ms * std.time.ns_per_ms) catch {};
+        if (self.reset) {
+            const linger = extern struct { onoff: c_int, linger: c_int }{ .onoff = 1, .linger = 0 };
+            std.posix.setsockopt(conn.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger)) catch {};
+        }
+        conn.stream.close();
+        self.closed.set();
+    }
+
+    fn stop(self: *HoldServer) void {
+        self.release.set();
+        self.thread.join();
+        self.server.deinit();
+    }
+};
+
+test "isConnectionError: the errors after which a connection can't be reused" {
+    for ([_]FloError{ FloError.Timeout, FloError.NotConnected, FloError.UnexpectedEof, FloError.ConnectionFailed }) |err| {
+        try std.testing.expect(isConnectionError(err));
+    }
+    for ([_]FloError{ FloError.NotFound, FloError.BadRequest, FloError.ServerError }) |err| {
+        try std.testing.expect(!isConnectionError(err));
+    }
+}
+
+test "a request on a connection the server reset fails with ConnectionFailed and disconnects" {
+    var srv = try HoldServer.listen();
+    srv.reset = true;
+    try srv.start();
+    defer srv.stop();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{ .timeout_ms = 1_000 });
+    defer client.deinit();
+    try client.connect();
+    srv.release.set();
+    srv.closed.wait();
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    try std.testing.expectError(FloError.ConnectionFailed, client.sendRequest(.kv_get, "default", "k", "", ""));
+    try std.testing.expect(!client.isConnected());
+}
+
+test "a failed send disconnects; a send that would block is a Timeout" {
+    var srv = try HoldServer.listen();
+    try srv.start();
+    defer srv.stop();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+
+    try client.connect();
+    try std.testing.expectEqual(FloError.ConnectionFailed, client.sendFailed(error.BrokenPipe));
+    try std.testing.expect(!client.isConnected());
+
+    try client.connect();
+    try std.testing.expectEqual(FloError.Timeout, client.sendFailed(error.WouldBlock));
+    try std.testing.expect(!client.isConnected());
+}
+
+test "timeout_ms 0 never times out, even with a block_ms" {
+    var srv = try HoldServer.listen();
+    srv.hold_ms = 600;
+    try srv.start();
+    defer srv.stop();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{ .timeout_ms = 0 });
+    defer client.deinit();
+    try client.connect();
+
+    var opts_buf: [8]u8 = undefined;
+    var opts = wire.OptionsBuilder.init(&opts_buf);
+    try opts.addU32(.block_ms, 100);
+
+    // The call ends only when the server hangs up.
+    var timer = try std.time.Timer.start();
+    try std.testing.expectError(FloError.UnexpectedEof, client.sendRequest(.kv_get, "default", "k", "", opts.getOptions()));
+    try std.testing.expect(timer.read() >= 500 * std.time.ns_per_ms);
 }

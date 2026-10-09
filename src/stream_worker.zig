@@ -29,7 +29,8 @@
 
 const std = @import("std");
 const types = @import("types.zig");
-const Client = @import("client.zig").Client;
+const client_mod = @import("client.zig");
+const Client = client_mod.Client;
 const Stream = @import("stream.zig").Stream;
 const Actions = @import("actions.zig").Actions;
 
@@ -199,15 +200,7 @@ pub const StreamWorker = struct {
             self.consumer_name,
         });
 
-        // Join consumer group for each stream
-        for (stream_list) |stream_name| {
-            try self.stream.groupJoin(
-                stream_name,
-                self.config.group,
-                self.consumer_name,
-                .{ .namespace = self.config.namespace },
-            );
-        }
+        try self.joinGroups();
 
         // Register in worker registry with all streams as processes
         var process_names = try self.allocator.alloc([]u8, stream_list.len);
@@ -253,6 +246,14 @@ pub const StreamWorker = struct {
 
         // Main polling loop
         while (self.running) {
+            if (!self.client.isConnected()) {
+                self.reconnect() catch |err| {
+                    std.log.err("[flo-stream-worker] Reconnect failed: {}, retrying...", .{err});
+                    std.Thread.sleep(1 * std.time.ns_per_s);
+                    continue;
+                };
+            }
+
             // Send heartbeat if interval has elapsed
             self.maybeHeartbeat();
 
@@ -270,8 +271,13 @@ pub const StreamWorker = struct {
             }
 
             self.pollAndProcess(stream_list[stream_idx]) catch |err| {
-                std.log.err("[flo-stream-worker] GroupRead error: {}, retrying...", .{err});
-                std.Thread.sleep(1 * std.time.ns_per_s);
+                if (client_mod.isConnectionError(err)) {
+                    std.log.warn("[flo-stream-worker] Connection lost: {}, reconnecting...", .{err});
+                    self.client.disconnect();
+                } else {
+                    std.log.err("[flo-stream-worker] GroupRead error: {}, retrying...", .{err});
+                    std.Thread.sleep(1 * std.time.ns_per_s);
+                }
             };
 
             // Round-robin across streams
@@ -282,6 +288,24 @@ pub const StreamWorker = struct {
             self.messages_processed,
             self.messages_failed,
         });
+    }
+
+    /// Open a fresh connection and join the groups on it again.
+    fn reconnect(self: *Self) !void {
+        try self.client.reconnect();
+        errdefer self.client.disconnect();
+        try self.joinGroups();
+    }
+
+    fn joinGroups(self: *Self) !void {
+        for (self.config.getStreams()) |stream_name| {
+            try self.stream.groupJoin(
+                stream_name,
+                self.config.group,
+                self.consumer_name,
+                .{ .namespace = self.config.namespace },
+            );
+        }
     }
 
     /// Stop the worker immediately.
@@ -483,4 +507,36 @@ test "StreamWorker.init turns block_ms 0 into 30000" {
         w.client.deinit();
     }
     try std.testing.expectEqual(@as(u32, 30000), w.config.block_ms);
+}
+
+fn runWorker(w: *StreamWorker) void {
+    w.start() catch |err| std.debug.panic("stream worker start: {}", .{err});
+}
+
+test "StreamWorker reconnects after a group read times out and acks the next record" {
+    const handler = struct {
+        fn handle(_: *StreamContext) anyerror!void {}
+    }.handle;
+    // [count:u32] then one record: [seq:u64][ts:u64][tier:u8][partition:u32]
+    // [key_present:u8][payload_len:u32]["hi"][header_count:u32]
+    const records = "\x01\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ "\x00" ** 8 ++ "\x00" ++
+        "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4;
+    var srv = try @import("stall_server.zig").StallServer.listen(.stream_group_join, .stream_group_read, .stream_group_ack, records);
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, handler);
+    defer w.deinit();
+    // init's Stream and Actions point at init's own copy of the client.
+    w.stream = Stream.init(&w.client);
+    w.actions = Actions.init(&w.client);
+    w.client.timeout_ms = 200;
+
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    const done = srv.waitDone(1, 10_000);
+    w.stop();
+    thread.join();
+
+    try std.testing.expect(done);
+    try std.testing.expectEqual(@as(u32, 2), srv.connections.load(.monotonic));
 }

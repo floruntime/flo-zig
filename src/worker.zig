@@ -33,7 +33,8 @@
 
 const std = @import("std");
 const types = @import("types.zig");
-const Client = @import("client.zig").Client;
+const client_mod = @import("client.zig");
+const Client = client_mod.Client;
 const Actions = @import("actions.zig").Actions;
 
 const FloError = types.FloError;
@@ -254,6 +255,59 @@ pub const ActionWorker = struct {
             self.config.concurrency,
         });
 
+        try self.registerWorker();
+
+        self.running = true;
+        self.last_heartbeat_ns = std.time.nanoTimestamp();
+
+        // Main polling loop
+        while (self.running) {
+            if (!self.client.isConnected()) {
+                self.reconnect() catch |err| {
+                    std.log.err("[flo-worker] Reconnect failed: {}, retrying...", .{err});
+                    std.Thread.sleep(1 * std.time.ns_per_s);
+                    continue;
+                };
+            }
+
+            // Send heartbeat if interval has elapsed
+            self.maybeHeartbeat();
+
+            // If draining and no active tasks, we're done
+            if (self.draining and self.active_tasks == 0) {
+                std.log.info("[flo-worker] Drain complete, shutting down", .{});
+                self.running = false;
+                break;
+            }
+
+            // Don't accept new tasks while draining
+            if (self.draining) {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                continue;
+            }
+
+            self.pollAndExecute() catch |err| {
+                if (client_mod.isConnectionError(err)) {
+                    std.log.warn("[flo-worker] Connection lost: {}, reconnecting...", .{err});
+                    self.client.disconnect();
+                } else {
+                    std.log.err("[flo-worker] Await error: {}, retrying...", .{err});
+                    std.Thread.sleep(1 * std.time.ns_per_s);
+                }
+            };
+        }
+
+        std.log.info("[flo-worker] Worker stopped", .{});
+    }
+
+    /// Open a fresh connection and register on it again.
+    fn reconnect(self: *Self) !void {
+        try self.client.reconnect();
+        errdefer self.client.disconnect();
+        try self.registerWorker();
+    }
+
+    fn registerWorker(self: *Self) !void {
         // Build process list for registration
         var processes: [64]types.ProcessEntry = undefined;
         const count = @min(self.action_names.items.len, 64);
@@ -274,35 +328,6 @@ pub const ActionWorker = struct {
                 .machine_id = self.config.machine_id,
             },
         );
-
-        self.running = true;
-        self.last_heartbeat_ns = std.time.nanoTimestamp();
-
-        // Main polling loop
-        while (self.running) {
-            // Send heartbeat if interval has elapsed
-            self.maybeHeartbeat();
-
-            // If draining and no active tasks, we're done
-            if (self.draining and self.active_tasks == 0) {
-                std.log.info("[flo-worker] Drain complete, shutting down", .{});
-                self.running = false;
-                break;
-            }
-
-            // Don't accept new tasks while draining
-            if (self.draining) {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
-                continue;
-            }
-
-            self.pollAndExecute() catch |err| {
-                std.log.err("[flo-worker] Await error: {}, retrying...", .{err});
-                std.Thread.sleep(1 * std.time.ns_per_s);
-            };
-        }
-
-        std.log.info("[flo-worker] Worker stopped", .{});
     }
 
     /// Stop the worker immediately.
@@ -537,4 +562,36 @@ test "ActionWorker.init turns block_ms 0 into 30000" {
         w.client.deinit();
     }
     try std.testing.expectEqual(@as(u32, 30000), w.config.block_ms);
+}
+
+fn runWorker(w: *ActionWorker) void {
+    w.start() catch |err| std.debug.panic("worker start: {}", .{err});
+}
+
+test "ActionWorker reconnects after an await times out and runs the next task" {
+    const handler = struct {
+        fn handle(ctx: *ActionContext) anyerror!ActionHandlerResult {
+            return .{ .bytes = try ctx.allocator.dupe(u8, "done") };
+        }
+    }.handle;
+    // [task_id_len:u16]["t1"][task_type_len:u16]["job"][created_at:i64][attempt:u32][has_caller:u8]
+    const task = "\x02\x00t1\x03\x00job" ++ "\x00" ** 8 ++ "\x01\x00\x00\x00" ++ "\x00";
+    var srv = try @import("stall_server.zig").StallServer.listen(.worker_register, .action_await, .action_complete, task);
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    // init's Actions points at init's own copy of the client.
+    w.actions = Actions.init(&w.client);
+    w.client.timeout_ms = 200;
+    try w.registerAction("job", handler);
+
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    const done = srv.waitDone(1, 10_000);
+    w.stop();
+    thread.join();
+
+    try std.testing.expect(done);
+    try std.testing.expectEqual(@as(u32, 2), srv.connections.load(.monotonic));
 }
