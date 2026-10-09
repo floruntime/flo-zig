@@ -463,3 +463,24 @@ test "StreamWorker.init refuses block_ms over MAX_BLOCK_MS before connecting" {
         .block_ms = types.MAX_BLOCK_MS + 1,
     }, handler));
 }
+
+test "StreamWorker.init turns block_ms 0 into 30000" {
+    // A worker that polls with block_ms 0 would spin against the server.
+    const handler = struct {
+        fn handle(_: *StreamContext) anyerror!void {}
+    }.handle;
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var endpoint_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "127.0.0.1:{d}", .{server.listen_address.getPort()});
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = endpoint, .stream = "events", .block_ms = 0 }, handler);
+    // Not deinit: it sends requests the listener never answers.
+    defer {
+        std.testing.allocator.free(w.consumer_name);
+        std.testing.allocator.free(w.worker_id);
+        w.client.deinit();
+    }
+    try std.testing.expectEqual(@as(u32, 30000), w.config.block_ms);
+}

@@ -519,3 +519,22 @@ test "ActionWorker.init refuses block_ms over MAX_BLOCK_MS before connecting" {
         .block_ms = types.MAX_BLOCK_MS + 1,
     }));
 }
+
+test "ActionWorker.init turns block_ms 0 into 30000" {
+    // A worker that polls with block_ms 0 would spin against the server.
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var endpoint_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "127.0.0.1:{d}", .{server.listen_address.getPort()});
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = endpoint, .block_ms = 0 });
+    // Not deinit: it sends a deregister the listener never answers.
+    defer {
+        w.handlers.deinit();
+        w.action_names.deinit(std.testing.allocator);
+        std.testing.allocator.free(w.worker_id);
+        w.client.deinit();
+    }
+    try std.testing.expectEqual(@as(u32, 30000), w.config.block_ms);
+}

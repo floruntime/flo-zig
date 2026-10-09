@@ -1027,7 +1027,7 @@ pub const WorkerAwaitOptions = struct {
     namespace: ?[]const u8 = null,
     /// Task execution timeout (lease duration) in ms
     timeout_ms: ?u64 = null,
-    /// Block waiting for task (null or 0 = don't wait, max 300000)
+    /// Block waiting for task (null = 30000, 0 = don't wait, max 300000)
     block_ms: ?u32 = null,
 };
 
@@ -1257,7 +1257,7 @@ pub const ProcessingSyncResult = struct {
 };
 
 test "workerBlockMs: 0 means the default, over MAX_BLOCK_MS is refused" {
-    try std.testing.expectEqual(DEFAULT_WORKER_BLOCK_MS, try workerBlockMs(0));
+    try std.testing.expectEqual(@as(u32, 30000), try workerBlockMs(0));
     try std.testing.expectEqual(@as(u32, 1000), try workerBlockMs(1000));
     try std.testing.expectEqual(MAX_BLOCK_MS, try workerBlockMs(MAX_BLOCK_MS));
     try std.testing.expectError(FloError.BlockTooLong, workerBlockMs(MAX_BLOCK_MS + 1));
