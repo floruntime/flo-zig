@@ -156,7 +156,7 @@ pub const Client = struct {
         stream.writeAll(serialized) catch return FloError.ConnectionFailed;
 
         // Read response header
-        var header_buf: [24]u8 = undefined;
+        var header_buf: [@sizeOf(wire.ResponseHeader)]u8 = undefined;
         readExact(stream, &header_buf) catch return FloError.UnexpectedEof;
 
         const response_header = @as(*align(1) const wire.ResponseHeader, @ptrCast(&header_buf)).*;
@@ -255,4 +255,22 @@ test "resolveAddress IPv4" {
 test "resolveAddress IPv6" {
     const addr = try resolveAddress("::1", 9000);
     try std.testing.expectEqual(std.posix.AF.INET6, addr.any.family);
+}
+
+test "two requests on one connection each read their whole response" {
+    var srv = try @import("test_server.zig").OkServer.listen();
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+
+    for (0..2) |_| {
+        var resp = try client.sendRequest(.kv_get, "default", "k", "", "");
+        defer resp.deinit();
+        try std.testing.expectEqual(StatusCode.ok, resp.status);
+        try std.testing.expectEqual(@as(usize, 0), resp.data.len);
+    }
+    try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.monotonic));
 }
