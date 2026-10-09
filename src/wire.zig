@@ -471,7 +471,7 @@ test "OptionsBuilder and Iterator roundtrip" {
     var buffer: [64]u8 = undefined;
     var builder = OptionsBuilder.init(&buffer);
 
-    try builder.addU64(.ttl_seconds, 3600);
+    try builder.addU64(.ttl_ms, 3_600_000);
     try builder.addU8(.priority, 5);
     try builder.addBytes(.dedup_key, "abc123");
 
@@ -480,8 +480,8 @@ test "OptionsBuilder and Iterator roundtrip" {
     var iter = OptionsIterator.init(options);
 
     const ttl_opt = iter.next().?;
-    try std.testing.expectEqual(OptionTag.ttl_seconds, ttl_opt.tag);
-    try std.testing.expectEqual(@as(u64, 3600), ttl_opt.asU64().?);
+    try std.testing.expectEqual(OptionTag.ttl_ms, ttl_opt.tag);
+    try std.testing.expectEqual(@as(u64, 3_600_000), ttl_opt.asU64().?);
 
     const priority_opt = iter.next().?;
     try std.testing.expectEqual(OptionTag.priority, priority_opt.tag);

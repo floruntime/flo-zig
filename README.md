@@ -124,7 +124,7 @@ try kv.put("key", "value", .{});
 
 // Put with options
 try kv.put("key", "value", .{
-    .ttl_seconds = 3600,        // Expire after 1 hour
+    .ttl_ms = 3_600_000,        // Expire after 1 hour
     .cas_version = 5,           // Compare-and-swap
     .if_not_exists = true,      // Only set if key doesn't exist
 });
