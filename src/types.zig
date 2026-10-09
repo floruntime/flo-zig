@@ -257,7 +257,7 @@ pub const OptionTag = enum(u8) {
     txn_id = 0x09, // u64: Transaction ID for per-shard transactions
 
     // Queue Options (0x10 - 0x1F)
-    priority = 0x10, // u8: Message priority (0-255, higher = more urgent)
+    priority = 0x10, // u8: Message priority (0-255, lower is dequeued first)
     count = 0x15, // u32: Number of messages to dequeue
     block_ms = 0x17, // u32: Blocking wait for data (0=don't wait, max 300000)
     wait_ms = 0x18, // u32: Watch timeout - wait for NEXT version change (0=don't wait, max 300000)
@@ -568,6 +568,7 @@ pub const KVMGetOptions = struct {
 pub const EnqueueOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+    /// Lower is dequeued first; equal priorities go in enqueue order.
     priority: u8 = 0,
 };
 
@@ -864,7 +865,7 @@ pub const ActionRegisterOptions = struct {
 pub const ActionInvokeOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Task priority (higher = more urgent)
+    /// Task priority. The server skips this byte today; it has no effect.
     priority: ?u8 = null,
     /// Delay before task becomes visible (ms)
     delay_ms: ?u64 = null,

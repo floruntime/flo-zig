@@ -67,9 +67,7 @@ pub fn main() !void {
         std.debug.print("Message: {s}\n", .{msg.payload});
     }
 
-    // Acknowledge processed messages
-    var seqs = [_]u64{ result.messages[0].seq };
-    try queue.ack("tasks", &seqs, .{});
+    // No ack needed: dequeue already acknowledged these messages (see Queue Operations).
 }
 ```
 
@@ -159,13 +157,15 @@ var queue = flo.Queue.init(&client);
 
 // Enqueue message (uses client's default namespace)
 const seq = try queue.enqueue("queue-name", "payload", .{
-    .priority = 5, // Higher = more urgent
+    .priority = 5, // Lower is dequeued first (0 = default, taken before 5)
 });
 
 // Enqueue to different namespace
 const seq = try queue.enqueue("queue-name", "payload", .{ .namespace = "other-ns" });
 
-// Dequeue messages
+// Dequeue messages. Queues are at-most-once today: dequeue acknowledges each
+// message as it hands it out, so a message is not redelivered if the consumer
+// fails, and ack/nack have no effect on it.
 var result = try queue.dequeue("queue-name", 10, .{});
 defer result.deinit();
 
@@ -173,18 +173,16 @@ defer result.deinit();
 var result = try queue.dequeue("queue-name", 10, .{ .block_ms = 5000 });
 defer result.deinit();
 
-// Acknowledge messages
+// ack / nack exist on the wire but have no effect on a dequeued message,
+// since dequeue already acknowledged it. Don't rely on them for retries.
 try queue.ack("queue-name", &seqs, .{});
-
-// Negative acknowledge (the server retries or dead-letters by its retry policy)
 try queue.nack("queue-name", &seqs, .{});
 
-// List DLQ messages
+// The DLQ isn't reached in normal use, because dequeued messages are never
+// failed back. dlqList returns a count summary; dlqRequeue is refused by the
+// server as not implemented.
 var dlq = try queue.dlqList("queue-name", .{ .limit = 100 });
 defer dlq.deinit();
-
-// Requeue from DLQ
-try queue.dlqRequeue("queue-name", &seqs, .{});
 ```
 
 ### Stream Operations

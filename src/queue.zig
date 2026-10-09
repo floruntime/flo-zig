@@ -90,7 +90,8 @@ pub const Queue = struct {
         return wire.parseDequeueResponse(self.client.allocator, response.data);
     }
 
-    /// Acknowledge messages (mark as processed)
+    /// Acknowledge messages. Dequeue already acknowledges each message it
+    /// hands out (queues are at-most-once), so this has no effect on one.
     pub fn ack(
         self: *Queue,
         queue_name: []const u8,
@@ -116,7 +117,8 @@ pub const Queue = struct {
         }
     }
 
-    /// Negative acknowledge messages (the server decides between retry and DLQ)
+    /// Negative acknowledge messages. Dequeue already acknowledged them, so
+    /// this has no effect on a dequeued message and does not retry it.
     pub fn nack(
         self: *Queue,
         queue_name: []const u8,
@@ -172,7 +174,8 @@ pub const Queue = struct {
         return wire.parseDequeueResponse(self.client.allocator, response.data);
     }
 
-    /// Requeue messages from DLQ back to main queue
+    /// Requeue messages from DLQ back to main queue. The server refuses this
+    /// as not implemented.
     pub fn dlqRequeue(
         self: *Queue,
         queue_name: []const u8,
