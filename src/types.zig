@@ -32,15 +32,12 @@ pub fn workerBlockMs(block_ms: u32) FloError!u32 {
     return block_ms;
 }
 
-/// Paces a worker's polls after blocking polls that come back empty early.
-/// The server answers early and empty in two cases that look the same on
-/// the wire: a blocking read or await it has no room to park is answered at
-/// once, and a parked group read is woken by every append as a cue to read
-/// again. A wake comes whenever a record arrives and its re-read finds the
-/// record, while a full server answers within a round trip, every time. So
-/// only an empty answer in under EARLY_EMPTY_MS (or half of block_ms) counts
-/// as early, a first early empty is re-polled at once, and only back-to-back
-/// early empties back off: 50 ms, doubling up to 1 s.
+/// Paces polls that come back empty early. The server answers a blocking
+/// read early and empty both when it has no room to park it and, for a group
+/// read, when an append wakes it as a cue to re-read. Only timing tells them
+/// apart. So an empty counts as early under min(EARLY_EMPTY_MS, block_ms/2),
+/// the first early empty is re-polled at once, and back-to-back ones pause
+/// 50 ms doubling to 1 s.
 pub const EmptyPollBackoff = struct {
     early_empties: u32 = 0,
 

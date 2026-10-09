@@ -364,7 +364,8 @@ pub const ActionWorker = struct {
             },
         );
 
-        const elapsed = (try std.time.Instant.now()).since(polled);
+        // No `try`: an error here would leak a task already handed to us.
+        const elapsed = if (std.time.Instant.now()) |now| now.since(polled) else |_| 0;
         const pause_ms = self.backoff.afterPoll(task_opt == null, elapsed, self.config.block_ms);
         var task = task_opt orelse {
             types.pauseWhileRunning(&self.running, pause_ms);
