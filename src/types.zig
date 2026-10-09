@@ -290,7 +290,7 @@ pub const StatusCode = enum(u8) {
 /// Option tags for TLV-encoded operation parameters
 pub const OptionTag = enum(u8) {
     // KV Options (0x01 - 0x0F)
-    ttl_seconds = 0x01, // u64: Time-to-live in seconds (0 = no expiration)
+    ttl_ms = 0x01, // u64: KV time-to-live in milliseconds (0 = no expiration)
     cas_version = 0x02, // u64: Expected version for compare-and-swap
     if_not_exists = 0x03, // void: Only set if key doesn't exist (NX)
     if_exists = 0x04, // void: Only set if key exists (XX)
@@ -569,7 +569,8 @@ pub const GetOptions = struct {
 pub const PutOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    ttl_seconds: ?u64 = null,
+    /// Expire the key after this many milliseconds (0 = no expiration)
+    ttl_ms: ?u64 = null,
     cas_version: ?u64 = null,
     if_not_exists: bool = false,
     if_exists: bool = false,

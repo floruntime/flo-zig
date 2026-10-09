@@ -172,11 +172,17 @@ pub const Client = struct {
         readExact(stream, &header_buf) catch |err| return self.readFailed(err);
 
         const response_header = @as(*align(1) const wire.ResponseHeader, @ptrCast(&header_buf)).*;
-        try response_header.validate();
+        response_header.validate() catch |err| {
+            self.disconnect();
+            return err;
+        };
 
         // Read response data
         const data: []u8 = if (response_header.data_len > 0) blk: {
-            const buf = self.allocator.alloc(u8, response_header.data_len) catch return FloError.ServerError;
+            const buf = self.allocator.alloc(u8, response_header.data_len) catch {
+                self.disconnect();
+                return FloError.ServerError;
+            };
             errdefer self.allocator.free(buf);
             readExact(stream, buf) catch |err| return self.readFailed(err);
             break :blk buf;
@@ -197,11 +203,10 @@ pub const Client = struct {
     }
 
     fn readFailed(self: *Self, err: anyerror) FloError {
-        if (err != error.WouldBlock) return FloError.UnexpectedEof;
-        // The response may still arrive and would be read as the answer to
-        // the next request.
+        // Whatever is still unread (or still to arrive) would be read as the
+        // start of the next request's reply.
         self.disconnect();
-        return FloError.Timeout;
+        return if (err == error.WouldBlock) FloError.Timeout else FloError.UnexpectedEof;
     }
 
     /// Get the next request ID
@@ -521,6 +526,27 @@ test "a failed send disconnects; a send that would block is a Timeout" {
     try std.testing.expect(!client.isConnected());
 }
 
+test "a connection the server closes is dropped" {
+    var srv = try HoldServer.listen();
+    try srv.start();
+    defer srv.stop();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{ .timeout_ms = 1_000 });
+    defer client.deinit();
+    try client.connect();
+    srv.release.set();
+    srv.closed.wait();
+
+    if (client.sendRequest(.kv_get, "default", "k", "", "")) |resp| {
+        var r = resp;
+        r.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(err == FloError.UnexpectedEof or err == FloError.ConnectionFailed);
+    }
+    try std.testing.expect(!client.isConnected());
+}
+
 test "timeout_ms 0 never times out, even with a block_ms" {
     var srv = try HoldServer.listen();
     srv.hold_ms = 600;
@@ -539,4 +565,22 @@ test "timeout_ms 0 never times out, even with a block_ms" {
     var timer = try std.time.Timer.start();
     try std.testing.expectError(FloError.UnexpectedEof, client.sendRequest(.kv_get, "default", "k", "", opts.getOptions()));
     try std.testing.expect(timer.read() >= 500 * std.time.ns_per_ms);
+}
+
+test "two requests on one connection each read their whole response" {
+    var srv = try @import("test_server.zig").OkServer.listen();
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+
+    for (0..2) |_| {
+        var resp = try client.sendRequest(.kv_get, "default", "k", "", "");
+        defer resp.deinit();
+        try std.testing.expectEqual(StatusCode.ok, resp.status);
+        try std.testing.expectEqual(@as(usize, 0), resp.data.len);
+    }
+    try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.monotonic));
 }
