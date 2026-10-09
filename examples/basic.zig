@@ -56,11 +56,11 @@ pub fn main() !void {
     }
 
     // Put with TTL
-    _ = kv.put("temp", "expires soon", .{ .ttl_seconds = 60 }) catch |err| {
+    _ = kv.put("temp", "expires soon", .{ .ttl_ms = 60_000 }) catch |err| {
         std.debug.print("PUT with TTL failed: {}\n", .{err});
         return;
     };
-    std.debug.print("PUT temp = 'expires soon' (TTL: 60s)\n", .{});
+    std.debug.print("PUT temp = 'expires soon' (TTL: 60000 ms)\n", .{});
 
     // Put to a different namespace (override default)
     _ = kv.put("config-key", "config-value", .{ .namespace = "config" }) catch |err| {

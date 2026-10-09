@@ -69,18 +69,7 @@ pub const KV = struct {
         var opts_buf: [64]u8 = undefined;
         var builder = wire.OptionsBuilder.init(&opts_buf);
 
-        if (options.ttl_seconds) |ttl| {
-            try builder.addU64(.ttl_seconds, ttl);
-        }
-        if (options.cas_version) |version| {
-            try builder.addU64(.cas_version, version);
-        }
-        if (options.if_not_exists) {
-            try builder.addFlag(.if_not_exists);
-        }
-        if (options.if_exists) {
-            try builder.addFlag(.if_exists);
-        }
+        try addPutOptions(&builder, options);
 
         var response = try self.client.sendRequest(
             .kv_put,
@@ -318,19 +307,18 @@ pub const KV = struct {
         return std.mem.readInt(i64, response.data[8..16], .little);
     }
 
-    /// Update the TTL on an existing key. `ttl_seconds = 0` clears the TTL.
+    /// Update the TTL on an existing key, in milliseconds. `ttl_ms = 0` clears the TTL.
     ///
     /// When `options.if_match` is set, the touch only succeeds if the current
     /// key version equals it — enabling race-free lease renewal.
     pub fn touch(
         self: *KV,
         key: []const u8,
-        ttl_seconds: u64,
+        ttl_ms: u64,
         options: types.KVTouchOptions,
     ) FloError!void {
         const ns = self.client.getNamespace(options.namespace);
-        var value_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &value_buf, ttl_seconds, .little);
+        const value_buf = touchValue(ttl_ms);
         var opts_buf: [16]u8 = undefined;
         var builder = wire.OptionsBuilder.init(&opts_buf);
         if (options.if_match) |v| try builder.addU64(.cas_version, v);
@@ -559,10 +547,7 @@ pub const Transaction = struct {
             try builder.addBytes(.routing_key, self.routing_key);
         }
         try builder.addU64(.txn_id, self.id);
-        if (options.ttl_seconds) |ttl| try builder.addU64(.ttl_seconds, ttl);
-        if (options.cas_version) |v| try builder.addU64(.cas_version, v);
-        if (options.if_not_exists) try builder.addFlag(.if_not_exists);
-        if (options.if_exists) try builder.addFlag(.if_exists);
+        try addPutOptions(&builder, options);
 
         var response = try self.client.sendRequest(
             .kv_put,
@@ -630,13 +615,13 @@ pub const Transaction = struct {
         return std.mem.readInt(i64, response.data[0..8], .little);
     }
 
-    /// Update the TTL on an existing key inside the transaction.
-    pub fn touch(self: *Transaction, key: []const u8, ttl_seconds: u64) FloError!void {
+    /// Update the TTL on an existing key inside the transaction, in
+    /// milliseconds. `ttl_ms = 0` clears the TTL.
+    pub fn touch(self: *Transaction, key: []const u8, ttl_ms: u64) FloError!void {
         try self.checkAlive();
         var opts_buf: [64]u8 = undefined;
         const opts = try self.buildOptions(&opts_buf);
-        var value_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &value_buf, ttl_seconds, .little);
+        const value_buf = touchValue(ttl_ms);
         var response = try self.client.sendRequest(.kv_touch, self.namespace, key, value_buf[0..8], opts);
         defer response.deinit();
         if (response.status != .ok) return mapStatusToError(response.status);
@@ -734,6 +719,21 @@ pub const Transaction = struct {
     }
 };
 
+/// Put options as TLVs, shared by `KV.put` and `Transaction.put`.
+fn addPutOptions(builder: *wire.OptionsBuilder, options: types.PutOptions) FloError!void {
+    if (options.ttl_ms) |ttl| try builder.addU64(.ttl_ms, ttl);
+    if (options.cas_version) |v| try builder.addU64(.cas_version, v);
+    if (options.if_not_exists) try builder.addFlag(.if_not_exists);
+    if (options.if_exists) try builder.addFlag(.if_exists);
+}
+
+/// KV touch carries its TTL as the request value: 8 bytes, u64 LE milliseconds.
+fn touchValue(ttl_ms: u64) [8]u8 {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, ttl_ms, .little);
+    return buf;
+}
+
 /// Parse history response data
 fn parseHistoryResponse(allocator: Allocator, data: []const u8) FloError![]types.VersionEntry {
     if (data.len < 4) return FloError.IncompleteResponse;
@@ -788,4 +788,37 @@ fn mapStatusToError(status: StatusCode) FloError {
         .overloaded => FloError.Overloaded,
         else => FloError.ServerError,
     };
+}
+
+test "put encodes ttl_ms as option 0x01 with an 8-byte millisecond value" {
+    var buf: [64]u8 = undefined;
+    var builder = wire.OptionsBuilder.init(&buf);
+    try addPutOptions(&builder, .{ .ttl_ms = 1500 });
+
+    var expected: [10]u8 = undefined;
+    expected[0] = 0x01;
+    expected[1] = 8;
+    std.mem.writeInt(u64, expected[2..10], 1500, .little);
+    try std.testing.expectEqualSlices(u8, &expected, builder.getOptions());
+}
+
+test "put encodes every option in tag order" {
+    var buf: [64]u8 = undefined;
+    var builder = wire.OptionsBuilder.init(&buf);
+    try addPutOptions(&builder, .{ .ttl_ms = 1500, .cas_version = 7, .if_not_exists = true, .if_exists = true });
+
+    var expected: [24]u8 = undefined;
+    expected[0..2].* = .{ 0x01, 8 };
+    std.mem.writeInt(u64, expected[2..10], 1500, .little);
+    expected[10..12].* = .{ 0x02, 8 };
+    std.mem.writeInt(u64, expected[12..20], 7, .little);
+    expected[20..24].* = .{ 0x03, 0, 0x04, 0 };
+    try std.testing.expectEqualSlices(u8, &expected, builder.getOptions());
+}
+
+test "touch encodes its TTL as an 8-byte millisecond value" {
+    var expected: [8]u8 = undefined;
+    std.mem.writeInt(u64, &expected, 90_000, .little);
+    try std.testing.expectEqualSlices(u8, &expected, &touchValue(90_000));
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 8, &touchValue(0));
 }
