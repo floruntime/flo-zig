@@ -77,11 +77,6 @@ pub fn pauseWhileRunning(running: *const bool, ms: u64) void {
 pub const OpCode = enum(u16) {
     // ── System (0x000 – 0x00F) ──
     ping = 0x000,
-    pong = 0x001,
-    error_response = 0x002,
-    auth = 0x003,
-    set_durability = 0x004,
-    ok = 0x005,
 
     // ── Namespace (0x010 – 0x02F) ──
     namespace_create = 0x010,
@@ -90,12 +85,6 @@ pub const OpCode = enum(u16) {
     namespace_info = 0x013,
     namespace_config_set = 0x014,
     namespace_config_get = 0x015,
-    namespace_create_response = 0x020,
-    namespace_delete_response = 0x021,
-    namespace_list_response = 0x022,
-    namespace_info_response = 0x023,
-    namespace_config_set_response = 0x024,
-    namespace_config_get_response = 0x025,
 
     // ── Cluster (0x030 – 0x04F) ──
     cluster_status = 0x030,
@@ -105,9 +94,6 @@ pub const OpCode = enum(u16) {
     cluster_transfer_leader = 0x034,
     cluster_add_node = 0x035,
     cluster_remove_node = 0x036,
-    cluster_status_response = 0x040,
-    cluster_members_response = 0x041,
-    cluster_join_response = 0x042,
 
     // ── KV + Transactions + Snapshots (0x100 – 0x12F) ──
     kv_put = 0x100,
@@ -116,11 +102,6 @@ pub const OpCode = enum(u16) {
     kv_delete = 0x103,
     kv_scan = 0x104,
     kv_history = 0x105,
-    kv_get_response = 0x106,
-    kv_mget_response = 0x107,
-    kv_put_response = 0x108,
-    kv_scan_response = 0x109,
-    kv_history_response = 0x10A,
     // KV extended (atomic counters, JSON ops)
     kv_incr = 0x10B,
     kv_json_get = 0x10C,
@@ -134,27 +115,14 @@ pub const OpCode = enum(u16) {
     kv_touch = 0x113,
     kv_persist = 0x114,
     kv_exists = 0x115,
-    kv_incr_response = 0x116,
-    kv_json_response = 0x117,
-    kv_exists_response = 0x118,
-    kv_txn_response = 0x119,
 
     // ── Streams (0x130 – 0x14F) ──
     stream_append = 0x130,
     stream_read = 0x131,
     stream_trim = 0x132,
     stream_info = 0x133,
-    stream_append_response = 0x134,
-    stream_read_response = 0x135,
-    stream_event = 0x136,
-    stream_subscribe = 0x137,
-    stream_unsubscribe = 0x138,
-    stream_subscribed = 0x139,
-    stream_unsubscribed = 0x13A,
     stream_list = 0x13B,
-    stream_list_response = 0x13C,
     stream_create = 0x13D,
-    stream_create_response = 0x13E,
     stream_alter = 0x13F,
 
     // ── Stream Consumer Groups (0x150 – 0x16F) ──
@@ -166,7 +134,6 @@ pub const OpCode = enum(u16) {
     stream_group_claim = 0x155,
     stream_group_pending = 0x156,
     stream_group_configure_sweeper = 0x157,
-    stream_group_read_response = 0x158,
     stream_group_nack = 0x159,
     stream_group_touch = 0x15A,
     stream_group_info = 0x15B,
@@ -176,29 +143,14 @@ pub const OpCode = enum(u16) {
     queue_enqueue = 0x170,
     queue_dequeue = 0x171,
     queue_complete = 0x172,
-    queue_extend_lease = 0x173,
     queue_fail = 0x174,
-    queue_fail_auto = 0x175,
     queue_dlq_list = 0x176,
     queue_dlq_delete = 0x177,
     queue_dlq_requeue = 0x178,
-    queue_dlq_stats = 0x179,
-    queue_promote_due = 0x17A,
     queue_stats = 0x17B,
     queue_peek = 0x17C,
-    queue_touch = 0x17D,
-    queue_batch_enqueue = 0x17E,
     queue_purge = 0x17F,
-    queue_enqueue_response = 0x190,
-    queue_dequeue_response = 0x191,
-    queue_dlq_list_response = 0x192,
-    queue_stats_response = 0x193,
-    queue_peek_response = 0x194,
-    queue_touch_response = 0x195,
-    queue_batch_enqueue_response = 0x196,
-    queue_purge_response = 0x197,
     queue_list = 0x198,
-    queue_list_response = 0x199,
 
     // ── Time-Series (0x1A0 – 0x1BF) ──
     ts_write = 0x1A0,
@@ -208,13 +160,6 @@ pub const OpCode = enum(u16) {
     ts_list = 0x1A4,
     ts_delete = 0x1A5,
     ts_retention = 0x1A6,
-    ts_write_response = 0x1A7,
-    ts_read_response = 0x1A8,
-    ts_query_response = 0x1A9,
-    ts_floql_response = 0x1AA,
-    ts_list_response = 0x1AB,
-    ts_delete_response = 0x1AC,
-    ts_retention_response = 0x1AD,
 
     // ── Actions (0x300 – 0x31F) ──
     action_register = 0x300,
@@ -227,12 +172,6 @@ pub const OpCode = enum(u16) {
     action_complete = 0x307,
     action_fail = 0x308,
     action_touch = 0x309,
-    action_register_response = 0x310,
-    action_invoke_response = 0x311,
-    action_status_response = 0x312,
-    action_list_response = 0x313,
-    action_list_runs_response = 0x314,
-    action_task_assignment = 0x315,
 
     // ── Workers (0x320 – 0x33F) ──
     worker_register = 0x320,
@@ -241,10 +180,6 @@ pub const OpCode = enum(u16) {
     worker_list = 0x323,
     worker_info = 0x324,
     worker_drain = 0x325,
-    worker_register_response = 0x330,
-    worker_list_response = 0x331,
-    worker_info_response = 0x332,
-    worker_drain_response = 0x333,
 
     // ── Workflows (0x340 – 0x35F) ──
     workflow_create = 0x340,
@@ -258,15 +193,6 @@ pub const OpCode = enum(u16) {
     workflow_disable = 0x348,
     workflow_enable = 0x349,
     workflow_list_definitions = 0x34A,
-    workflow_create_response = 0x350,
-    workflow_start_response = 0x351,
-    workflow_status_response = 0x352,
-    workflow_history_response = 0x353,
-    workflow_list_runs_response = 0x354,
-    workflow_get_definition_response = 0x355,
-    workflow_disable_response = 0x356,
-    workflow_enable_response = 0x357,
-    workflow_list_definitions_response = 0x358,
 
     // ── Processing (0x360 – 0x37F) ──
     processing_submit = 0x360,
@@ -277,14 +203,6 @@ pub const OpCode = enum(u16) {
     processing_savepoint = 0x365,
     processing_restore = 0x366,
     processing_rescale = 0x367,
-    processing_submit_response = 0x370,
-    processing_stop_response = 0x371,
-    processing_cancel_response = 0x372,
-    processing_status_response = 0x373,
-    processing_list_response = 0x374,
-    processing_savepoint_response = 0x375,
-    processing_restore_response = 0x376,
-    processing_rescale_response = 0x377,
 
     _,
 };
@@ -335,18 +253,12 @@ pub const OptionTag = enum(u8) {
     if_exists = 0x04, // void: Only set if key exists (XX)
     limit = 0x05, // u32: Maximum number of results for scan/list operations
     keys_only = 0x06, // u8: Skip values in scan response (0/1)
-    cursor = 0x07, // bytes: Pagination cursor (ShardWalker format)
     routing_key = 0x08, // string: Explicit routing key for shard co-location
     txn_id = 0x09, // u64: Transaction ID for per-shard transactions
 
     // Queue Options (0x10 - 0x1F)
     priority = 0x10, // u8: Message priority (0-255, higher = more urgent)
-    delay_ms = 0x11, // u64: Delay before message becomes visible
-    visibility_timeout_ms = 0x12, // u32: How long message is invisible after dequeue
-    dedup_key = 0x13, // string: Deduplication key
-    max_retries = 0x14, // u8: Maximum retry attempts before DLQ
     count = 0x15, // u32: Number of messages to dequeue
-    send_to_dlq = 0x16, // u8: Whether to send failed messages to DLQ (0/1)
     block_ms = 0x17, // u32: Blocking wait for data (0=don't wait, max 300000)
     wait_ms = 0x18, // u32: Watch timeout - wait for NEXT version change (0=don't wait, max 300000)
 
@@ -363,27 +275,6 @@ pub const OptionTag = enum(u8) {
     // Consumer Group Options (0x30 - 0x3F)
     ack_timeout_ms = 0x30, // u32: Time before unacked message auto-redelivers
     max_deliver = 0x31, // u8: Max delivery attempts before DLQ (default: 10, 0=unlimited)
-    subscription_mode = 0x32, // u8: 0=shared, 1=exclusive, 2=key_shared
-    redelivery_delay_ms = 0x33, // u32: Delay before NACK'd message becomes visible again
-    consumer_timeout_ms = 0x34, // u32: Remove consumer from group if no activity
-    no_ack = 0x35, // void: Auto-ack on delivery (at-most-once semantics)
-    idle_timeout_ms = 0x36, // u64: Min idle time for claiming stuck messages (XCLAIM-style)
-    max_ack_pending = 0x37, // u32: Max unacked messages per consumer (backpressure)
-    extend_ack_ms = 0x38, // u32: Amount of time to extend ack deadline (for touch)
-    max_standbys = 0x39, // u16: Max standby consumers in exclusive mode
-    num_slots = 0x3A, // u16: Number of hash slots for key_shared mode (default: 256)
-
-    // Worker/Action Options (0x40 - 0x4F)
-    worker_id = 0x40, // string: Worker identifier
-    extend_ms = 0x41, // u32: Lease extension time in milliseconds
-    max_tasks = 0x42, // u32: Maximum tasks to return in batch
-    retry = 0x43, // u8: Whether to retry on failure (0/1)
-
-    // Workflow Options (0x50 - 0x5F)
-    timeout_ms = 0x50, // u64: Workflow/activity timeout
-    retry_policy = 0x51, // bytes: Serialized retry policy
-    correlation_id = 0x52, // string: Correlation ID for tracing
-    subscription_id = 0x53, // u64: Subscription ID for stream subscriptions
 
     // Time-Series Options (0x60 - 0x6F)
     ts_from_ms = 0x60, // i64: Start of time range (inclusive, unix ms)
@@ -392,11 +283,9 @@ pub const OptionTag = enum(u8) {
     ts_aggregation = 0x63, // string: Aggregation function name (avg, sum, count, min, max)
     ts_field = 0x64, // string: Field name filter (empty = "value")
     ts_tags = 0x65, // string: Comma-separated tag filters "key=val,key2=val2"
-    ts_precision = 0x66, // u8: Timestamp precision (0=ns, 1=us, 2=ms, 3=s)
     ts_timestamp = 0x67, // i64: Explicit timestamp for write (0 = server-assigned)
     ts_raw_ttl = 0x68, // string: Raw data TTL (e.g., "7d")
     ts_downsample = 0x69, // string: refused by the server; downsampling isn't supported
-    ts_batch = 0x6A, // void: Flag indicating batch/line-protocol mode
 
     _,
 };
@@ -680,16 +569,12 @@ pub const EnqueueOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
     priority: u8 = 0,
-    delay_ms: ?u64 = null,
-    dedup_key: ?[]const u8 = null,
 };
 
 /// Options for queue dequeue operations
 pub const DequeueOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Visibility timeout - how long message is hidden before retry (server default: 30s)
-    visibility_timeout_ms: ?u32 = null,
     /// Block waiting for messages, in ms (null or 0 = don't wait, max 300000)
     block_ms: ?u32 = null,
 };
@@ -704,7 +589,6 @@ pub const AckOptions = struct {
 pub const NackOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    to_dlq: bool = false,
 };
 
 /// Options for DLQ list operations
@@ -722,12 +606,6 @@ pub const DlqRequeueOptions = struct {
 
 /// Options for queue peek operations
 pub const PeekOptions = struct {
-    /// Override client's default namespace
-    namespace: ?[]const u8 = null,
-};
-
-/// Options for queue touch (lease renewal) operations
-pub const TouchOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
 };
@@ -899,8 +777,6 @@ pub const StreamGroupNackOptions = struct {
     namespace: ?[]const u8 = null,
     /// Consumer ID (required for correct nack matching)
     consumer: []const u8 = "",
-    /// Delay before message becomes visible again (ms)
-    redelivery_delay_ms: ?u32 = null,
 };
 
 // =============================================================================
@@ -1074,8 +950,6 @@ pub const WorkerDrainOptions = struct {
 pub const WorkerAwaitOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Task execution timeout (lease duration) in ms
-    timeout_ms: ?u64 = null,
     /// Block waiting for task (null = 30000, 0 = don't wait, max 300000)
     block_ms: ?u32 = null,
 };
@@ -1283,6 +1157,9 @@ pub const ProcessingListEntry = struct {
 /// Result of a processing list operation.
 pub const ProcessingListResult = struct {
     entries: []ProcessingListEntry,
+    has_more: bool,
+    /// Pass as `ProcessingListOptions.cursor` for the next page; null on the last page.
+    cursor: ?[]const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ProcessingListResult) void {
@@ -1290,6 +1167,7 @@ pub const ProcessingListResult = struct {
             entry.deinit(self.allocator);
         }
         self.allocator.free(self.entries);
+        if (self.cursor) |c| self.allocator.free(c);
     }
 };
 

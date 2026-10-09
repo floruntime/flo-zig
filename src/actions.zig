@@ -407,12 +407,9 @@ pub const Actions = struct {
     ) FloError!?types.TaskAssignment {
         const ns = self.client.getNamespace(options.namespace);
 
-        var opts_buf: [32]u8 = undefined;
+        var opts_buf: [16]u8 = undefined;
         var builder = wire.OptionsBuilder.init(&opts_buf);
 
-        if (options.timeout_ms) |t| {
-            try builder.addU64(.timeout_ms, t);
-        }
         if (options.block_ms) |b| {
             try builder.addU32(.block_ms, b);
         }

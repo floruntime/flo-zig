@@ -399,7 +399,7 @@ pub const Stream = struct {
     }
 
     /// Negatively acknowledge records in a consumer group.
-    /// Records will be redelivered after the redelivery delay.
+    /// The server makes the records available for redelivery.
     pub fn groupNack(
         self: *Stream,
         stream_name: []const u8,
@@ -437,20 +437,12 @@ pub const Stream = struct {
             offset += 8;
         }
 
-        // Build options for redelivery delay
-        var opts_buf: [16]u8 = undefined;
-        var builder = wire.OptionsBuilder.init(&opts_buf);
-
-        if (options.redelivery_delay_ms) |delay| {
-            try builder.addU32(.redelivery_delay_ms, delay);
-        }
-
         var response = try self.client.sendRequest(
             .stream_group_nack,
             ns,
             stream_name,
             value_buf[0..offset],
-            builder.getOptions(),
+            "",
         );
         defer response.deinit();
 

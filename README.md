@@ -142,6 +142,12 @@ var result = try kv.scan("prefix:", .{
 });
 defer result.deinit();
 
+// Next page: pass back the cursor the previous page returned
+if (result.has_more) {
+    var next = try kv.scan("prefix:", .{ .limit = 100, .cursor = result.cursor });
+    defer next.deinit();
+}
+
 // Get version history
 const versions = try kv.history("key", .{ .limit = 10 });
 ```
@@ -153,30 +159,25 @@ var queue = flo.Queue.init(&client);
 
 // Enqueue message (uses client's default namespace)
 const seq = try queue.enqueue("queue-name", "payload", .{
-    .priority = 5,              // Higher = more urgent
-    .delay_ms = 1000,           // Delay before visible
-    .dedup_key = "unique-id",   // Deduplication key
+    .priority = 5, // Higher = more urgent
 });
 
 // Enqueue to different namespace
 const seq = try queue.enqueue("queue-name", "payload", .{ .namespace = "other-ns" });
 
-// Dequeue messages (uses server default 30s visibility timeout)
+// Dequeue messages
 var result = try queue.dequeue("queue-name", 10, .{});
 defer result.deinit();
 
-// Dequeue with custom options
-var result = try queue.dequeue("queue-name", 10, .{
-    .visibility_timeout_ms = 60000,  // Custom visibility timeout
-    .block_ms = 5000,                // Block waiting for messages (long polling)
-});
+// Block waiting for messages (long polling)
+var result = try queue.dequeue("queue-name", 10, .{ .block_ms = 5000 });
 defer result.deinit();
 
 // Acknowledge messages
 try queue.ack("queue-name", &seqs, .{});
 
-// Negative acknowledge (return to queue or DLQ)
-try queue.nack("queue-name", &seqs, .{ .to_dlq = false });
+// Negative acknowledge (the server retries or dead-letters by its retry policy)
+try queue.nack("queue-name", &seqs, .{});
 
 // List DLQ messages
 var dlq = try queue.dlqList("queue-name", .{ .limit = 100 });
@@ -300,7 +301,6 @@ try worker.register("worker-1", &[_][]const u8{ "send-email", "process-order" },
 while (true) {
     // Await task (blocks until task available or timeout)
     if (try worker.awaitTask("worker-1", &[_][]const u8{ "send-email" }, .{
-        .timeout_ms = 30000,  // Task lease duration
         .block_ms = 30000,    // Wait up to 30s (0 = don't wait, max 300000)
     })) |*task| {
         defer task.deinit();

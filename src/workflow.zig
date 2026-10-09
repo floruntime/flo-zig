@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const wire = @import("wire.zig");
 const Client = @import("client.zig").Client;
 
 const FloError = types.FloError;
@@ -459,21 +460,14 @@ pub const Workflow = struct {
     ) FloError![]u8 {
         const ns = self.client.getNamespace(options.namespace);
 
-        // Wire format: [limit:u32][cursor...]
-        const cursor = options.cursor orelse &[_]u8{};
-        var value_buf: [4 + 64]u8 = undefined; // 4 bytes limit + up to 64 bytes cursor
-        std.mem.writeInt(u32, value_buf[0..4], options.limit, .little);
-        if (cursor.len > 0) {
-            const copy_len = @min(cursor.len, value_buf.len - 4);
-            @memcpy(value_buf[4 .. 4 + copy_len], cursor[0..copy_len]);
-        }
-        const value_len = 4 + @min(cursor.len, value_buf.len - 4);
+        const value = try wire.encodeListValue(self.client.allocator, options.limit, options.cursor orelse "");
+        defer self.client.allocator.free(value);
 
         var response = try self.client.sendRequest(
             .workflow_list_definitions,
             ns,
             "",
-            value_buf[0..value_len],
+            value,
             "",
         );
         defer response.deinit();

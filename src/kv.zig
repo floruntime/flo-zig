@@ -217,22 +217,14 @@ pub const KV = struct {
             try builder.addU8(.keys_only, 1);
         }
 
-        // Value: [limit:u32][cursor...]
-        const cursor = options.cursor orelse &[_]u8{};
-        const limit: u32 = options.limit orelse 0; // 0 = server default
-        var value_buf: [4 + 64]u8 = undefined;
-        std.mem.writeInt(u32, value_buf[0..4], limit, .little);
-        if (cursor.len > 0) {
-            const copy_len = @min(cursor.len, value_buf.len - 4);
-            @memcpy(value_buf[4 .. 4 + copy_len], cursor[0..copy_len]);
-        }
-        const value_len = 4 + @min(cursor.len, value_buf.len - 4);
+        const value = try wire.encodeListValue(self.client.allocator, options.limit orelse 0, options.cursor orelse "");
+        defer self.client.allocator.free(value);
 
         var response = try self.client.sendRequest(
             .kv_scan,
             ns,
             prefix,
-            value_buf[0..value_len],
+            value,
             builder.getOptions(),
         );
         defer response.deinit();
@@ -821,4 +813,33 @@ test "touch encodes its TTL as an 8-byte millisecond value" {
     std.mem.writeInt(u64, &expected, 90_000, .little);
     try std.testing.expectEqualSlices(u8, &expected, &touchValue(90_000));
     try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 8, &touchValue(0));
+}
+
+test "scan sends [limit][cursor] in the value and reads the next cursor from the trailer" {
+    // One entry ("k" = "v"), then has_more=1 and a 3-byte cursor.
+    const body = [_]u8{ 1, 0, 0, 0, 1, 0, 'k', 1, 0, 0, 0, 'v', 1, 3, 0, 'n', 'x', 't' };
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.body = &body;
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var kv = KV.init(&client);
+
+    var result = try kv.scan("p", .{ .limit = 7, .cursor = "abc" });
+    defer result.deinit();
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 7, 0, 0, 0, 'a', 'b', 'c' }, srv.lastValue());
+    try std.testing.expectEqual(@as(usize, 1), result.entries.len);
+    try std.testing.expectEqualStrings("k", result.entries[0].key);
+    try std.testing.expectEqualStrings("v", result.entries[0].value.?);
+    try std.testing.expect(result.has_more);
+    try std.testing.expectEqualStrings("nxt", result.cursor.?);
+
+    // First page: no cursor, limit 0 asks for the server default.
+    var first = try kv.scan("p", .{});
+    defer first.deinit();
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, srv.lastValue());
 }

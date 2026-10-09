@@ -331,74 +331,80 @@ pub const RawResponse = struct {
     }
 };
 
+/// Encode the request value every list/scan op reads: [limit:u32][cursor].
+/// limit 0 asks for the server default; cursor is the opaque bytes the
+/// previous page returned (empty for the first page). Caller frees.
+pub fn encodeListValue(allocator: Allocator, limit: u32, cursor: []const u8) FloError![]u8 {
+    const buf = try allocator.alloc(u8, 4 + cursor.len);
+    std.mem.writeInt(u32, buf[0..4], limit, .little);
+    @memcpy(buf[4..], cursor);
+    return buf;
+}
+
+/// The trailer every list/scan answer ends with: [has_more:u8][cursor_len:u16][cursor].
+pub const ListTrailer = struct {
+    has_more: bool,
+    /// Borrowed from the response data; null when there is no next page.
+    cursor: ?[]const u8,
+};
+
+pub fn parseListTrailer(data: []const u8, offset: usize) FloError!ListTrailer {
+    if (data.len < offset + 3) return FloError.IncompleteResponse;
+    const has_more = data[offset] != 0;
+    const cursor_len = std.mem.readInt(u16, data[offset + 1 ..][0..2], .little);
+    const start = offset + 3;
+    if (data.len < start + cursor_len) return FloError.IncompleteResponse;
+    return .{
+        .has_more = has_more,
+        .cursor = if (cursor_len > 0) data[start..][0..cursor_len] else null,
+    };
+}
+
 /// Parse a scan response
-/// Format: [has_more:u8][cursor_len:u32][cursor:bytes][count:u32][entries...]
-/// Entry format: [key_len:u16][key][value_len:u32][value]
+/// Format: [count:u32]([key_len:u16][key][value_len:u32][value])*[has_more:u8][cursor_len:u16][cursor]
 pub fn parseScanResponse(allocator: Allocator, data: []const u8) !types.ScanResult {
-    if (data.len < 9) return FloError.IncompleteResponse;
+    if (data.len < 4) return FloError.IncompleteResponse;
 
     var offset: usize = 0;
-
-    // has_more
-    const has_more = data[offset] != 0;
-    offset += 1;
-
-    // cursor
-    const cursor_len = std.mem.readInt(u32, data[offset..][0..4], .little);
-    offset += 4;
-
-    if (data.len < offset + cursor_len) return FloError.IncompleteResponse;
-    const cursor_data = if (cursor_len > 0) data[offset..][0..cursor_len] else null;
-    offset += cursor_len;
-
-    // count
-    if (data.len < offset + 4) return FloError.IncompleteResponse;
     const count = std.mem.readInt(u32, data[offset..][0..4], .little);
     offset += 4;
 
-    // Allocate entries
     var entries = try allocator.alloc(types.KVEntry, count);
+    var parsed: usize = 0;
     errdefer {
-        for (entries) |*e| {
-            e.deinit(allocator);
-        }
+        for (entries[0..parsed]) |*e| e.deinit(allocator);
         allocator.free(entries);
     }
 
-    // Parse entries
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        // Key
+    while (parsed < count) {
         if (data.len < offset + 2) return FloError.IncompleteResponse;
         const key_len = std.mem.readInt(u16, data[offset..][0..2], .little);
         offset += 2;
-
         if (data.len < offset + key_len) return FloError.IncompleteResponse;
-        const key = try allocator.dupe(u8, data[offset..][0..key_len]);
+        const key_bytes = data[offset..][0..key_len];
         offset += key_len;
 
-        // Value
         if (data.len < offset + 4) return FloError.IncompleteResponse;
         const value_len = std.mem.readInt(u32, data[offset..][0..4], .little);
         offset += 4;
+        if (data.len < offset + value_len) return FloError.IncompleteResponse;
+        const value_bytes = data[offset..][0..value_len];
+        offset += value_len;
 
-        const value = if (value_len > 0) blk: {
-            if (data.len < offset + value_len) return FloError.IncompleteResponse;
-            const v = try allocator.dupe(u8, data[offset..][0..value_len]);
-            offset += value_len;
-            break :blk v;
-        } else null;
-
-        entries[i] = .{ .key = key, .value = value };
+        const key = try allocator.dupe(u8, key_bytes);
+        errdefer allocator.free(key);
+        const value = if (value_len > 0) try allocator.dupe(u8, value_bytes) else null;
+        entries[parsed] = .{ .key = key, .value = value };
+        parsed += 1;
     }
 
-    // Copy cursor if present
-    const cursor = if (cursor_data) |c| try allocator.dupe(u8, c) else null;
+    const trailer = try parseListTrailer(data, offset);
+    const cursor = if (trailer.cursor) |c| try allocator.dupe(u8, c) else null;
 
     return types.ScanResult{
         .entries = entries,
         .cursor = cursor,
-        .has_more = has_more,
+        .has_more = trailer.has_more,
         .allocator = allocator,
     };
 }
@@ -486,7 +492,7 @@ test "OptionsBuilder and Iterator roundtrip" {
 
     try builder.addU64(.ttl_ms, 3_600_000);
     try builder.addU8(.priority, 5);
-    try builder.addBytes(.dedup_key, "abc123");
+    try builder.addBytes(.partition_key, "abc123");
 
     const options = builder.getOptions();
 
@@ -500,9 +506,9 @@ test "OptionsBuilder and Iterator roundtrip" {
     try std.testing.expectEqual(OptionTag.priority, priority_opt.tag);
     try std.testing.expectEqual(@as(u8, 5), priority_opt.asU8().?);
 
-    const dedup_opt = iter.next().?;
-    try std.testing.expectEqual(OptionTag.dedup_key, dedup_opt.tag);
-    try std.testing.expectEqualStrings("abc123", dedup_opt.asString());
+    const pkey_opt = iter.next().?;
+    try std.testing.expectEqual(OptionTag.partition_key, pkey_opt.tag);
+    try std.testing.expectEqualStrings("abc123", pkey_opt.asString());
 
     try std.testing.expect(iter.next() == null);
 }
