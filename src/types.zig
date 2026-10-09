@@ -32,24 +32,46 @@ pub fn workerBlockMs(block_ms: u32) FloError!u32 {
     return block_ms;
 }
 
-/// How long a worker waits before polling again after a blocking poll came
-/// back empty well before its block_ms. The server answers a blocking read
-/// empty at once when it has no room to park it, so polling again straight
-/// away would spin against a server that is already full.
-pub const EMPTY_POLL_PAUSE_MS: u64 = 100;
+/// Paces a worker's polls after blocking polls that come back empty early.
+/// The server answers early and empty in two cases that look the same on
+/// the wire: a blocking read or await it has no room to park is answered at
+/// once, and a parked group read is woken by every append as a cue to read
+/// again. A wake comes whenever a record arrives and its re-read finds the
+/// record, while a full server answers within a round trip, every time. So
+/// only an empty answer in under EARLY_EMPTY_MS (or half of block_ms) counts
+/// as early, a first early empty is re-polled at once, and only back-to-back
+/// early empties back off: 50 ms, doubling up to 1 s.
+pub const EmptyPollBackoff = struct {
+    early_empties: u32 = 0,
 
-/// The pause after an empty poll that took `elapsed_ns` with `block_ms`:
-/// EMPTY_POLL_PAUSE_MS if it returned in under half of block_ms, else 0.
-pub fn emptyPollPauseMs(elapsed_ns: u64, block_ms: u32) u64 {
-    if (elapsed_ns >= @as(u64, block_ms) * std.time.ns_per_ms / 2) return 0;
-    return EMPTY_POLL_PAUSE_MS;
-}
+    pub const EARLY_EMPTY_MS: u64 = 250;
+    pub const MIN_PAUSE_MS: u64 = 50;
+    pub const MAX_PAUSE_MS: u64 = 1_000;
 
-/// Sleep for emptyPollPauseMs after an empty poll started at `polled_ns`
-/// (std.time.nanoTimestamp).
-pub fn pauseAfterEmptyPoll(polled_ns: i128, block_ms: u32) void {
-    const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - polled_ns));
-    std.Thread.sleep(emptyPollPauseMs(elapsed, block_ms) * std.time.ns_per_ms);
+    /// Record a poll that took `elapsed_ns` with `block_ms` and returned
+    /// work or not; returns how long to pause before the next poll.
+    pub fn afterPoll(self: *EmptyPollBackoff, empty: bool, elapsed_ns: u64, block_ms: u32) u64 {
+        const early_ms: u64 = @min(EARLY_EMPTY_MS, @as(u64, block_ms) / 2);
+        if (!empty or elapsed_ns >= early_ms * std.time.ns_per_ms) {
+            self.early_empties = 0;
+            return 0;
+        }
+        self.early_empties +|= 1;
+        if (self.early_empties == 1) return 0;
+        const shift: u6 = @intCast(@min(self.early_empties - 2, 5));
+        return @min(MIN_PAUSE_MS << shift, MAX_PAUSE_MS);
+    }
+};
+
+/// Sleep for `ms`, in short slices, returning early once `running` is false.
+pub fn pauseWhileRunning(running: *const bool, ms: u64) void {
+    const slice_ms: u64 = 10;
+    var left = ms;
+    while (left > 0 and @atomicLoad(bool, running, .monotonic)) {
+        const step: u64 = @min(left, slice_ms);
+        std.Thread.sleep(step * std.time.ns_per_ms);
+        left -= step;
+    }
 }
 
 /// Operation codes
@@ -1276,11 +1298,57 @@ pub const ProcessingSyncResult = struct {
     }
 };
 
-test "emptyPollPauseMs pauses only after an early empty poll" {
-    try std.testing.expectEqual(EMPTY_POLL_PAUSE_MS, emptyPollPauseMs(0, 30_000));
-    try std.testing.expectEqual(EMPTY_POLL_PAUSE_MS, emptyPollPauseMs(14_999 * std.time.ns_per_ms, 30_000));
-    try std.testing.expectEqual(@as(u64, 0), emptyPollPauseMs(15_000 * std.time.ns_per_ms, 30_000));
-    try std.testing.expectEqual(@as(u64, 0), emptyPollPauseMs(30_000 * std.time.ns_per_ms, 30_000));
+const Poll = struct { empty: bool, ms: u64 };
+
+fn expectPauses(b: *EmptyPollBackoff, polls: []const Poll, want: []const u64) !void {
+    for (polls, want) |p, w| {
+        try std.testing.expectEqual(w, b.afterPoll(p.empty, p.ms * std.time.ns_per_ms, 30_000));
+    }
+}
+
+test "EmptyPollBackoff: a full server's instant empties back off from 50 ms to 1 s" {
+    var b: EmptyPollBackoff = .{};
+    const instant: Poll = .{ .empty = true, .ms = 1 };
+    try expectPauses(&b, &.{ instant, instant, instant, instant, instant, instant, instant, instant }, &.{ 0, 50, 100, 200, 400, 800, 1000, 1000 });
+    // Work resets it.
+    try expectPauses(&b, &.{ .{ .empty = false, .ms = 1 }, instant, instant }, &.{ 0, 0, 50 });
+}
+
+test "EmptyPollBackoff: a group-read wake is re-read at once" {
+    var b: EmptyPollBackoff = .{};
+    // Parked, woken empty by an append after 20 ms, re-read finds the record.
+    const wake: Poll = .{ .empty = true, .ms = 20 };
+    const record: Poll = .{ .empty = false, .ms = 1 };
+    try expectPauses(&b, &.{ wake, record, wake, record, wake, record }, &.{ 0, 0, 0, 0, 0, 0 });
+}
+
+test "EmptyPollBackoff: a re-read loser woken after 300 ms never pauses" {
+    var b: EmptyPollBackoff = .{};
+    const lost: Poll = .{ .empty = true, .ms = 300 };
+    try expectPauses(&b, &.{ lost, lost, lost, lost, lost }, &.{ 0, 0, 0, 0, 0 });
+    // A non-early empty also ends a run of early ones.
+    try expectPauses(&b, &.{ .{ .empty = true, .ms = 1 }, .{ .empty = true, .ms = 1 }, lost, .{ .empty = true, .ms = 1 } }, &.{ 0, 50, 0, 0 });
+}
+
+test "EmptyPollBackoff: early means under half of a short block_ms" {
+    var b: EmptyPollBackoff = .{};
+    _ = b.afterPoll(true, 1 * std.time.ns_per_ms, 100);
+    try std.testing.expectEqual(@as(u64, 0), b.afterPoll(true, 60 * std.time.ns_per_ms, 100));
+    try std.testing.expectEqual(@as(u32, 0), b.early_empties);
+}
+
+test "pauseWhileRunning returns soon after running goes false" {
+    var running = true;
+    const stopper = try std.Thread.spawn(.{}, struct {
+        fn run(r: *bool) void {
+            std.Thread.sleep(30 * std.time.ns_per_ms);
+            @atomicStore(bool, r, false, .monotonic);
+        }
+    }.run, .{&running});
+    var timer = try std.time.Timer.start();
+    pauseWhileRunning(&running, 1_000);
+    stopper.join();
+    try std.testing.expect(timer.read() < 300 * std.time.ns_per_ms);
 }
 
 test "workerBlockMs: 0 means the default, over MAX_BLOCK_MS is refused" {

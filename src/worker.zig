@@ -168,6 +168,7 @@ pub const ActionWorker = struct {
     handlers: std.StringHashMap(ActionHandler),
     action_names: std.ArrayListUnmanaged([]const u8),
     running: bool = false,
+    backoff: types.EmptyPollBackoff = .{},
     draining: bool = false,
     active_tasks: u32 = 0,
     last_heartbeat_ns: i128 = 0,
@@ -353,7 +354,7 @@ pub const ActionWorker = struct {
     /// Poll for a task and execute it.
     fn pollAndExecute(self: *Self) !void {
         // Await task from server
-        const polled = std.time.nanoTimestamp();
+        const polled = try std.time.Instant.now();
         const task_opt = try self.actions.awaitTask(
             self.worker_id,
             self.action_names.items,
@@ -363,8 +364,10 @@ pub const ActionWorker = struct {
             },
         );
 
+        const elapsed = (try std.time.Instant.now()).since(polled);
+        const pause_ms = self.backoff.afterPoll(task_opt == null, elapsed, self.config.block_ms);
         var task = task_opt orelse {
-            types.pauseAfterEmptyPoll(polled, self.config.block_ms);
+            types.pauseWhileRunning(&self.running, pause_ms);
             return;
         };
         defer task.deinit();

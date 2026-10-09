@@ -123,6 +123,7 @@ pub const StreamWorker = struct {
     worker_id: []const u8,
     consumer_name: []const u8,
     running: bool = false,
+    backoff: types.EmptyPollBackoff = .{},
     draining: bool = false,
     active_tasks: u32 = 0,
     last_heartbeat_ns: i128 = 0,
@@ -329,7 +330,7 @@ pub const StreamWorker = struct {
 
     /// Poll for records and process them.
     fn pollAndProcess(self: *Self, stream_name: []const u8) !void {
-        const polled = std.time.nanoTimestamp();
+        const polled = try std.time.Instant.now();
         var result = try self.stream.groupRead(
             stream_name,
             self.config.group,
@@ -342,8 +343,10 @@ pub const StreamWorker = struct {
         );
         defer result.deinit();
 
+        const elapsed = (try std.time.Instant.now()).since(polled);
+        const pause_ms = self.backoff.afterPoll(result.records.len == 0, elapsed, self.config.block_ms);
         if (result.records.len == 0) {
-            types.pauseAfterEmptyPoll(polled, self.config.block_ms);
+            types.pauseWhileRunning(&self.running, pause_ms);
             return;
         }
 
