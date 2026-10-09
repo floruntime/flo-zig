@@ -377,8 +377,8 @@ pub const FloError = error{
     ConnectionFailed,
     InvalidEndpoint,
     UnexpectedEof,
-    /// No response within the client's timeout_ms (plus the request's
-    /// block_ms / wait_ms)
+    /// The socket went silent for longer than the client's timeout_ms (plus
+    /// the request's block_ms / wait_ms)
     Timeout,
 
     // Protocol errors

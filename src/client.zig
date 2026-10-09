@@ -16,9 +16,11 @@ const StatusCode = types.StatusCode;
 pub const ClientOptions = struct {
     /// Default namespace for operations (can be overridden per-operation)
     namespace: []const u8 = "default",
-    /// How long a request may wait on the socket, in milliseconds, plus its
-    /// block_ms / wait_ms for blocking requests. On expiry the call returns
-    /// error.Timeout and the client disconnects. 0 = no timeout.
+    /// The longest a request may go without the socket accepting or
+    /// delivering any bytes, in milliseconds, plus its block_ms / wait_ms for
+    /// blocking requests. It bounds silence, not the whole request. On expiry
+    /// the call returns error.Timeout and the client disconnects. 0 = no
+    /// timeout. Not applied on Windows.
     timeout_ms: u32 = 5_000,
     /// Enable debug logging
     debug: bool = false,
@@ -155,11 +157,16 @@ pub const Client = struct {
         );
         self.request_id += 1;
 
-        const timeout_ms: u64 = if (self.timeout_ms == 0) 0 else @as(u64, self.timeout_ms) + blockingWaitMs(options);
+        const timeout_ms: u64 = if (self.timeout_ms == 0) 0 else @as(u64, self.timeout_ms) + blockingWaitMs(op_code, options);
         setSocketTimeout(stream.handle, timeout_ms) catch return FloError.ConnectionFailed;
 
         // Send
-        stream.writeAll(serialized) catch return FloError.ConnectionFailed;
+        stream.writeAll(serialized) catch |err| {
+            // Part of the frame may be on the wire; the next request would
+            // be read as its remainder.
+            self.disconnect();
+            return if (err == error.WouldBlock) FloError.Timeout else FloError.ConnectionFailed;
+        };
 
         // Read response header
         var header_buf: [24]u8 = undefined;
@@ -172,10 +179,7 @@ pub const Client = struct {
         const data: []u8 = if (response_header.data_len > 0) blk: {
             const buf = self.allocator.alloc(u8, response_header.data_len) catch return FloError.ServerError;
             errdefer self.allocator.free(buf);
-            readExact(stream, buf) catch |err| {
-                self.allocator.free(buf);
-                return self.readFailed(err);
-            };
+            readExact(stream, buf) catch |err| return self.readFailed(err);
             break :blk buf;
         } else &[_]u8{};
 
@@ -217,32 +221,34 @@ fn readExact(stream: std.net.Stream, buf: []u8) !void {
     }
 }
 
-/// The longest block_ms / wait_ms in a request's options, 0 if none.
-fn blockingWaitMs(options: []const u8) u64 {
+/// How long the server may hold a request on purpose: the longest block_ms /
+/// wait_ms in its options, or for an action await without block_ms the
+/// server's 30 s default; 0 if none.
+fn blockingWaitMs(op_code: OpCode, options: []const u8) u64 {
     var longest: u64 = 0;
+    var has_block_ms = false;
     var it = wire.OptionsIterator.init(options);
     while (it.next()) |opt| {
         if (opt.tag != .block_ms and opt.tag != .wait_ms) continue;
+        if (opt.tag == .block_ms) has_block_ms = true;
         longest = @max(longest, opt.asU32() orelse 0);
     }
+    if (op_code == .action_await and !has_block_ms) return types.DEFAULT_WORKER_BLOCK_MS;
     return longest;
 }
 
 /// Set the socket's send and receive timeouts; 0 means none.
 fn setSocketTimeout(handle: std.posix.socket_t, ms: u64) !void {
     const posix = std.posix;
-    if (builtin.os.tag == .windows) {
-        const v: u32 = @intCast(@min(ms, std.math.maxInt(u32)));
-        try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&v));
-        try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&v));
-    } else {
-        const tv = posix.timeval{
-            .sec = @intCast(ms / std.time.ms_per_s),
-            .usec = @intCast((ms % std.time.ms_per_s) * std.time.us_per_ms),
-        };
-        try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
-        try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
-    }
+    // Zig's Windows sockets read through ReadFile, where a receive timeout
+    // isn't reported as error.WouldBlock, so it couldn't become error.Timeout.
+    if (builtin.os.tag == .windows) return;
+    const tv = posix.timeval{
+        .sec = @intCast(ms / std.time.ms_per_s),
+        .usec = @intCast((ms % std.time.ms_per_s) * std.time.us_per_ms),
+    };
+    try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
 }
 
 /// Resolve hostname or IP to address
@@ -363,4 +369,53 @@ test "a blocking request waits timeout_ms plus its block_ms" {
     var timer = try std.time.Timer.start();
     try std.testing.expectError(FloError.Timeout, client.sendRequest(.kv_get, "default", "k", "", opts.getOptions()));
     try std.testing.expect(timer.read() >= 650 * std.time.ns_per_ms);
+}
+
+test "an action await without block_ms is given the server's 30 s on top of timeout_ms" {
+    try std.testing.expectEqual(@as(u64, 30_000), blockingWaitMs(.action_await, ""));
+
+    var opts_buf: [8]u8 = undefined;
+    var opts = wire.OptionsBuilder.init(&opts_buf);
+    try opts.addU32(.block_ms, 0);
+    try std.testing.expectEqual(@as(u64, 0), blockingWaitMs(.action_await, opts.getOptions()));
+    try std.testing.expectEqual(@as(u64, 0), blockingWaitMs(.kv_get, ""));
+}
+
+test "a response body that stalls partway fails with Timeout" {
+    // Answers the first request with a header for 100 bytes of data, sends
+    // 3 of them, then goes quiet until the test is done.
+    const Stalling = struct {
+        server: std.net.Server,
+        done: std.Thread.ResetEvent = .{},
+
+        fn serve(self: *@This()) void {
+            const conn = self.server.accept() catch return;
+            defer conn.stream.close();
+            var req: wire.RequestHeader = undefined;
+            _ = conn.stream.readAtLeast(std.mem.asBytes(&req), @sizeOf(wire.RequestHeader)) catch return;
+            var resp = std.mem.zeroes(wire.ResponseHeader);
+            resp.magic = types.MAGIC;
+            resp.version = types.VERSION;
+            resp.request_id = req.request_id;
+            resp.data_len = 100;
+            conn.stream.writeAll(std.mem.asBytes(&resp)) catch return;
+            conn.stream.writeAll("abc") catch return;
+            self.done.timedWait(5 * std.time.ns_per_s) catch {};
+        }
+    };
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var srv: Stalling = .{ .server = try addr.listen(.{}) };
+    defer srv.server.deinit();
+    const thread = try std.Thread.spawn(.{}, Stalling.serve, .{&srv});
+    defer thread.join();
+    defer srv.done.set();
+
+    var endpoint_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "127.0.0.1:{d}", .{srv.server.listen_address.getPort()});
+    var client = Client.init(std.testing.allocator, endpoint, .{ .timeout_ms = 200 });
+    defer client.deinit();
+    try client.connect();
+
+    try std.testing.expectError(FloError.Timeout, client.sendRequest(.kv_get, "default", "k", "", ""));
+    try std.testing.expect(!client.isConnected());
 }
