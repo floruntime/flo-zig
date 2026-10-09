@@ -117,8 +117,6 @@ pub const StreamWorker = struct {
     allocator: Allocator,
     config: StreamWorkerConfig,
     client: Client,
-    stream: Stream,
-    actions: Actions,
     handler: StreamRecordHandler,
     worker_id: []const u8,
     consumer_name: []const u8,
@@ -157,20 +155,30 @@ pub const StreamWorker = struct {
             .allocator = allocator,
             .config = config,
             .client = client,
-            .stream = Stream.init(&client),
-            .actions = Actions.init(&client),
             .handler = handler,
             .worker_id = worker_id,
             .consumer_name = consumer_name,
         };
     }
 
+    // Request APIs over this worker's connection. Built per use, not stored:
+    // see ActionWorker.api.
+    fn streamApi(self: *Self) Stream {
+        return Stream.init(&self.client);
+    }
+
+    fn actionsApi(self: *Self) Actions {
+        return Actions.init(&self.client);
+    }
+
     /// Deinitialize the stream worker and free resources.
     pub fn deinit(self: *Self) void {
         // Best-effort leave group and deregister for all streams
+        var stream = self.streamApi();
+        var actions = self.actionsApi();
         const stream_list = self.config.getStreams();
         for (stream_list) |stream_name| {
-            self.stream.groupLeave(
+            stream.groupLeave(
                 stream_name,
                 self.config.group,
                 self.consumer_name,
@@ -178,7 +186,7 @@ pub const StreamWorker = struct {
             ) catch {};
         }
 
-        self.actions.deregister(self.worker_id, .{
+        actions.deregister(self.worker_id, .{
             .namespace = self.config.namespace,
         }) catch {};
 
@@ -200,8 +208,9 @@ pub const StreamWorker = struct {
         });
 
         // Join consumer group for each stream
+        var stream = self.streamApi();
         for (stream_list) |stream_name| {
-            try self.stream.groupJoin(
+            try stream.groupJoin(
                 stream_name,
                 self.config.group,
                 self.consumer_name,
@@ -231,7 +240,8 @@ pub const StreamWorker = struct {
             };
         }
 
-        self.actions.register(
+        var actions = self.actionsApi();
+        actions.register(
             self.worker_id,
             null,
             .{
@@ -295,7 +305,8 @@ pub const StreamWorker = struct {
         std.log.info("[flo-stream-worker] Draining...", .{});
         self.draining = true;
 
-        self.actions.drain(self.worker_id, .{
+        var actions = self.actionsApi();
+        actions.drain(self.worker_id, .{
             .namespace = self.config.namespace,
         }) catch |err| {
             std.log.err("[flo-stream-worker] Failed to notify server of drain: {}", .{err});
@@ -312,7 +323,8 @@ pub const StreamWorker = struct {
 
         self.last_heartbeat_ns = now;
 
-        const status = self.actions.heartbeat(
+        var actions = self.actionsApi();
+        const status = actions.heartbeat(
             self.worker_id,
             self.active_tasks,
             .{ .namespace = self.config.namespace },
@@ -329,7 +341,8 @@ pub const StreamWorker = struct {
 
     /// Poll for records and process them.
     fn pollAndProcess(self: *Self, stream_name: []const u8) !void {
-        var result = try self.stream.groupRead(
+        var stream = self.streamApi();
+        var result = try stream.groupRead(
             stream_name,
             self.config.group,
             self.consumer_name,
@@ -363,11 +376,12 @@ pub const StreamWorker = struct {
             .allocator = self.allocator,
         };
 
+        var stream = self.streamApi();
         if (self.handler(&ctx)) {
             // Success - auto-ack
             self.messages_processed += 1;
             var ids = [_]StreamID{record.id};
-            self.stream.groupAck(
+            stream.groupAck(
                 stream_name,
                 self.config.group,
                 &ids,
@@ -380,7 +394,7 @@ pub const StreamWorker = struct {
             self.messages_failed += 1;
             std.log.err("[flo-stream-worker] Record {} failed: {}", .{ record.id, err });
             var ids = [_]StreamID{record.id};
-            self.stream.groupNack(
+            stream.groupNack(
                 stream_name,
                 self.config.group,
                 &ids,
@@ -483,4 +497,20 @@ test "StreamWorker.init turns block_ms 0 into 30000" {
         w.client.deinit();
     }
     try std.testing.expectEqual(@as(u32, 30000), w.config.block_ms);
+}
+
+test "StreamWorker sends requests on its own connection after init returns" {
+    const handler = struct {
+        fn handle(_: *StreamContext) anyerror!void {}
+    }.handle;
+    var srv = try @import("test_server.zig").OkServer.listen();
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events" }, handler);
+    defer w.deinit();
+    @import("test_server.zig").clobberStack();
+
+    w.drain();
+    try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.monotonic));
 }
