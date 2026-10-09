@@ -815,7 +815,7 @@ pub const StreamTrimOptions = struct {
 pub const StreamTrimResult = struct {
     /// Records removed
     removed: u64,
-    /// Sequence of the first record left (0 if none)
+    /// Sequence of the first record left; meaningful only when records remain
     first_seq: u64,
 };
 
