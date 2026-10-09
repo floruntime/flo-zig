@@ -161,9 +161,8 @@ pub const StreamWorker = struct {
         };
     }
 
-    // Request APIs over this worker's connection. Built per use rather than
-    // stored: the worker is returned by value, so a pointer to its client
-    // taken in init would point at init's stack frame.
+    // Request APIs over this worker's connection. Built per use, not stored:
+    // see ActionWorker.api.
     fn streamApi(self: *Self) Stream {
         return Stream.init(&self.client);
     }

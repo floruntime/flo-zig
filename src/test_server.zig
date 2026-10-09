@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const types = @import("types.zig");
-const wire = @import("wire.zig");
 
 pub const OkServer = struct {
     server: std.net.Server,
@@ -29,27 +28,47 @@ pub const OkServer = struct {
         self.server.deinit();
     }
 
+    // Headers are encoded and decoded at the server's byte offsets rather
+    // than through the SDK's wire structs, so a wrong field layout in those
+    // structs fails here instead of agreeing with itself.
     fn serve(self: *OkServer) void {
         const conn = self.server.accept() catch return;
         defer conn.stream.close();
         while (true) {
-            var header: wire.RequestHeader = undefined;
-            readAll(conn.stream, std.mem.asBytes(&header)) catch return;
-            var skipped: usize = 0;
+            var req: [32]u8 = undefined;
+            readAll(conn.stream, &req) catch return;
+            const magic = std.mem.readInt(u32, req[0..4], .little);
+            const payload_length = std.mem.readInt(u32, req[4..8], .little);
+            const request_id = std.mem.readInt(u64, req[8..16], .little);
+            const crc32 = std.mem.readInt(u32, req[16..20], .little);
+            const version = req[22];
+            if (magic != types.MAGIC or version != types.VERSION) return;
+
+            var crc = std.hash.Crc32.init();
+            crc.update(req[0..16]);
+            crc.update(req[20..32]);
+            var read: usize = 0;
             var buf: [1024]u8 = undefined;
-            while (skipped < header.payload_length) {
-                const n = @min(buf.len, header.payload_length - skipped);
+            while (read < payload_length) {
+                const n = @min(buf.len, payload_length - read);
                 readAll(conn.stream, buf[0..n]) catch return;
-                skipped += n;
+                crc.update(buf[0..n]);
+                read += n;
             }
+            if (crc.final() != crc32) return;
             _ = self.requests.fetchAdd(1, .monotonic);
-            var resp = std.mem.zeroes(wire.ResponseHeader);
-            resp.magic = types.MAGIC;
-            resp.version = types.VERSION;
-            resp.request_id = header.request_id;
-            resp.status = @intFromEnum(types.StatusCode.ok);
-            resp.crc32 = resp.computeCRC32("");
-            conn.stream.writeAll(std.mem.asBytes(&resp)) catch return;
+
+            var resp = [_]u8{0} ** 32;
+            std.mem.writeInt(u32, resp[0..4], types.MAGIC, .little);
+            std.mem.writeInt(u32, resp[4..8], 0, .little); // data_len
+            std.mem.writeInt(u64, resp[8..16], request_id, .little);
+            resp[20] = types.VERSION;
+            resp[21] = @intFromEnum(types.StatusCode.ok);
+            var resp_crc = std.hash.Crc32.init();
+            resp_crc.update(resp[0..16]);
+            resp_crc.update(resp[20..32]);
+            std.mem.writeInt(u32, resp[16..20], resp_crc.final(), .little);
+            conn.stream.writeAll(&resp) catch return;
         }
     }
 
