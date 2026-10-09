@@ -719,7 +719,7 @@ pub const Transaction = struct {
     }
 };
 
-/// Parse history response data
+/// Put options as TLVs, shared by `KV.put` and `Transaction.put`.
 fn addPutOptions(builder: *wire.OptionsBuilder, options: types.PutOptions) FloError!void {
     if (options.ttl_ms) |ttl| try builder.addU64(.ttl_ms, ttl);
     if (options.cas_version) |v| try builder.addU64(.cas_version, v);
@@ -734,6 +734,7 @@ fn touchValue(ttl_ms: u64) [8]u8 {
     return buf;
 }
 
+/// Parse history response data
 fn parseHistoryResponse(allocator: Allocator, data: []const u8) FloError![]types.VersionEntry {
     if (data.len < 4) return FloError.IncompleteResponse;
 
@@ -798,6 +799,20 @@ test "put encodes ttl_ms as option 0x01 with an 8-byte millisecond value" {
     expected[0] = 0x01;
     expected[1] = 8;
     std.mem.writeInt(u64, expected[2..10], 1500, .little);
+    try std.testing.expectEqualSlices(u8, &expected, builder.getOptions());
+}
+
+test "put encodes every option in tag order" {
+    var buf: [64]u8 = undefined;
+    var builder = wire.OptionsBuilder.init(&buf);
+    try addPutOptions(&builder, .{ .ttl_ms = 1500, .cas_version = 7, .if_not_exists = true, .if_exists = true });
+
+    var expected: [24]u8 = undefined;
+    expected[0..2].* = .{ 0x01, 8 };
+    std.mem.writeInt(u64, expected[2..10], 1500, .little);
+    expected[10..12].* = .{ 0x02, 8 };
+    std.mem.writeInt(u64, expected[12..20], 7, .little);
+    expected[20..24].* = .{ 0x03, 0, 0x04, 0 };
     try std.testing.expectEqualSlices(u8, &expected, builder.getOptions());
 }
 
