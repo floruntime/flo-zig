@@ -58,8 +58,9 @@ pub const StreamWorkerConfig = struct {
     concurrency: u32 = 10,
     /// Number of messages to read per poll (default: 10)
     batch_size: u32 = 10,
-    /// Block timeout for reading in milliseconds (default: 30000)
-    block_ms: u32 = 30_000,
+    /// Long-poll wait per read in ms. 0 means DEFAULT_WORKER_BLOCK_MS; over
+    /// MAX_BLOCK_MS, StreamWorker.init returns error.BlockTooLong.
+    block_ms: u32 = types.DEFAULT_WORKER_BLOCK_MS,
     /// Heartbeat interval in milliseconds (default: 30s)
     heartbeat_interval_ms: u64 = 30_000,
     /// Optional metadata for this worker
@@ -131,7 +132,10 @@ pub const StreamWorker = struct {
     const Self = @This();
 
     /// Initialize a new StreamWorker.
-    pub fn init(allocator: Allocator, config: StreamWorkerConfig, handler: StreamRecordHandler) !Self {
+    pub fn init(allocator: Allocator, config_in: StreamWorkerConfig, handler: StreamRecordHandler) !Self {
+        var config = config_in;
+        config.block_ms = try types.workerBlockMs(config.block_ms);
+
         var client = Client.init(allocator, config.endpoint, .{
             .namespace = config.namespace,
         });
@@ -447,4 +451,36 @@ test "generateStreamWorkerId" {
 
     try std.testing.expect(id.len > 0);
     try std.testing.expect(std.mem.startsWith(u8, id, "sw-"));
+}
+
+test "StreamWorker.init refuses block_ms over MAX_BLOCK_MS before connecting" {
+    const handler = struct {
+        fn handle(_: *StreamContext) anyerror!void {}
+    }.handle;
+    try std.testing.expectError(error.BlockTooLong, StreamWorker.init(std.testing.allocator, .{
+        .endpoint = "localhost:1",
+        .stream = "events",
+        .block_ms = types.MAX_BLOCK_MS + 1,
+    }, handler));
+}
+
+test "StreamWorker.init turns block_ms 0 into 30000" {
+    // A worker that polls with block_ms 0 would spin against the server.
+    const handler = struct {
+        fn handle(_: *StreamContext) anyerror!void {}
+    }.handle;
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var endpoint_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "127.0.0.1:{d}", .{server.listen_address.getPort()});
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = endpoint, .stream = "events", .block_ms = 0 }, handler);
+    // Not deinit: it sends requests the listener never answers.
+    defer {
+        std.testing.allocator.free(w.consumer_name);
+        std.testing.allocator.free(w.worker_id);
+        w.client.deinit();
+    }
+    try std.testing.expectEqual(@as(u32, 30000), w.config.block_ms);
 }

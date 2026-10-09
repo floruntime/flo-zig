@@ -145,6 +145,7 @@ pub const OptionsBuilder = struct {
     }
 
     pub fn addU32(self: *OptionsBuilder, tag: OptionTag, value: u32) FloError!void {
+        if (tag == .block_ms or tag == .wait_ms) try types.checkBlockMs(value);
         try self.ensureCapacity(6);
         self.buffer[self.offset] = @intFromEnum(tag);
         self.buffer[self.offset + 1] = 4;
@@ -525,4 +526,17 @@ test "serializeSeqs" {
 
     const count = std.mem.readInt(u32, serialized[0..4], .little);
     try std.testing.expectEqual(@as(u32, 3), count);
+}
+
+test "OptionsBuilder refuses a blocking wait over 300000 ms" {
+    var buffer: [64]u8 = undefined;
+    var builder = OptionsBuilder.init(&buffer);
+
+    try builder.addU32(.block_ms, 0);
+    try builder.addU32(.block_ms, types.MAX_BLOCK_MS);
+    try builder.addU32(.wait_ms, types.MAX_BLOCK_MS);
+    try std.testing.expectError(FloError.BlockTooLong, builder.addU32(.block_ms, types.MAX_BLOCK_MS + 1));
+    try std.testing.expectError(FloError.BlockTooLong, builder.addU32(.wait_ms, types.MAX_BLOCK_MS + 1));
+    // Other u32 options are not blocking waits.
+    try builder.addU32(.count, types.MAX_BLOCK_MS + 1);
 }

@@ -52,8 +52,9 @@ pub const WorkerConfig = struct {
     concurrency: u32 = 10,
     /// Action timeout in milliseconds (default: 5 minutes)
     action_timeout_ms: u64 = 300_000,
-    /// Block timeout for awaiting tasks in milliseconds
-    block_ms: u32 = 30_000,
+    /// Long-poll wait per await in ms. 0 means DEFAULT_WORKER_BLOCK_MS; over
+    /// MAX_BLOCK_MS, ActionWorker.init returns error.BlockTooLong.
+    block_ms: u32 = types.DEFAULT_WORKER_BLOCK_MS,
     /// Heartbeat interval in milliseconds (default: 30s)
     heartbeat_interval_ms: u64 = 30_000,
     /// Optional metadata for this worker
@@ -174,7 +175,10 @@ pub const ActionWorker = struct {
     const Self = @This();
 
     /// Initialize a new ActionWorker.
-    pub fn init(allocator: Allocator, config: WorkerConfig) !Self {
+    pub fn init(allocator: Allocator, config_in: WorkerConfig) !Self {
+        var config = config_in;
+        config.block_ms = try types.workerBlockMs(config.block_ms);
+
         var client = Client.init(allocator, config.endpoint, .{
             .namespace = config.namespace,
         });
@@ -507,4 +511,30 @@ test "generateWorkerId" {
     defer allocator.free(id);
 
     try std.testing.expect(id.len > 0);
+}
+
+test "ActionWorker.init refuses block_ms over MAX_BLOCK_MS before connecting" {
+    try std.testing.expectError(error.BlockTooLong, ActionWorker.init(std.testing.allocator, .{
+        .endpoint = "localhost:1",
+        .block_ms = types.MAX_BLOCK_MS + 1,
+    }));
+}
+
+test "ActionWorker.init turns block_ms 0 into 30000" {
+    // A worker that polls with block_ms 0 would spin against the server.
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var endpoint_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "127.0.0.1:{d}", .{server.listen_address.getPort()});
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = endpoint, .block_ms = 0 });
+    // Not deinit: it sends a deregister the listener never answers.
+    defer {
+        w.handlers.deinit();
+        w.action_names.deinit(std.testing.allocator);
+        std.testing.allocator.free(w.worker_id);
+        w.client.deinit();
+    }
+    try std.testing.expectEqual(@as(u32, 30000), w.config.block_ms);
 }
