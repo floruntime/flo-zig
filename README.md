@@ -180,7 +180,7 @@ try queue.nack("queue-name", &seqs, .{});
 // The DLQ isn't reached in normal use, because dequeued messages are never
 // failed back. dlqList returns a count summary; dlqRequeue is refused by the
 // server as not implemented.
-var dlq = try queue.dlqList("queue-name", .{ .limit = 100 });
+var dlq = try queue.dlqList("queue-name", .{});
 defer dlq.deinit();
 ```
 
