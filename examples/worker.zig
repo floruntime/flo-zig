@@ -1,6 +1,6 @@
 //! Example: High-level Worker API usage with the Flo Zig SDK
 //!
-//! This example demonstrates how to use the Worker to process actions.
+//! This example demonstrates how to use the ActionWorker to process actions.
 
 const std = @import("std");
 const flo = @import("flo");
@@ -174,7 +174,7 @@ pub fn main() !void {
     const namespace = std.posix.getenv("FLO_NAMESPACE") orelse "myapp";
 
     // Create worker
-    var worker = try flo.Worker.init(allocator, .{
+    var worker = try flo.ActionWorker.init(allocator, .{
         .endpoint = endpoint,
         .namespace = namespace,
         .concurrency = 5,
