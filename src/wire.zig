@@ -405,7 +405,7 @@ pub fn parseScanResponse(allocator: Allocator, data: []const u8) !types.ScanResu
 
 /// Parse a dequeue response
 /// Format: [count:u32][messages...]
-/// Message format: [seq:u64][payload_len:u32][payload]
+/// Message format: [seq:u64][payload_len:u32][payload][enqueued_at_ms:i64][delivery_count:u32][priority:u8]
 pub fn parseDequeueResponse(allocator: Allocator, data: []const u8) !types.DequeueResult {
     if (data.len < 4) return FloError.IncompleteResponse;
 
