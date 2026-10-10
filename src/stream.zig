@@ -164,27 +164,31 @@ pub const Stream = struct {
         };
     }
 
-    /// Trim stream based on retention policies.
+    /// Remove a stream's oldest records by exactly one bound: `before`,
+    /// `max_len` or `max_age_seconds`. With `dry_run` nothing is removed and
+    /// the result says what would be. Trim cuts whole append batches, so
+    /// `max_len` may keep a few more records than asked.
     pub fn trim(
         self: *Stream,
         stream_name: []const u8,
         options: types.StreamTrimOptions,
-    ) FloError!void {
+    ) FloError!types.StreamTrimResult {
         const ns = self.client.getNamespace(options.namespace);
 
         var opts_buf: [64]u8 = undefined;
         var builder = wire.OptionsBuilder.init(&opts_buf);
 
+        if (options.before) |before| {
+            const bytes = before.toBytes();
+            try builder.addBytes(.stream_start, &bytes);
+        }
+
         if (options.max_len) |max| {
-            try builder.addU64(.retention_count, max);
+            try builder.addU64(.limit, max);
         }
 
         if (options.max_age_seconds) |age| {
-            try builder.addU64(.retention_age, age);
-        }
-
-        if (options.max_bytes) |bytes| {
-            try builder.addU64(.retention_bytes, bytes);
+            try builder.addU64(.max_age_seconds, age);
         }
 
         if (options.dry_run) {
@@ -203,6 +207,11 @@ pub const Stream = struct {
         if (response.status != .ok) {
             return mapStatusToError(response.status);
         }
+        if (response.data.len != 16) return FloError.IncompleteResponse;
+        return .{
+            .removed = std.mem.readInt(u64, response.data[0..8], .little),
+            .first_seq = std.mem.readInt(u64, response.data[8..16], .little),
+        };
     }
 
     // =========================================================================

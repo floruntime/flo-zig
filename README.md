@@ -124,7 +124,7 @@ try kv.put("key", "value", .{});
 
 // Put with options
 try kv.put("key", "value", .{
-    .ttl_seconds = 3600,        // Expire after 1 hour
+    .ttl_ms = 3_600_000,        // Expire after 1 hour
     .cas_version = 5,           // Compare-and-swap
     .if_not_exists = true,      // Only set if key doesn't exist
 });
@@ -230,7 +230,8 @@ const info = try stream.info("events", .{});
 std.debug.print("Stream has {d} records\n", .{info.count});
 
 // Trim stream
-try stream.trim("events", .{ .max_len = 1000 });
+const trimmed = try stream.trim("events", .{ .max_len = 1000 });
+_ = trimmed.removed;
 ```
 
 ### Stream Consumer Groups

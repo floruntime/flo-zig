@@ -329,7 +329,7 @@ pub const StatusCode = enum(u8) {
 /// Option tags for TLV-encoded operation parameters
 pub const OptionTag = enum(u8) {
     // KV Options (0x01 - 0x0F)
-    ttl_seconds = 0x01, // u64: Time-to-live in seconds (0 = no expiration)
+    ttl_ms = 0x01, // u64: KV time-to-live in milliseconds (0 = no expiration)
     cas_version = 0x02, // u64: Expected version for compare-and-swap
     if_not_exists = 0x03, // void: Only set if key doesn't exist (NX)
     if_exists = 0x04, // void: Only set if key exists (XX)
@@ -358,11 +358,7 @@ pub const OptionTag = enum(u8) {
     partition = 0x24, // u32: Explicit partition index
     partition_key = 0x25, // string: Key for partition routing
     max_age_seconds = 0x26, // u64: Maximum age in seconds for retention
-    max_bytes = 0x27, // u64: Maximum size in bytes for retention
     dry_run = 0x28, // void: Flag to preview what would be deleted without deleting
-    retention_count = 0x29, // u64: Retention policy - max event count
-    retention_age = 0x2A, // u64: Retention policy - max age in seconds
-    retention_bytes = 0x2B, // u64: Retention policy - max bytes
 
     // Consumer Group Options (0x30 - 0x3F)
     ack_timeout_ms = 0x30, // u32: Time before unacked message auto-redelivers
@@ -416,6 +412,8 @@ pub const FloError = error{
     ConnectionFailed,
     InvalidEndpoint,
     UnexpectedEof,
+    /// No bytes moved within the client's timeout (see ClientOptions.timeout_ms).
+    Timeout,
 
     // Protocol errors
     InvalidMagic,
@@ -606,7 +604,8 @@ pub const GetOptions = struct {
 pub const PutOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    ttl_seconds: ?u64 = null,
+    /// Expire the key after this many milliseconds (0 = no expiration)
+    ttl_ms: ?u64 = null,
     cas_version: ?u64 = null,
     if_not_exists: bool = false,
     if_exists: bool = false,
@@ -843,14 +842,22 @@ pub const StreamReadOptions = struct {
 pub const StreamTrimOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Retention policy - max event count
+    /// Remove records up to and including this id
+    before: ?StreamID = null,
+    /// Keep only the newest N records (> 0)
     max_len: ?u64 = null,
-    /// Retention policy - max age in seconds
+    /// Remove records older than this, in seconds (> 0)
     max_age_seconds: ?u64 = null,
-    /// Retention policy - max bytes
-    max_bytes: ?u64 = null,
-    /// Preview what would be deleted without deleting
+    /// Report what would be removed, removing nothing
     dry_run: bool = false,
+};
+
+/// What a trim removed, or with `dry_run` would remove.
+pub const StreamTrimResult = struct {
+    /// Records removed
+    removed: u64,
+    /// Sequence of the first record left; meaningful only when records remain
+    first_seq: u64,
 };
 
 /// Options for stream info operations

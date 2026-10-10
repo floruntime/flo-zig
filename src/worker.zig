@@ -33,7 +33,8 @@
 
 const std = @import("std");
 const types = @import("types.zig");
-const Client = @import("client.zig").Client;
+const client_mod = @import("client.zig");
+const Client = client_mod.Client;
 const Actions = @import("actions.zig").Actions;
 
 const FloError = types.FloError;
@@ -163,7 +164,6 @@ pub const ActionWorker = struct {
     allocator: Allocator,
     config: WorkerConfig,
     client: Client,
-    actions: Actions,
     worker_id: []const u8,
     handlers: std.StringHashMap(ActionHandler),
     action_names: std.ArrayListUnmanaged([]const u8),
@@ -197,7 +197,6 @@ pub const ActionWorker = struct {
             .allocator = allocator,
             .config = config,
             .client = client,
-            .actions = Actions.init(&client),
             .worker_id = worker_id,
             .handlers = std.StringHashMap(ActionHandler).init(allocator),
             .action_names = .{},
@@ -208,7 +207,8 @@ pub const ActionWorker = struct {
     /// Deregisters from the server if connected.
     pub fn deinit(self: *Self) void {
         // Best-effort deregister
-        self.actions.deregister(self.worker_id, .{
+        var actions = self.api();
+        actions.deregister(self.worker_id, .{
             .namespace = self.config.namespace,
         }) catch {};
 
@@ -221,6 +221,13 @@ pub const ActionWorker = struct {
         self.client.deinit();
     }
 
+    /// Request API over this worker's connection. Built per use rather than
+    /// stored: the worker is returned by value, so a pointer to its client
+    /// taken in init would point at init's stack frame.
+    fn api(self: *Self) Actions {
+        return Actions.init(&self.client);
+    }
+
     /// Register an action handler.
     pub fn registerAction(self: *Self, action_name: []const u8, handler: ActionHandler) !void {
         if (self.handlers.contains(action_name)) {
@@ -228,7 +235,8 @@ pub const ActionWorker = struct {
         }
 
         // Register action with the server
-        try self.actions.registerAction(action_name, .user, .{
+        var actions = self.api();
+        try actions.registerAction(action_name, .user, .{
             .namespace = self.config.namespace,
         });
 
@@ -255,32 +263,21 @@ pub const ActionWorker = struct {
             self.config.concurrency,
         });
 
-        // Build process list for registration
-        var processes: [64]types.ProcessEntry = undefined;
-        const count = @min(self.action_names.items.len, 64);
-        for (self.action_names.items[0..count], 0..) |name, i| {
-            processes[i] = .{ .name = name, .kind = .action };
-        }
-
-        // Register worker with the server
-        try self.actions.register(
-            self.worker_id,
-            self.action_names.items,
-            .{
-                .namespace = self.config.namespace,
-                .worker_type = .action,
-                .max_concurrency = self.config.concurrency,
-                .processes = processes[0..count],
-                .metadata = self.config.metadata,
-                .machine_id = self.config.machine_id,
-            },
-        );
+        try self.registerWorker();
 
         self.running = true;
         self.last_heartbeat_ns = std.time.nanoTimestamp();
 
         // Main polling loop
         while (self.running) {
+            if (!self.client.isConnected()) {
+                self.reconnect() catch |err| {
+                    std.log.err("[flo-worker] Reconnect failed: {}, retrying...", .{err});
+                    std.Thread.sleep(1 * std.time.ns_per_s);
+                    continue;
+                };
+            }
+
             // Send heartbeat if interval has elapsed
             self.maybeHeartbeat();
 
@@ -298,12 +295,48 @@ pub const ActionWorker = struct {
             }
 
             self.pollAndExecute() catch |err| {
-                std.log.err("[flo-worker] Await error: {}, retrying...", .{err});
-                std.Thread.sleep(1 * std.time.ns_per_s);
+                if (client_mod.isConnectionError(err)) {
+                    std.log.warn("[flo-worker] Connection lost: {}, reconnecting...", .{err});
+                    self.client.disconnect();
+                } else {
+                    std.log.err("[flo-worker] Await error: {}, retrying...", .{err});
+                    std.Thread.sleep(1 * std.time.ns_per_s);
+                }
             };
         }
 
         std.log.info("[flo-worker] Worker stopped", .{});
+    }
+
+    /// Open a fresh connection and register on it again.
+    fn reconnect(self: *Self) !void {
+        try self.client.reconnect();
+        errdefer self.client.disconnect();
+        try self.registerWorker();
+    }
+
+    fn registerWorker(self: *Self) !void {
+        // Build process list for registration
+        var processes: [64]types.ProcessEntry = undefined;
+        const count = @min(self.action_names.items.len, 64);
+        for (self.action_names.items[0..count], 0..) |name, i| {
+            processes[i] = .{ .name = name, .kind = .action };
+        }
+
+        // Register worker with the server
+        var actions = self.api();
+        try actions.register(
+            self.worker_id,
+            self.action_names.items,
+            .{
+                .namespace = self.config.namespace,
+                .worker_type = .action,
+                .max_concurrency = self.config.concurrency,
+                .processes = processes[0..count],
+                .metadata = self.config.metadata,
+                .machine_id = self.config.machine_id,
+            },
+        );
     }
 
     /// Stop the worker immediately.
@@ -318,7 +351,8 @@ pub const ActionWorker = struct {
         self.draining = true;
 
         // Notify server
-        self.actions.drain(self.worker_id, .{
+        var actions = self.api();
+        actions.drain(self.worker_id, .{
             .namespace = self.config.namespace,
         }) catch |err| {
             std.log.err("[flo-worker] Failed to notify server of drain: {}", .{err});
@@ -335,7 +369,8 @@ pub const ActionWorker = struct {
 
         self.last_heartbeat_ns = now;
 
-        const status = self.actions.heartbeat(
+        var actions = self.api();
+        const status = actions.heartbeat(
             self.worker_id,
             self.active_tasks,
             .{ .namespace = self.config.namespace },
@@ -354,8 +389,9 @@ pub const ActionWorker = struct {
     /// Poll for a task and execute it.
     fn pollAndExecute(self: *Self) !void {
         // Await task from server
+        var actions = self.api();
         const polled = try std.time.Instant.now();
-        const task_opt = try self.actions.awaitTask(
+        const task_opt = try actions.awaitTask(
             self.worker_id,
             self.action_names.items,
             .{
@@ -385,10 +421,12 @@ pub const ActionWorker = struct {
             task.attempt,
         });
 
+        var actions = self.api();
+
         // Get handler
         const handler = self.handlers.get(task.task_type) orelse {
             std.log.err("[flo-worker] No handler for action: {s}", .{task.task_type});
-            self.actions.fail(
+            actions.fail(
                 self.worker_id,
                 task.task_type,
                 task.task_id,
@@ -409,7 +447,7 @@ pub const ActionWorker = struct {
             .caller_run_id = task.caller_run_id,
             .caller_workflow_name = task.caller_workflow_name,
             .allocator = self.allocator,
-            .actions = &self.actions,
+            .actions = &actions,
             .worker_id = self.worker_id,
         };
 
@@ -420,7 +458,7 @@ pub const ActionWorker = struct {
                     defer self.allocator.free(data);
 
                     // Raw bytes — complete with default outcome
-                    self.actions.complete(
+                    actions.complete(
                         self.worker_id,
                         task.task_type,
                         task.task_id,
@@ -436,7 +474,7 @@ pub const ActionWorker = struct {
                     }
 
                     // Named outcome
-                    self.actions.complete(
+                    actions.complete(
                         self.worker_id,
                         task.task_type,
                         task.task_id,
@@ -458,7 +496,7 @@ pub const ActionWorker = struct {
 
             std.log.err("[flo-worker] Action failed: {s} - {s}", .{ task.task_type, error_msg });
 
-            self.actions.fail(
+            actions.fail(
                 self.worker_id,
                 task.task_type,
                 task.task_id,
@@ -543,4 +581,68 @@ test "ActionWorker.init turns block_ms 0 into 30000" {
         w.client.deinit();
     }
     try std.testing.expectEqual(@as(u32, 30000), w.config.block_ms);
+}
+
+fn runWorker(w: *ActionWorker) void {
+    w.start() catch |err| std.debug.panic("worker start: {}", .{err});
+}
+
+test "ActionWorker reconnects after an await times out and runs the next task" {
+    const handler = struct {
+        fn handle(ctx: *ActionContext) anyerror!ActionHandlerResult {
+            return .{ .bytes = try ctx.allocator.dupe(u8, "done") };
+        }
+    }.handle;
+    // [task_id_len:u16]["t1"][task_type_len:u16]["job"][created_at:i64][attempt:u32][has_caller:u8]
+    const task = "\x02\x00t1\x03\x00job" ++ "\x00" ** 8 ++ "\x01\x00\x00\x00" ++ "\x00";
+    var srv = try @import("stall_server.zig").StallServer.listen(.worker_register, .action_await, .action_complete, task);
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    w.client.timeout_ms = 200;
+    try w.registerAction("job", handler);
+
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    const done = srv.waitDone(1, 10_000);
+    w.stop();
+    thread.join();
+
+    try std.testing.expect(done);
+    try std.testing.expectEqual(@as(u32, 2), srv.connections.load(.monotonic));
+}
+
+test "ActionWorker sends requests on its own connection after init returns" {
+    var srv = try @import("test_server.zig").OkServer.listen();
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint });
+    defer w.deinit();
+    @import("test_server.zig").clobberStack();
+
+    const noop = struct {
+        fn handle(_: *ActionContext) anyerror!ActionHandlerResult {
+            return .{ .bytes = "" };
+        }
+    }.handle;
+    try w.registerAction("noop", noop);
+    try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.monotonic));
+}
+
+test "ActionWorker paces awaits that come back empty at once" {
+    var srv = try @import("test_server.zig").OkServer.listen();
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 30_000 });
+    defer w.deinit();
+    w.running = true;
+
+    // Re-polled at once, then paused 50, 100 and 200 ms.
+    var timer = try std.time.Timer.start();
+    for (0..4) |_| try w.pollAndExecute();
+    try std.testing.expectEqual(@as(u32, 4), w.backoff.early_empties);
+    try std.testing.expect(timer.read() >= 340 * std.time.ns_per_ms);
 }
