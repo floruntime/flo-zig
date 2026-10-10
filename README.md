@@ -260,58 +260,58 @@ for (records.records, 0..) |rec, i| {
 try stream.groupAck("events", "my-group", seqs[0..records.records.len], .{});
 ```
 
-### Worker/Action Operations
+### Action Operations
 
-Actions are task types that workers process. Workers are long-running processes that await and process tasks.
+Actions are task types that workers process. `Actions` is the low-level API; for a
+handler-based worker that registers, awaits, and heartbeats for you, see `ActionWorker`.
 
 ```zig
-var worker = flo.Worker.init(&client);
+var actions = flo.Actions.init(&client);
 
 // Register an action (task type)
-try worker.registerAction("send-email", .user, .{
+try actions.registerAction("send-email", .user, .{
     .description = "Send email notifications",
     .timeout_ms = 30000,
     .max_retries = 3,
 });
 
 // Invoke an action (create a task)
-const run_id = try worker.invoke("send-email", "{\"to\": \"user@example.com\"}", .{});
-defer allocator.free(run_id);
+var invoked = try actions.invoke("send-email", "{\"to\": \"user@example.com\"}", .{});
+defer invoked.deinit();
 
 // Check task status
-var status = try worker.getStatus(run_id, .{});
+var status = try actions.getStatus(invoked.run_id, .{});
 defer status.deinit();
-std.debug.print("Status: {}\n", .{status.status});
+std.debug.print("Status: {s}\n", .{@tagName(status.status)});
 ```
 
 #### Processing Tasks (Worker Pattern)
 
 ```zig
-var worker = flo.Worker.init(&client);
+var actions = flo.Actions.init(&client);
 
 // Register as a worker for specific task types
-try worker.register("worker-1", &[_][]const u8{ "send-email", "process-order" }, .{});
+try actions.register("worker-1", &[_][]const u8{ "send-email", "process-order" }, .{});
 
 // Main worker loop
 while (true) {
     // Await task (blocks until task available or timeout)
-    if (try worker.awaitTask("worker-1", &[_][]const u8{ "send-email" }, .{
-        .block_ms = 30000,    // Wait up to 30s (0 = don't wait, max 300000)
-    })) |*task| {
-        defer task.deinit();
+    var task = (try actions.awaitTask("worker-1", &[_][]const u8{"send-email"}, .{
+        .block_ms = 30000, // Wait up to 30s (0 = don't wait, max 300000)
+    })) orelse continue;
+    defer task.deinit();
 
-        std.debug.print("Got task: {s}\n", .{task.task_id});
+    std.debug.print("Got task: {s}\n", .{task.task_id});
 
-        // Process the task...
-        const result = processTask(task.payload);
+    // Process the task...
+    const result = processTask(task.payload);
 
-        if (result.success) {
-            // Complete successfully
-            try worker.complete("worker-1", task.task_id, result.output, .{});
-        } else {
-            // Fail with retry
-            try worker.fail("worker-1", task.task_id, result.error_msg, .{ .retry = true });
-        }
+    if (result.success) {
+        // Complete successfully
+        try actions.complete("worker-1", task.task_type, task.task_id, result.output, .{});
+    } else {
+        // Fail with retry
+        try actions.fail("worker-1", task.task_type, task.task_id, result.error_msg, .{ .retry = true });
     }
 }
 ```
@@ -320,7 +320,7 @@ while (true) {
 
 ```zig
 // For long-running tasks, extend the lease to prevent timeout
-try worker.touch("worker-1", task.task_id, .{ .extend_ms = 30000 });
+try actions.touch("worker-1", task.task_type, task.task_id, .{ .extend_ms = 30000 });
 ```
 
 ### Workflow Operations
