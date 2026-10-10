@@ -594,7 +594,6 @@ pub const NackOptions = struct {
 pub const DlqListOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    limit: u32 = 100,
 };
 
 /// Options for DLQ requeue operations

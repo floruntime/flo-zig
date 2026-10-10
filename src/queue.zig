@@ -153,17 +153,12 @@ pub const Queue = struct {
     ) FloError!types.DequeueResult {
         const ns = self.client.getNamespace(options.namespace);
 
-        var opts_buf: [16]u8 = undefined;
-        var builder = wire.OptionsBuilder.init(&opts_buf);
-
-        try builder.addU32(.limit, options.limit);
-
         var response = try self.client.sendRequest(
             .queue_dlq_list,
             ns,
             queue_name,
             "",
-            builder.getOptions(),
+            "",
         );
         defer response.deinit();
 

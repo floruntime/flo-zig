@@ -275,9 +275,7 @@ try worker.registerAction("send-email", .user, .{
 });
 
 // Invoke an action (create a task)
-const run_id = try worker.invoke("send-email", "{\"to\": \"user@example.com\"}", .{
-    .priority = 5,
-});
+const run_id = try worker.invoke("send-email", "{\"to\": \"user@example.com\"}", .{});
 defer allocator.free(run_id);
 
 // Check task status
