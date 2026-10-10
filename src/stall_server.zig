@@ -106,6 +106,7 @@ pub const StallServer = struct {
         std.mem.writeInt(u32, h[4..8], @intCast(data.len), .little);
         std.mem.writeInt(u64, h[8..16], request_id, .little);
         h[20] = types.VERSION;
+        std.mem.writeInt(u64, h[24..32], types.TABLE_HASH, .little);
         h[21] = @intFromEnum(status);
         var crc = std.hash.Crc32.init();
         crc.update(h[0..16]);

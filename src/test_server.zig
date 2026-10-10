@@ -74,6 +74,7 @@ pub const OkServer = struct {
             std.mem.writeInt(u32, resp[4..8], @intCast(reply.body.len), .little); // data_len
             std.mem.writeInt(u64, resp[8..16], request_id, .little);
             resp[20] = types.VERSION;
+            std.mem.writeInt(u64, resp[24..32], types.TABLE_HASH, .little);
             resp[21] = reply.status;
             var resp_crc = std.hash.Crc32.init();
             resp_crc.update(resp[0..16]);

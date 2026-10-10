@@ -8,7 +8,12 @@ const std = @import("std");
 pub const MAGIC: u32 = 0x004F4C46;
 
 /// Protocol version
-pub const VERSION: u8 = 0x01;
+pub const VERSION: u8 = 0x02;
+
+/// The hash of the op table this SDK was built for, written into every
+/// request header. A server built from another table refuses the request,
+/// and its answers carry its own hash, which this SDK refuses.
+pub const TABLE_HASH: u64 = 0x4e9243eeab771a02;
 
 /// Size limits (for client-side validation)
 pub const MAX_NAMESPACE_SIZE: usize = 255;
@@ -327,9 +332,11 @@ pub const FloError = error{
 
     // Protocol errors
     InvalidMagic,
-    UnsupportedVersion,
+    /// The server was built from another protocol version or op table;
+    /// `Client.foreignServer` says which. Upgrade the SDK and the server
+    /// together.
+    TableMismatch,
     InvalidChecksum,
-    InvalidReservedField,
     PayloadTooLarge,
     BufferTooSmall,
     IncompleteRequest,

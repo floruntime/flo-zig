@@ -172,6 +172,7 @@ pub const ProcessingSyncOptions = types.ProcessingSyncOptions;
 // Protocol constants
 pub const MAGIC = types.MAGIC;
 pub const VERSION = types.VERSION;
+pub const TABLE_HASH = types.TABLE_HASH;
 
 // =============================================================================
 // Convenience Functions
