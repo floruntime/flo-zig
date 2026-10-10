@@ -373,6 +373,8 @@ pub const FloError = error{
     ConnectionFailed,
     InvalidEndpoint,
     UnexpectedEof,
+    /// No bytes moved within the client's timeout (see ClientOptions.timeout_ms).
+    Timeout,
 
     // Protocol errors
     InvalidMagic,
