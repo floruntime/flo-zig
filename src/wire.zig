@@ -413,16 +413,19 @@ pub fn parseDequeueResponse(allocator: Allocator, data: []const u8) !types.Deque
 
     const count = std.mem.readInt(u32, data[offset..][0..4], .little);
     offset += 4;
+    // Each message: [seq:u64][payload_len:u32][payload]
+    //               [enqueued_at_ms:i64][delivery_count:u32][priority:u8]
+    // A count the data can't hold is refused before it sizes an allocation.
+    const min_message = 8 + 4 + 8 + 4 + 1;
+    if (count > (data.len - offset) / min_message) return FloError.IncompleteResponse;
 
     var messages = try allocator.alloc(types.Message, count);
+    var i: usize = 0;
     errdefer {
-        for (messages) |*m| {
-            m.deinit(allocator);
-        }
+        for (messages[0..i]) |*m| m.deinit(allocator);
         allocator.free(messages);
     }
 
-    var i: usize = 0;
     while (i < count) : (i += 1) {
         if (data.len < offset + 12) return FloError.IncompleteResponse;
 
@@ -432,11 +435,21 @@ pub fn parseDequeueResponse(allocator: Allocator, data: []const u8) !types.Deque
         const payload_len = std.mem.readInt(u32, data[offset..][0..4], .little);
         offset += 4;
 
-        if (data.len < offset + payload_len) return FloError.IncompleteResponse;
-        const payload = try allocator.dupe(u8, data[offset..][0..payload_len]);
+        if (data.len < offset + payload_len + 13) return FloError.IncompleteResponse;
+        const payload_bytes = data[offset..][0..payload_len];
         offset += payload_len;
+        const enqueued_at_ms = std.mem.readInt(i64, data[offset..][0..8], .little);
+        const delivery_count = std.mem.readInt(u32, data[offset + 8 ..][0..4], .little);
+        const priority = data[offset + 12];
+        offset += 13;
 
-        messages[i] = .{ .seq = seq, .payload = payload };
+        messages[i] = .{
+            .seq = seq,
+            .payload = try allocator.dupe(u8, payload_bytes),
+            .enqueued_at_ms = enqueued_at_ms,
+            .delivery_count = delivery_count,
+            .priority = priority,
+        };
     }
 
     return types.DequeueResult{
@@ -539,4 +552,55 @@ test "OptionsBuilder refuses a blocking wait over 300000 ms" {
     try std.testing.expectError(FloError.BlockTooLong, builder.addU32(.wait_ms, types.MAX_BLOCK_MS + 1));
     // Other u32 options are not blocking waits.
     try builder.addU32(.count, types.MAX_BLOCK_MS + 1);
+}
+
+test "parseDequeueResponse reads every message as the server writes it" {
+    const Want = struct { seq: u64, payload: []const u8, at: i64, deliveries: u32, priority: u8 };
+    const want = [_]Want{
+        .{ .seq = 100, .payload = "task1", .at = 1_700_000_000_000, .deliveries = 1, .priority = 0 },
+        .{ .seq = 101, .payload = "t2", .at = 1_700_000_000_005, .deliveries = 2, .priority = 7 },
+        .{ .seq = 102, .payload = "", .at = 1_700_000_000_009, .deliveries = 3, .priority = 255 },
+    };
+    var buf: [256]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], want.len, .little);
+    var at: usize = 4;
+    for (want) |m| {
+        std.mem.writeInt(u64, buf[at..][0..8], m.seq, .little);
+        std.mem.writeInt(u32, buf[at + 8 ..][0..4], @intCast(m.payload.len), .little);
+        @memcpy(buf[at + 12 ..][0..m.payload.len], m.payload);
+        at += 12 + m.payload.len;
+        std.mem.writeInt(i64, buf[at..][0..8], m.at, .little);
+        std.mem.writeInt(u32, buf[at + 8 ..][0..4], m.deliveries, .little);
+        buf[at + 12] = m.priority;
+        at += 13;
+    }
+
+    var result = try parseDequeueResponse(std.testing.allocator, buf[0..at]);
+    defer result.deinit();
+    try std.testing.expectEqual(want.len, result.messages.len);
+    for (want, result.messages) |w, got| {
+        try std.testing.expectEqual(w.seq, got.seq);
+        try std.testing.expectEqualStrings(w.payload, got.payload);
+        try std.testing.expectEqual(w.at, got.enqueued_at_ms);
+        try std.testing.expectEqual(w.deliveries, got.delivery_count);
+        try std.testing.expectEqual(w.priority, got.priority);
+    }
+}
+
+test "parseDequeueResponse refuses a cut trailer and a count its data can't hold, freeing only what it parsed" {
+    var huge: [4]u8 = undefined;
+    std.mem.writeInt(u32, &huge, std.math.maxInt(u32), .little);
+    try std.testing.expectError(FloError.IncompleteResponse, parseDequeueResponse(std.testing.allocator, &huge));
+
+    // Two messages claimed; the second's trailer is cut short.
+    var data: [4 + 26 + 25]u8 = undefined;
+    std.mem.writeInt(u32, data[0..4], 2, .little);
+    std.mem.writeInt(u64, data[4..12], 1, .little);
+    std.mem.writeInt(u32, data[12..16], 1, .little);
+    data[16] = 'a';
+    @memset(data[17..30], 0);
+    std.mem.writeInt(u64, data[30..38], 2, .little);
+    std.mem.writeInt(u32, data[38..42], 1, .little);
+    @memset(data[42..], 0);
+    try std.testing.expectError(FloError.IncompleteResponse, parseDequeueResponse(std.testing.allocator, &data));
 }
