@@ -36,8 +36,18 @@ pub const Client = struct {
     request_id: u64 = 1,
     timeout_ms: u32 = 5_000,
     debug: bool = false,
+    last_error_code: u8 = 0,
+    last_error_len: usize = 0,
+    last_error_buf: [512]u8 = undefined,
 
     const Self = @This();
+
+    /// The last non-ok response: its numeric status, which names codes this
+    /// SDK doesn't know, and the server's message from the body.
+    pub const LastError = struct {
+        code: u8,
+        message: []const u8,
+    };
 
     /// Initialize a new client (does not connect)
     pub fn init(allocator: Allocator, endpoint: []const u8, options: ClientOptions) Self {
@@ -144,6 +154,7 @@ pub const Client = struct {
         options: []const u8,
     ) FloError!wire.RawResponse {
         const stream = self.stream orelse return FloError.NotConnected;
+        self.last_error_code = 0;
 
         // Serialize request
         var send_buf: [8192]u8 = undefined;
@@ -188,6 +199,12 @@ pub const Client = struct {
             break :blk buf;
         } else &[_]u8{};
 
+        if (response_header.status != 0) {
+            self.last_error_code = response_header.status;
+            self.last_error_len = @min(data.len, self.last_error_buf.len);
+            @memcpy(self.last_error_buf[0..self.last_error_len], data[0..self.last_error_len]);
+        }
+
         return wire.RawResponse{
             .status = response_header.getStatus(),
             .data = data,
@@ -207,6 +224,16 @@ pub const Client = struct {
         // start of the next request's reply.
         self.disconnect();
         return if (err == error.WouldBlock) FloError.Timeout else FloError.UnexpectedEof;
+    }
+
+    /// What the server said about the last request, if it wasn't ok. Zig
+    /// errors carry no payload, so the reason lives here. The message is
+    /// truncated to 512 bytes and valid until the next request. A call that
+    /// turns a refusal into a value still leaves it here: kv.get returning
+    /// null for a missing key leaves code 2 (not_found).
+    pub fn lastError(self: *const Self) ?LastError {
+        if (self.last_error_code == 0) return null;
+        return .{ .code = self.last_error_code, .message = self.last_error_buf[0..self.last_error_len] };
     }
 
     /// Get the next request ID

@@ -410,11 +410,15 @@ All operations return `flo.FloError` which includes:
 - `BadRequest` - Invalid request
 - `Conflict` - CAS conflict
 - `Unauthorized` - Authentication required
-- `Overloaded` - Server overloaded
+- `Overloaded` - Server overloaded (retryable)
 - `RateLimited` - Request rate limit exceeded
-- `InternalError` - Internal server error
+- `Unavailable` - No leader, or the shard isn't taking writes or is offline (retryable; an offline shard needs an operator)
+- `InternalError` - Internal server error (not retryable: the write may have committed)
 - `UnexpectedResponse` - Unexpected response format
-- `ServerError` - Generic server error
+- `ServerError` - Generic server error, including status codes this SDK doesn't know
+
+Zig errors carry no payload: after a failed call, `client.lastError()` gives the
+numeric status and the server's message.
 
 ## Building
 

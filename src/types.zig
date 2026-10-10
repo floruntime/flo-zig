@@ -221,7 +221,10 @@ pub const StatusCode = enum(u8) {
     internal_error = 9,
     overloaded = 10,
     rate_limited = 11, // Request rate limit exceeded (WebSocket)
+    unavailable = 12,
 
+    // The server may send codes this SDK predates; `_` keeps them a value
+    // rather than illegal behaviour, and toError maps them to ServerError.
     _,
 
     /// Get human-readable error message
@@ -239,7 +242,26 @@ pub const StatusCode = enum(u8) {
             .internal_error => "Internal server error",
             .overloaded => "Server overloaded",
             .rate_limited => "Request rate limit exceeded",
-            _ => "Unknown error",
+            .unavailable => "Unavailable: no leader or the shard isn't taking writes; retry",
+            // No buffer to format the code into; Client.lastError has it.
+            _ => "Unknown status",
+        };
+    }
+
+    /// The error a non-ok status surfaces as. The server's message is in the
+    /// response body; Client.lastError keeps it.
+    pub fn toError(self: StatusCode) FloError {
+        return switch (self) {
+            .ok => FloError.UnexpectedResponse,
+            .not_found => FloError.NotFound,
+            .bad_request => FloError.BadRequest,
+            .conflict => FloError.Conflict,
+            .unauthorized => FloError.Unauthorized,
+            .overloaded => FloError.Overloaded,
+            .rate_limited => FloError.RateLimited,
+            .internal_error => FloError.InternalError,
+            .unavailable => FloError.Unavailable,
+            else => FloError.ServerError,
         };
     }
 };
@@ -329,9 +351,16 @@ pub const FloError = error{
     BadRequest,
     Conflict,
     Unauthorized,
+    /// Retryable: the server shed load.
     Overloaded,
     RateLimited,
+    /// Not retryable: the write may have committed without being applied,
+    /// so resending can apply it twice.
     InternalError,
+    /// Retryable: the write reached no leader, or the shard stopped taking
+    /// writes or is offline. An offline shard stays so until an operator
+    /// acts; Client.lastError has the server's reason.
+    Unavailable,
     UnexpectedResponse,
 
     // Transaction errors
@@ -1239,4 +1268,14 @@ test "workerBlockMs: 0 means the default, over MAX_BLOCK_MS is refused" {
     try std.testing.expectEqual(@as(u32, 1000), try workerBlockMs(1000));
     try std.testing.expectEqual(MAX_BLOCK_MS, try workerBlockMs(MAX_BLOCK_MS));
     try std.testing.expectError(FloError.BlockTooLong, workerBlockMs(MAX_BLOCK_MS + 1));
+}
+
+test "unavailable is retryable, internal_error is not, unknown codes are a server error" {
+    try std.testing.expectEqual(FloError.Unavailable, StatusCode.unavailable.toError());
+    try std.testing.expectEqual(FloError.Overloaded, StatusCode.overloaded.toError());
+    // internal_error can mean committed-but-not-applied: resending may apply twice.
+    try std.testing.expectEqual(FloError.InternalError, StatusCode.internal_error.toError());
+    const unknown: StatusCode = @enumFromInt(200);
+    try std.testing.expectEqual(FloError.ServerError, unknown.toError());
+    try std.testing.expectEqualStrings("Unknown status", unknown.message());
 }

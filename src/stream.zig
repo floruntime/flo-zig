@@ -8,7 +8,6 @@ const wire = @import("wire.zig");
 const Client = @import("client.zig").Client;
 
 const FloError = types.FloError;
-const StatusCode = types.StatusCode;
 
 /// Stream operations
 pub const Stream = struct {
@@ -43,7 +42,7 @@ pub const Stream = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         // Parse response: [sequence:u64][timestamp_ms:i64]
@@ -113,7 +112,7 @@ pub const Stream = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return parseStreamReadResponse(self.client.allocator, response.data);
@@ -141,7 +140,7 @@ pub const Stream = struct {
         }
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         // Parse response: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32]
@@ -205,7 +204,7 @@ pub const Stream = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
         if (response.data.len != 16) return FloError.IncompleteResponse;
         return .{
@@ -252,7 +251,7 @@ pub const Stream = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -302,7 +301,7 @@ pub const Stream = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return parseStreamReadResponse(self.client.allocator, response.data);
@@ -356,7 +355,7 @@ pub const Stream = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -394,7 +393,7 @@ pub const Stream = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -447,7 +446,7 @@ pub const Stream = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 };
@@ -579,18 +578,6 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
     return types.StreamReadResult{
         .records = records[0..i],
         .allocator = allocator,
-    };
-}
-
-/// Map status code to FloError
-fn mapStatusToError(status: StatusCode) FloError {
-    return switch (status) {
-        .not_found => FloError.NotFound,
-        .bad_request => FloError.BadRequest,
-        .conflict => FloError.Conflict,
-        .unauthorized => FloError.Unauthorized,
-        .overloaded => FloError.Overloaded,
-        else => FloError.ServerError,
     };
 }
 
