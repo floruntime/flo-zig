@@ -122,6 +122,7 @@ pub const StreamWorker = struct {
     worker_id: []const u8,
     consumer_name: []const u8,
     running: bool = false,
+    backoff: types.EmptyPollBackoff = .{},
     draining: bool = false,
     active_tasks: u32 = 0,
     last_heartbeat_ns: i128 = 0,
@@ -366,6 +367,7 @@ pub const StreamWorker = struct {
     /// Poll for records and process them.
     fn pollAndProcess(self: *Self, stream_name: []const u8) !void {
         var stream = self.streamApi();
+        const polled = try std.time.Instant.now();
         var result = try stream.groupRead(
             stream_name,
             self.config.group,
@@ -378,7 +380,10 @@ pub const StreamWorker = struct {
         );
         defer result.deinit();
 
+        const elapsed = (try std.time.Instant.now()).since(polled);
+        const pause_ms = self.backoff.afterPoll(result.records.len == 0, elapsed, self.config.block_ms);
         if (result.records.len == 0) {
+            types.pauseWhileRunning(&self.running, pause_ms);
             return;
         }
 
@@ -566,4 +571,23 @@ test "StreamWorker sends requests on its own connection after init returns" {
 
     w.drain();
     try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.monotonic));
+}
+
+test "StreamWorker paces group reads that come back empty at once" {
+    const handler = struct {
+        fn handle(_: *StreamContext) anyerror!void {}
+    }.handle;
+    var srv = try @import("test_server.zig").OkServer.listen();
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 30_000 }, handler);
+    defer w.deinit();
+    w.running = true;
+
+    // Re-read at once, then paused 50, 100 and 200 ms.
+    var timer = try std.time.Timer.start();
+    for (0..4) |_| try w.pollAndProcess("events");
+    try std.testing.expectEqual(@as(u32, 4), w.backoff.early_empties);
+    try std.testing.expect(timer.read() >= 340 * std.time.ns_per_ms);
 }

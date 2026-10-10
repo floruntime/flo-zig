@@ -168,6 +168,7 @@ pub const ActionWorker = struct {
     handlers: std.StringHashMap(ActionHandler),
     action_names: std.ArrayListUnmanaged([]const u8),
     running: bool = false,
+    backoff: types.EmptyPollBackoff = .{},
     draining: bool = false,
     active_tasks: u32 = 0,
     last_heartbeat_ns: i128 = 0,
@@ -389,6 +390,7 @@ pub const ActionWorker = struct {
     fn pollAndExecute(self: *Self) !void {
         // Await task from server
         var actions = self.api();
+        const polled = try std.time.Instant.now();
         const task_opt = try actions.awaitTask(
             self.worker_id,
             self.action_names.items,
@@ -398,13 +400,17 @@ pub const ActionWorker = struct {
             },
         );
 
-        if (task_opt) |task| {
-            var task_mut = task;
-            defer task_mut.deinit();
-            self.active_tasks += 1;
-            defer self.active_tasks -= 1;
-            self.executeTask(&task_mut);
-        }
+        // No `try`: an error here would leak a task already handed to us.
+        const elapsed = if (std.time.Instant.now()) |now| now.since(polled) else |_| 0;
+        const pause_ms = self.backoff.afterPoll(task_opt == null, elapsed, self.config.block_ms);
+        var task = task_opt orelse {
+            types.pauseWhileRunning(&self.running, pause_ms);
+            return;
+        };
+        defer task.deinit();
+        self.active_tasks += 1;
+        defer self.active_tasks -= 1;
+        self.executeTask(&task);
     }
 
     /// Execute a task with error handling.
@@ -623,4 +629,20 @@ test "ActionWorker sends requests on its own connection after init returns" {
     }.handle;
     try w.registerAction("noop", noop);
     try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.monotonic));
+}
+
+test "ActionWorker paces awaits that come back empty at once" {
+    var srv = try @import("test_server.zig").OkServer.listen();
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 30_000 });
+    defer w.deinit();
+    w.running = true;
+
+    // Re-polled at once, then paused 50, 100 and 200 ms.
+    var timer = try std.time.Timer.start();
+    for (0..4) |_| try w.pollAndExecute();
+    try std.testing.expectEqual(@as(u32, 4), w.backoff.early_empties);
+    try std.testing.expect(timer.read() >= 340 * std.time.ns_per_ms);
 }
