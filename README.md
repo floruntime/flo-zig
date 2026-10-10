@@ -279,11 +279,18 @@ try actions.registerAction("send-email", .user, .{
 var invoked = try actions.invoke("send-email", "{\"to\": \"user@example.com\"}", .{});
 defer invoked.deinit();
 
+// Only workers whose registered labels include every key/value get this run
+var gpu_run = try actions.invoke("render", "{}", .{ .labels = "{\"gpu\":true}" });
+defer gpu_run.deinit();
+
 // Check task status
 var status = try actions.getStatus(invoked.run_id, .{});
 defer status.deinit();
 std.debug.print("Status: {s}\n", .{@tagName(status.status)});
 ```
+
+Invoke has no priority, delay or idempotency key; see
+[flo#181](https://github.com/floruntime/flo/issues/181).
 
 #### Processing Tasks (Worker Pattern)
 

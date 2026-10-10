@@ -56,7 +56,6 @@ pub const Processing = @import("processing.zig").Processing;
 // High-level Worker API
 const worker_mod = @import("worker.zig");
 pub const ActionWorker = worker_mod.ActionWorker;
-pub const Worker = worker_mod.Worker; // backwards-compatible alias
 pub const WorkerConfig = worker_mod.WorkerConfig;
 pub const ActionContext = worker_mod.ActionContext;
 pub const ActionHandler = worker_mod.ActionHandler;

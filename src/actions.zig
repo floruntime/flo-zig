@@ -5,7 +5,7 @@
 //! - Worker registration, heartbeat, drain, deregistration
 //! - Task awaiting, completion, failure, and touch (lease extension)
 //!
-//! For a higher-level API, see `Worker` in worker.zig.
+//! For a higher-level API, see `ActionWorker` in worker.zig.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -16,7 +16,7 @@ const FloError = types.FloError;
 const StatusCode = types.StatusCode;
 
 /// Low-level actions and worker operations.
-/// For a higher-level API, see `Worker` in worker.zig.
+/// For a higher-level API, see `ActionWorker` in worker.zig.
 pub const Actions = struct {
     client: *Client,
 
@@ -110,47 +110,14 @@ pub const Actions = struct {
     ) FloError!types.ActionInvokeResult {
         const ns = self.client.getNamespace(options.namespace);
 
-        // Build value: [priority:u8][delay_ms:i64][has_caller:u8]
-        //              [has_idempotency_key:u8][key_len:u16]?[key]?[input...]
         var value_buf: [8192]u8 = undefined;
-        var offset: usize = 0;
-
-        // Priority (default 10)
-        const priority: u8 = options.priority orelse 10;
-        value_buf[offset] = priority;
-        offset += 1;
-
-        // Delay (default 0)
-        const delay_ms: u64 = options.delay_ms orelse 0;
-        std.mem.writeInt(u64, value_buf[offset..][0..8], delay_ms, .little);
-        offset += 8;
-
-        // Caller ID (none)
-        value_buf[offset] = 0;
-        offset += 1;
-
-        // Idempotency key (optional)
-        if (options.idempotency_key) |key| {
-            value_buf[offset] = 1;
-            offset += 1;
-            std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(key.len), .little);
-            offset += 2;
-            @memcpy(value_buf[offset..][0..key.len], key);
-            offset += key.len;
-        } else {
-            value_buf[offset] = 0;
-            offset += 1;
-        }
-
-        // Input
-        @memcpy(value_buf[offset..][0..input.len], input);
-        offset += input.len;
+        const value = try encodeInvokeValue(&value_buf, options.labels, input);
 
         var response = try self.client.sendRequest(
             .action_invoke,
             ns,
             action_name,
-            value_buf[0..offset],
+            value,
             "",
         );
         defer response.deinit();
@@ -590,40 +557,40 @@ pub const Actions = struct {
 // Response Parsers
 // =============================================================================
 
+/// Encode an action_invoke request value:
+///
+///   [has_labels:u8]([labels_len:u16 LE][labels])?[input...]
+///
+/// has_labels is 0 (the input follows directly) or 1. labels is a JSON object
+/// naming the labels a worker must have to receive the run. Returns the
+/// encoded slice of `buf`, or ValueTooLarge if it does not fit.
+pub fn encodeInvokeValue(buf: []u8, labels: ?[]const u8, input: []const u8) FloError![]const u8 {
+    var offset: usize = 0;
+    if (labels) |l| {
+        if (l.len > std.math.maxInt(u16)) return FloError.ValueTooLarge;
+        if (3 + l.len + input.len > buf.len) return FloError.ValueTooLarge;
+        buf[0] = 1;
+        std.mem.writeInt(u16, buf[1..3], @intCast(l.len), .little);
+        @memcpy(buf[3..][0..l.len], l);
+        offset = 3 + l.len;
+    } else {
+        if (1 + input.len > buf.len) return FloError.ValueTooLarge;
+        buf[0] = 0;
+        offset = 1;
+    }
+    @memcpy(buf[offset..][0..input.len], input);
+    return buf[0 .. offset + input.len];
+}
+
 /// Parse action invoke result
-/// Wire format: [run_id_len:u16][run_id][has_output:u8][output_len:u32]?[output]?
+/// Wire format: [run_id_len:u16][run_id][has_output:u8]. has_output is always
+/// 0, so nothing after the run id is read.
 fn parseActionInvokeResult(allocator: std.mem.Allocator, data: []const u8) FloError!types.ActionInvokeResult {
-    if (data.len < 3) {
-        // Fallback: treat entire data as run_id (backwards compat)
-        const run_id = allocator.dupe(u8, data) catch return FloError.OutOfMemory;
-        return types.ActionInvokeResult{ .run_id = run_id, .allocator = allocator };
-    }
+    if (data.len < 2) return FloError.UnexpectedResponse;
+    const run_id_len = std.mem.readInt(u16, data[0..2], .little);
+    if (run_id_len == 0 or run_id_len > data.len - 2) return FloError.UnexpectedResponse;
 
-    var pos: usize = 0;
-
-    // Read run_id (length-prefixed u16)
-    const run_id_len = std.mem.readInt(u16, data[pos..][0..2], .little);
-    pos += 2;
-
-    // Sanity check
-    if (run_id_len > data.len - pos or run_id_len > 256 or run_id_len == 0) {
-        const run_id = allocator.dupe(u8, data) catch return FloError.OutOfMemory;
-        return types.ActionInvokeResult{ .run_id = run_id, .allocator = allocator };
-    }
-
-    const run_id = allocator.dupe(u8, data[pos..][0..run_id_len]) catch return FloError.OutOfMemory;
-    errdefer allocator.free(run_id);
-    pos += run_id_len;
-
-    // Skip optional output field (wire compat — always empty now)
-    if (pos < data.len and data[pos] == 1) {
-        pos += 1;
-        if (pos + 4 <= data.len) {
-            const output_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-            pos += 4 + output_len;
-        }
-    }
-
+    const run_id = allocator.dupe(u8, data[2..][0..run_id_len]) catch return FloError.OutOfMemory;
     return types.ActionInvokeResult{ .run_id = run_id, .allocator = allocator };
 }
 
@@ -840,4 +807,22 @@ test "Actions init" {
 
     const actions = Actions.init(&client);
     _ = actions;
+}
+
+test "encodeInvokeValue without labels writes 0 then the input" {
+    var buf: [16]u8 = undefined;
+    const value = try encodeInvokeValue(&buf, null, "x");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 'x' }, value);
+}
+
+test "encodeInvokeValue with labels writes 1, the u16 LE length, the labels, then the input" {
+    var buf: [32]u8 = undefined;
+    const value = try encodeInvokeValue(&buf, "{\"gpu\":true}", "x");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 12, 0 } ++ "{\"gpu\":true}" ++ "x", value);
+}
+
+test "encodeInvokeValue refuses a value that does not fit the buffer" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(FloError.ValueTooLarge, encodeInvokeValue(&buf, null, "12345678"));
+    try std.testing.expectError(FloError.ValueTooLarge, encodeInvokeValue(&buf, "{}", "1234"));
 }

@@ -862,12 +862,10 @@ pub const ActionRegisterOptions = struct {
 pub const ActionInvokeOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Task priority. The server skips this byte today; it has no effect.
-    priority: ?u8 = null,
-    /// Delay before task becomes visible (ms)
-    delay_ms: ?u64 = null,
-    /// Idempotency key for deduplication
-    idempotency_key: ?[]const u8 = null,
+    /// Labels a worker must have to receive the run, as a JSON object string
+    /// such as `{"gpu":true}`. A worker gets the run only if the JSON object
+    /// it registered as metadata contains every key with the same value.
+    labels: ?[]const u8 = null,
 };
 
 /// Options for action status query
