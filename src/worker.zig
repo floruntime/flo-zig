@@ -510,9 +510,6 @@ pub const ActionWorker = struct {
     }
 };
 
-/// Backwards-compatible alias.
-pub const Worker = ActionWorker;
-
 /// Generate a random worker ID.
 fn generateWorkerId(allocator: Allocator) ![]u8 {
     var id_buf: [8]u8 = undefined;
