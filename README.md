@@ -136,7 +136,6 @@ try kv.delete("key", .{});
 // Scan keys with prefix
 var result = try kv.scan("prefix:", .{
     .limit = 100,
-    .keys_only = true,
 });
 defer result.deinit();
 

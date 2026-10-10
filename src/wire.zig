@@ -368,6 +368,9 @@ pub fn parseScanResponse(allocator: Allocator, data: []const u8) !types.ScanResu
     var offset: usize = 0;
     const count = std.mem.readInt(u32, data[offset..][0..4], .little);
     offset += 4;
+    // Each entry is at least its two length fields; a count the data can't
+    // hold is refused before it sizes an allocation.
+    if (count > (data.len - offset) / (2 + 4)) return FloError.IncompleteResponse;
 
     var entries = try allocator.alloc(types.KVEntry, count);
     var parsed: usize = 0;
@@ -591,6 +594,12 @@ test "parseDequeueResponse reads every message as the server writes it" {
         try std.testing.expectEqual(w.deliveries, got.delivery_count);
         try std.testing.expectEqual(w.priority, got.priority);
     }
+}
+
+test "parseScanResponse refuses a count its data can't hold" {
+    var data: [4]u8 = undefined;
+    std.mem.writeInt(u32, &data, std.math.maxInt(u32), .little);
+    try std.testing.expectError(FloError.IncompleteResponse, parseScanResponse(std.testing.allocator, &data));
 }
 
 test "parseDequeueResponse refuses a cut trailer and a count its data can't hold, freeing only what it parsed" {

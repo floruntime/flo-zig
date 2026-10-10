@@ -210,13 +210,6 @@ pub const KV = struct {
     ) FloError!types.ScanResult {
         const ns = self.client.getNamespace(options.namespace);
 
-        var opts_buf: [64]u8 = undefined;
-        var builder = wire.OptionsBuilder.init(&opts_buf);
-
-        if (options.keys_only) {
-            try builder.addU8(.keys_only, 1);
-        }
-
         const value = try wire.encodeListValue(self.client.allocator, options.limit orelse 0, options.cursor orelse "");
         defer self.client.allocator.free(value);
 
@@ -225,7 +218,7 @@ pub const KV = struct {
             ns,
             prefix,
             value,
-            builder.getOptions(),
+            "",
         );
         defer response.deinit();
 

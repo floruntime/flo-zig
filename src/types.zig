@@ -252,7 +252,6 @@ pub const OptionTag = enum(u8) {
     if_not_exists = 0x03, // void: Only set if key doesn't exist (NX)
     if_exists = 0x04, // void: Only set if key exists (XX)
     limit = 0x05, // u32: Maximum number of results for scan/list operations
-    keys_only = 0x06, // u8: Skip values in scan response (0/1)
     routing_key = 0x08, // string: Explicit routing key for shard co-location
     txn_id = 0x09, // u64: Transaction ID for per-shard transactions
 
@@ -350,7 +349,7 @@ pub const FloError = error{
 /// KV entry from scan results
 pub const KVEntry = struct {
     key: []const u8,
-    value: ?[]const u8, // null if keys_only=true
+    value: ?[]const u8,
 
     pub fn deinit(self: *KVEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.key);
@@ -519,7 +518,6 @@ pub const ScanOptions = struct {
     namespace: ?[]const u8 = null,
     cursor: ?[]const u8 = null,
     limit: ?u32 = null,
-    keys_only: bool = false,
 };
 
 /// Options for KV history operations
