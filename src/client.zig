@@ -226,9 +226,11 @@ pub const Client = struct {
         return if (err == error.WouldBlock) FloError.Timeout else FloError.UnexpectedEof;
     }
 
-    /// What the server said about the last request, if it failed. Zig errors
-    /// carry no payload, so the reason lives here. The message is truncated
-    /// to 512 bytes and valid until the next request.
+    /// What the server said about the last request, if it wasn't ok. Zig
+    /// errors carry no payload, so the reason lives here. The message is
+    /// truncated to 512 bytes and valid until the next request. A call that
+    /// turns a refusal into a value still leaves it here: kv.get returning
+    /// null for a missing key leaves code 2 (not_found).
     pub fn lastError(self: *const Self) ?LastError {
         if (self.last_error_code == 0) return null;
         return .{ .code = self.last_error_code, .message = self.last_error_buf[0..self.last_error_len] };

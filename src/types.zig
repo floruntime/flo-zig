@@ -243,7 +243,8 @@ pub const StatusCode = enum(u8) {
             .overloaded => "Server overloaded",
             .rate_limited => "Request rate limit exceeded",
             .unavailable => "Unavailable: no leader or the shard isn't taking writes; retry",
-            _ => "Unknown error",
+            // No buffer to format the code into; Client.lastError has it.
+            _ => "Unknown status",
         };
     }
 
@@ -1276,5 +1277,5 @@ test "unavailable is retryable, internal_error is not, unknown codes are a serve
     try std.testing.expectEqual(FloError.InternalError, StatusCode.internal_error.toError());
     const unknown: StatusCode = @enumFromInt(200);
     try std.testing.expectEqual(FloError.ServerError, unknown.toError());
-    try std.testing.expectEqualStrings("Unknown error", unknown.message());
+    try std.testing.expectEqualStrings("Unknown status", unknown.message());
 }
