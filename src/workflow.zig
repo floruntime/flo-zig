@@ -34,19 +34,6 @@ const Client = @import("client.zig").Client;
 const FloError = types.FloError;
 const Allocator = std.mem.Allocator;
 
-fn mapStatusToError(status: types.StatusCode) FloError {
-    return switch (status) {
-        .not_found => FloError.NotFound,
-        .bad_request => FloError.BadRequest,
-        .conflict => FloError.Conflict,
-        .unauthorized => FloError.Unauthorized,
-        .overloaded => FloError.Overloaded,
-        .rate_limited => FloError.RateLimited,
-        .internal_error => FloError.InternalError,
-        else => FloError.UnexpectedResponse,
-    };
-}
-
 const status_names = [_][]const u8{
     "pending", "running", "waiting", "completed", "failed", "cancelled", "timed_out",
 };
@@ -188,7 +175,7 @@ pub const Workflow = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -218,7 +205,7 @@ pub const Workflow = struct {
         }
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
@@ -291,7 +278,7 @@ pub const Workflow = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
@@ -316,7 +303,7 @@ pub const Workflow = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return parseWorkflowStatus(allocator, response.data) catch return FloError.UnexpectedResponse;
@@ -354,7 +341,7 @@ pub const Workflow = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -377,7 +364,7 @@ pub const Workflow = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -404,7 +391,7 @@ pub const Workflow = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
@@ -446,7 +433,7 @@ pub const Workflow = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
@@ -473,7 +460,7 @@ pub const Workflow = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
@@ -497,7 +484,7 @@ pub const Workflow = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -519,7 +506,7 @@ pub const Workflow = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
