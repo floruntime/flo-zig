@@ -333,7 +333,7 @@ pub const FloError = error{
     // Protocol errors
     InvalidMagic,
     /// The server was built from another protocol version or op table;
-    /// `Client.foreignServer` says which. Upgrade the SDK and the server
+    /// `Client.foreign_server` says which. Upgrade the SDK and the server
     /// together.
     TableMismatch,
     InvalidChecksum,
