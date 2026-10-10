@@ -25,14 +25,14 @@ pub const RequestHeader = extern struct {
     op_code: u16,
     version: u8,
     flags: u8,
-    reserved: [8]u8,
+    table_hash: u64,
 
     pub fn validate(self: RequestHeader) FloError!void {
         if (self.magic != types.MAGIC) {
             return FloError.InvalidMagic;
         }
-        if (self.version != types.VERSION) {
-            return FloError.UnsupportedVersion;
+        if (self.version != types.VERSION or self.table_hash != types.TABLE_HASH) {
+            return FloError.TableMismatch;
         }
         if (self.payload_length > 100 * 1024 * 1024) {
             return FloError.PayloadTooLarge;
@@ -60,14 +60,14 @@ pub const ResponseHeader = extern struct {
     status: u8,
     flags: u8,
     _pad: u8,
-    reserved: [8]u8,
+    table_hash: u64,
 
     pub fn validate(self: ResponseHeader) FloError!void {
         if (self.magic != types.MAGIC) {
             return FloError.InvalidMagic;
         }
-        if (self.version != types.VERSION) {
-            return FloError.UnsupportedVersion;
+        if (self.version != types.VERSION or self.table_hash != types.TABLE_HASH) {
+            return FloError.TableMismatch;
         }
     }
 
@@ -294,7 +294,7 @@ pub fn serializeRequest(
         .op_code = @intFromEnum(op_code),
         .version = types.VERSION,
         .flags = 0,
-        .reserved = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        .table_hash = types.TABLE_HASH,
     };
 
     // Compute CRC32
@@ -535,6 +535,7 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
+    try std.testing.expectEqual(@as(u64, 0x4e9243eeab771a02), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
 }
 

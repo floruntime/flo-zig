@@ -39,8 +39,25 @@ pub const Client = struct {
     last_error_code: u8 = 0,
     last_error_len: usize = 0,
     last_error_buf: [512]u8 = undefined,
+    foreign_server: ?ForeignServer = null,
 
     const Self = @This();
+
+    /// A server built from another protocol version or op table, as its
+    /// answer's header named it (`FloError.TableMismatch`).
+    pub const ForeignServer = struct {
+        version: u8,
+        table_hash: u64,
+
+        /// What to tell a person: both builds, and what to do.
+        pub fn format(self: ForeignServer, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            if (self.version != types.VERSION) {
+                try w.print("server protocol {d}, client protocol {d}: upgrade the client", .{ self.version, types.VERSION });
+            } else {
+                try w.print("server table 0x{x:0>16}, client table 0x{x:0>16}: upgrade the client", .{ self.table_hash, types.TABLE_HASH });
+            }
+        }
+    };
 
     /// The last non-ok response: its numeric status, which names codes this
     /// SDK doesn't know, and the server's message from the body.
@@ -184,6 +201,9 @@ pub const Client = struct {
 
         const response_header = @as(*align(1) const wire.ResponseHeader, @ptrCast(&header_buf)).*;
         response_header.validate() catch |err| {
+            // Another build's body can't be read: the connection is dropped
+            // with it unread.
+            if (err == FloError.TableMismatch) self.foreign_server = .{ .version = response_header.version, .table_hash = response_header.table_hash };
             self.disconnect();
             return err;
         };
@@ -430,6 +450,54 @@ test "an action await without block_ms is given the server's 30 s on top of time
     try std.testing.expectEqual(@as(u64, 0), blockingWaitMs(.kv_get, ""));
 }
 
+test "an answer from another op table is refused unread, naming both tables" {
+    // Answers the first request with an ok header from another table and a
+    // body that would read as a value, then waits for the client to hang up.
+    const Foreign = struct {
+        server: std.net.Server,
+
+        fn serve(self: *@This()) void {
+            const conn = self.server.accept() catch return;
+            defer conn.stream.close();
+            var req: wire.RequestHeader = undefined;
+            _ = conn.stream.readAtLeast(std.mem.asBytes(&req), @sizeOf(wire.RequestHeader)) catch return;
+            const body = "\x07\x00\x00\x00\x00\x00\x00\x00v";
+            var resp = std.mem.zeroes(wire.ResponseHeader);
+            resp.magic = types.MAGIC;
+            resp.version = types.VERSION;
+            resp.table_hash = types.TABLE_HASH +% 1;
+            resp.request_id = req.request_id;
+            resp.data_len = body.len;
+            resp.crc32 = resp.computeCRC32(body);
+            conn.stream.writeAll(std.mem.asBytes(&resp)) catch return;
+            conn.stream.writeAll(body) catch return;
+            var rest: [64]u8 = undefined;
+            _ = conn.stream.read(&rest) catch {};
+        }
+    };
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var srv: Foreign = .{ .server = try addr.listen(.{}) };
+    defer srv.server.deinit();
+    const thread = try std.Thread.spawn(.{}, Foreign.serve, .{&srv});
+    defer thread.join();
+
+    var endpoint_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "127.0.0.1:{d}", .{srv.server.listen_address.getPort()});
+    var client = Client.init(std.testing.allocator, endpoint, .{ .timeout_ms = 1000 });
+    defer client.deinit();
+    try client.connect();
+
+    try std.testing.expectError(FloError.TableMismatch, client.sendRequest(.kv_get, "default", "k", "", ""));
+    try std.testing.expect(!client.isConnected());
+    const foreign = client.foreign_server.?;
+    try std.testing.expectEqual(types.TABLE_HASH +% 1, foreign.table_hash);
+    var msg_buf: [128]u8 = undefined;
+    const msg = try std.fmt.bufPrint(&msg_buf, "{f}", .{foreign});
+    var want_buf: [128]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "server table 0x{x:0>16}, client table 0x{x:0>16}: upgrade the client", .{ types.TABLE_HASH +% 1, types.TABLE_HASH });
+    try std.testing.expectEqualStrings(want, msg);
+}
+
 test "a response body that stalls partway fails with Timeout" {
     // Answers the first request with a header for 100 bytes of data, sends
     // 3 of them, then goes quiet until the test is done.
@@ -445,6 +513,7 @@ test "a response body that stalls partway fails with Timeout" {
             var resp = std.mem.zeroes(wire.ResponseHeader);
             resp.magic = types.MAGIC;
             resp.version = types.VERSION;
+            resp.table_hash = types.TABLE_HASH;
             resp.request_id = req.request_id;
             resp.data_len = 100;
             conn.stream.writeAll(std.mem.asBytes(&resp)) catch return;
