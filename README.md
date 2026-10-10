@@ -230,7 +230,8 @@ const info = try stream.info("events", .{});
 std.debug.print("Stream has {d} records\n", .{info.count});
 
 // Trim stream
-try stream.trim("events", .{ .max_len = 1000 });
+const trimmed = try stream.trim("events", .{ .max_len = 1000 });
+_ = trimmed.removed;
 ```
 
 ### Stream Consumer Groups
