@@ -67,9 +67,7 @@ pub fn main() !void {
         std.debug.print("Message: {s}\n", .{msg.payload});
     }
 
-    // Acknowledge processed messages
-    var seqs = [_]u64{ result.messages[0].seq };
-    try queue.ack("tasks", &seqs, .{});
+    // No ack needed: dequeue already acknowledged these messages (see Queue Operations).
 }
 ```
 
@@ -138,9 +136,14 @@ try kv.delete("key", .{});
 // Scan keys with prefix
 var result = try kv.scan("prefix:", .{
     .limit = 100,
-    .keys_only = true,
 });
 defer result.deinit();
+
+// Next page: pass back the cursor the previous page returned
+if (result.has_more) {
+    var next = try kv.scan("prefix:", .{ .limit = 100, .cursor = result.cursor });
+    defer next.deinit();
+}
 
 // Get version history
 const versions = try kv.history("key", .{ .limit = 10 });
@@ -153,37 +156,32 @@ var queue = flo.Queue.init(&client);
 
 // Enqueue message (uses client's default namespace)
 const seq = try queue.enqueue("queue-name", "payload", .{
-    .priority = 5,              // Higher = more urgent
-    .delay_ms = 1000,           // Delay before visible
-    .dedup_key = "unique-id",   // Deduplication key
+    .priority = 5, // Lower is dequeued first (0 = default, taken before 5)
 });
 
 // Enqueue to different namespace
 const seq = try queue.enqueue("queue-name", "payload", .{ .namespace = "other-ns" });
 
-// Dequeue messages (uses server default 30s visibility timeout)
+// Dequeue messages. Queues are at-most-once today: dequeue acknowledges each
+// message as it hands it out, so a message is not redelivered if the consumer
+// fails, and ack/nack have no effect on it.
 var result = try queue.dequeue("queue-name", 10, .{});
 defer result.deinit();
 
-// Dequeue with custom options
-var result = try queue.dequeue("queue-name", 10, .{
-    .visibility_timeout_ms = 60000,  // Custom visibility timeout
-    .block_ms = 5000,                // Block waiting for messages (long polling)
-});
+// Block waiting for messages (long polling)
+var result = try queue.dequeue("queue-name", 10, .{ .block_ms = 5000 });
 defer result.deinit();
 
-// Acknowledge messages
+// ack / nack exist on the wire but have no effect on a dequeued message,
+// since dequeue already acknowledged it. Don't rely on them for retries.
 try queue.ack("queue-name", &seqs, .{});
+try queue.nack("queue-name", &seqs, .{});
 
-// Negative acknowledge (return to queue or DLQ)
-try queue.nack("queue-name", &seqs, .{ .to_dlq = false });
-
-// List DLQ messages
-var dlq = try queue.dlqList("queue-name", .{ .limit = 100 });
+// The DLQ isn't reached in normal use, because dequeued messages are never
+// failed back. dlqList returns a count summary; dlqRequeue is refused by the
+// server as not implemented.
+var dlq = try queue.dlqList("queue-name", .{});
 defer dlq.deinit();
-
-// Requeue from DLQ
-try queue.dlqRequeue("queue-name", &seqs, .{});
 ```
 
 ### Stream Operations
@@ -262,61 +260,58 @@ for (records.records, 0..) |rec, i| {
 try stream.groupAck("events", "my-group", seqs[0..records.records.len], .{});
 ```
 
-### Worker/Action Operations
+### Action Operations
 
-Actions are task types that workers process. Workers are long-running processes that await and process tasks.
+Actions are task types that workers process. `Actions` is the low-level API; for a
+handler-based worker that registers, awaits, and heartbeats for you, see `ActionWorker`.
 
 ```zig
-var worker = flo.Worker.init(&client);
+var actions = flo.Actions.init(&client);
 
 // Register an action (task type)
-try worker.registerAction("send-email", .user, .{
+try actions.registerAction("send-email", .user, .{
     .description = "Send email notifications",
     .timeout_ms = 30000,
     .max_retries = 3,
 });
 
 // Invoke an action (create a task)
-const run_id = try worker.invoke("send-email", "{\"to\": \"user@example.com\"}", .{
-    .priority = 5,
-});
-defer allocator.free(run_id);
+var invoked = try actions.invoke("send-email", "{\"to\": \"user@example.com\"}", .{});
+defer invoked.deinit();
 
 // Check task status
-var status = try worker.getStatus(run_id, .{});
+var status = try actions.getStatus(invoked.run_id, .{});
 defer status.deinit();
-std.debug.print("Status: {}\n", .{status.status});
+std.debug.print("Status: {s}\n", .{@tagName(status.status)});
 ```
 
 #### Processing Tasks (Worker Pattern)
 
 ```zig
-var worker = flo.Worker.init(&client);
+var actions = flo.Actions.init(&client);
 
 // Register as a worker for specific task types
-try worker.register("worker-1", &[_][]const u8{ "send-email", "process-order" }, .{});
+try actions.register("worker-1", &[_][]const u8{ "send-email", "process-order" }, .{});
 
 // Main worker loop
 while (true) {
     // Await task (blocks until task available or timeout)
-    if (try worker.awaitTask("worker-1", &[_][]const u8{ "send-email" }, .{
-        .timeout_ms = 30000,  // Task lease duration
-        .block_ms = 30000,    // Wait up to 30s (0 = don't wait, max 300000)
-    })) |*task| {
-        defer task.deinit();
+    var task = (try actions.awaitTask("worker-1", &[_][]const u8{"send-email"}, .{
+        .block_ms = 30000, // Wait up to 30s (0 = don't wait, max 300000)
+    })) orelse continue;
+    defer task.deinit();
 
-        std.debug.print("Got task: {s}\n", .{task.task_id});
+    std.debug.print("Got task: {s}\n", .{task.task_id});
 
-        // Process the task...
-        const result = processTask(task.payload);
+    // Process the task...
+    const result = processTask(task.payload);
 
-        if (result.success) {
-            // Complete successfully
-            try worker.complete("worker-1", task.task_id, result.output, .{});
-        } else {
-            // Fail with retry
-            try worker.fail("worker-1", task.task_id, result.error_msg, .{ .retry = true });
-        }
+    if (result.success) {
+        // Complete successfully
+        try actions.complete("worker-1", task.task_type, task.task_id, result.output, .{});
+    } else {
+        // Fail with retry
+        try actions.fail("worker-1", task.task_type, task.task_id, result.error_msg, .{ .retry = true });
     }
 }
 ```
@@ -325,7 +320,7 @@ while (true) {
 
 ```zig
 // For long-running tasks, extend the lease to prevent timeout
-try worker.touch("worker-1", task.task_id, .{ .extend_ms = 30000 });
+try actions.touch("worker-1", task.task_type, task.task_id, .{ .extend_ms = 30000 });
 ```
 
 ### Workflow Operations

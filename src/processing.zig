@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const wire = @import("wire.zig");
 const Client = @import("client.zig").Client;
 
 const FloError = types.FloError;
@@ -122,21 +123,14 @@ pub const Processing = struct {
     ) FloError!types.ProcessingListResult {
         const ns = self.client.getNamespace(options.namespace);
 
-        // Wire format: [limit:u32][cursor...]
-        const cursor = options.cursor orelse &[_]u8{};
-        var value_buf: [4 + 64]u8 = undefined;
-        std.mem.writeInt(u32, value_buf[0..4], options.limit, .little);
-        if (cursor.len > 0) {
-            const copy_len = @min(cursor.len, value_buf.len - 4);
-            @memcpy(value_buf[4 .. 4 + copy_len], cursor[0..copy_len]);
-        }
-        const value_len = 4 + @min(cursor.len, value_buf.len - 4);
+        const value = try wire.encodeListValue(self.client.allocator, options.limit, options.cursor orelse "");
+        defer self.client.allocator.free(value);
 
         var response = try self.client.sendRequest(
             .processing_list,
             ns,
             "",
-            value_buf[0..value_len],
+            value,
             "",
         );
         defer response.deinit();
@@ -370,6 +364,7 @@ fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.Processi
 ///
 /// Wire format: [count:u32]([name_len:u16][name][job_id_len:u16][job_id]
 ///              [status_len:u16][status][parallelism:u32][created_at:i64])*
+///              [has_more:u8][cursor_len:u16][cursor]
 fn parseProcessingList(allocator: Allocator, data: []const u8) !types.ProcessingListResult {
     if (data.len < 4) return error.UnexpectedEndOfData;
 
@@ -378,14 +373,14 @@ fn parseProcessingList(allocator: Allocator, data: []const u8) !types.Processing
     pos += 4;
 
     var entries = try allocator.alloc(types.ProcessingListEntry, count);
+    var i: u32 = 0;
     errdefer {
-        for (entries[0..count]) |*e| {
+        for (entries[0..i]) |*e| {
             e.deinit(allocator);
         }
         allocator.free(entries);
     }
 
-    var i: u32 = 0;
     while (i < count) : (i += 1) {
         // Read name
         if (pos + 2 > data.len) return error.UnexpectedEndOfData;
@@ -433,8 +428,13 @@ fn parseProcessingList(allocator: Allocator, data: []const u8) !types.Processing
         };
     }
 
+    const trailer = try wire.parseListTrailer(data, pos);
+    const cursor = if (trailer.cursor) |c| try allocator.dupe(u8, c) else null;
+
     return .{
         .entries = entries,
+        .has_more = trailer.has_more,
+        .cursor = cursor,
         .allocator = allocator,
     };
 }
@@ -471,4 +471,26 @@ test "extractYamlName" {
     try std.testing.expectEqualStrings("quoted", extractYamlName("name: \"quoted\"\n").?);
     try std.testing.expectEqualStrings("test", extractYamlName("  name: test").?);
     try std.testing.expect(extractYamlName("type: stream\nversion: 1") == null);
+}
+
+test "list sends [limit][cursor] in the value and returns the next cursor" {
+    // No jobs, then has_more=1 and a 2-byte cursor.
+    const body = [_]u8{ 0, 0, 0, 0, 1, 2, 0, 'c', '2' };
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.body = &body;
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var processing = Processing.init(&client);
+
+    var result = try processing.list(std.testing.allocator, .{ .limit = 5, .cursor = "c1" });
+    defer result.deinit();
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 5, 0, 0, 0, 'c', '1' }, srv.lastValue());
+    try std.testing.expectEqual(@as(usize, 0), result.entries.len);
+    try std.testing.expect(result.has_more);
+    try std.testing.expectEqualStrings("c2", result.cursor.?);
 }

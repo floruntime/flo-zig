@@ -1,4 +1,5 @@
-//! A loopback server for tests that answers every request with an empty OK.
+//! A loopback server for tests that answers every request with OK and `body`,
+//! and keeps the last request's payload for the test to inspect.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -9,6 +10,10 @@ pub const OkServer = struct {
     requests: std.atomic.Value(u32) = .init(0),
     endpoint_buf: [32]u8 = undefined,
     endpoint: []const u8 = "",
+    /// Data sent back with every OK.
+    body: []const u8 = "",
+    last_payload_buf: [1024]u8 = undefined,
+    last_payload_len: usize = 0,
 
     /// Listen on an ephemeral port. Call `start` once the value is at its
     /// final address.
@@ -47,20 +52,17 @@ pub const OkServer = struct {
             var crc = std.hash.Crc32.init();
             crc.update(req[0..16]);
             crc.update(req[20..32]);
-            var read: usize = 0;
-            var buf: [1024]u8 = undefined;
-            while (read < payload_length) {
-                const n = @min(buf.len, payload_length - read);
-                readAll(conn.stream, buf[0..n]) catch return;
-                crc.update(buf[0..n]);
-                read += n;
-            }
+            if (payload_length > self.last_payload_buf.len) return;
+            const payload = self.last_payload_buf[0..payload_length];
+            readAll(conn.stream, payload) catch return;
+            crc.update(payload);
             if (crc.final() != crc32) return;
-            _ = self.requests.fetchAdd(1, .monotonic);
+            self.last_payload_len = payload_length;
+            _ = self.requests.fetchAdd(1, .release);
 
             var resp = [_]u8{0} ** 32;
             std.mem.writeInt(u32, resp[0..4], types.MAGIC, .little);
-            std.mem.writeInt(u32, resp[4..8], 0, .little); // data_len
+            std.mem.writeInt(u32, resp[4..8], @intCast(self.body.len), .little); // data_len
             std.mem.writeInt(u64, resp[8..16], request_id, .little);
             resp[20] = types.VERSION;
             resp[21] = @intFromEnum(types.StatusCode.ok);
@@ -69,7 +71,21 @@ pub const OkServer = struct {
             resp_crc.update(resp[20..32]);
             std.mem.writeInt(u32, resp[16..20], resp_crc.final(), .little);
             conn.stream.writeAll(&resp) catch return;
+            conn.stream.writeAll(self.body) catch return;
         }
+    }
+
+    /// The value field of the last request, read at the server's payload
+    /// offsets: [ns_len:u16][ns][key_len:u16][key][value_len:u32][value]...
+    pub fn lastValue(self: *OkServer) []const u8 {
+        _ = self.requests.load(.acquire);
+        const p = self.last_payload_buf[0..self.last_payload_len];
+        var off: usize = 0;
+        off += 2 + std.mem.readInt(u16, p[off..][0..2], .little);
+        off += 2 + std.mem.readInt(u16, p[off..][0..2], .little);
+        const value_len = std.mem.readInt(u32, p[off..][0..4], .little);
+        off += 4;
+        return p[off..][0..value_len];
     }
 
     fn readAll(stream: std.net.Stream, buf: []u8) !void {

@@ -178,7 +178,6 @@ pub fn main() !void {
         .endpoint = endpoint,
         .namespace = namespace,
         .concurrency = 5,
-        .action_timeout_ms = 300_000, // 5 minutes
     });
     defer worker.deinit();
 

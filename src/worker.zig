@@ -51,8 +51,6 @@ pub const WorkerConfig = struct {
     worker_id: ?[]const u8 = null,
     /// Maximum concurrent actions
     concurrency: u32 = 10,
-    /// Action timeout in milliseconds (default: 5 minutes)
-    action_timeout_ms: u64 = 300_000,
     /// Long-poll wait per await in ms. 0 means DEFAULT_WORKER_BLOCK_MS; over
     /// MAX_BLOCK_MS, ActionWorker.init returns error.BlockTooLong.
     block_ms: u32 = types.DEFAULT_WORKER_BLOCK_MS,
@@ -544,7 +542,6 @@ test "WorkerConfig defaults" {
         .endpoint = "localhost:3000",
     };
     try std.testing.expectEqual(@as(u32, 10), config.concurrency);
-    try std.testing.expectEqual(@as(u64, 300_000), config.action_timeout_ms);
     try std.testing.expectEqual(@as(u32, 30_000), config.block_ms);
     try std.testing.expectEqual(@as(u64, 30_000), config.heartbeat_interval_ms);
 }

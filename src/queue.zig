@@ -34,13 +34,6 @@ pub const Queue = struct {
 
         try builder.addU8(.priority, options.priority);
 
-        if (options.delay_ms) |delay| {
-            try builder.addU64(.delay_ms, delay);
-        }
-        if (options.dedup_key) |key| {
-            try builder.addBytes(.dedup_key, key);
-        }
-
         var response = try self.client.sendRequest(
             .queue_enqueue,
             ns,
@@ -77,9 +70,6 @@ pub const Queue = struct {
 
         try builder.addU32(.count, count);
 
-        if (options.visibility_timeout_ms) |timeout| {
-            try builder.addU32(.visibility_timeout_ms, timeout);
-        }
         if (options.block_ms) |block| {
             try builder.addU32(.block_ms, block);
         }
@@ -100,7 +90,8 @@ pub const Queue = struct {
         return wire.parseDequeueResponse(self.client.allocator, response.data);
     }
 
-    /// Acknowledge messages (mark as processed)
+    /// Acknowledge messages. Dequeue already acknowledges each message it
+    /// hands out (queues are at-most-once), so this has no effect on one.
     pub fn ack(
         self: *Queue,
         queue_name: []const u8,
@@ -126,7 +117,8 @@ pub const Queue = struct {
         }
     }
 
-    /// Negative acknowledge messages (return to queue or send to DLQ)
+    /// Negative acknowledge messages. Dequeue already acknowledged them, so
+    /// this has no effect on a dequeued message and does not retry it.
     pub fn nack(
         self: *Queue,
         queue_name: []const u8,
@@ -134,11 +126,6 @@ pub const Queue = struct {
         options: types.NackOptions,
     ) FloError!void {
         const ns = self.client.getNamespace(options.namespace);
-
-        var opts_buf: [8]u8 = undefined;
-        var builder = wire.OptionsBuilder.init(&opts_buf);
-
-        try builder.addU8(.send_to_dlq, if (options.to_dlq) 1 else 0);
 
         var value_buf: [4096]u8 = undefined;
         const value = try wire.serializeSeqs(&value_buf, seqs);
@@ -148,7 +135,7 @@ pub const Queue = struct {
             ns,
             queue_name,
             value,
-            builder.getOptions(),
+            "",
         );
         defer response.deinit();
 
@@ -166,17 +153,12 @@ pub const Queue = struct {
     ) FloError!types.DequeueResult {
         const ns = self.client.getNamespace(options.namespace);
 
-        var opts_buf: [16]u8 = undefined;
-        var builder = wire.OptionsBuilder.init(&opts_buf);
-
-        try builder.addU32(.limit, options.limit);
-
         var response = try self.client.sendRequest(
             .queue_dlq_list,
             ns,
             queue_name,
             "",
-            builder.getOptions(),
+            "",
         );
         defer response.deinit();
 
@@ -187,7 +169,8 @@ pub const Queue = struct {
         return wire.parseDequeueResponse(self.client.allocator, response.data);
     }
 
-    /// Requeue messages from DLQ back to main queue
+    /// Requeue messages from DLQ back to main queue. The server refuses this
+    /// as not implemented.
     pub fn dlqRequeue(
         self: *Queue,
         queue_name: []const u8,
@@ -243,33 +226,6 @@ pub const Queue = struct {
         }
 
         return wire.parseDequeueResponse(self.client.allocator, response.data);
-    }
-
-    /// Touch (renew lease) for messages to prevent timeout.
-    /// Use this to extend visibility timeout while still processing.
-    pub fn touch(
-        self: *Queue,
-        queue_name: []const u8,
-        seqs: []const u64,
-        options: types.TouchOptions,
-    ) FloError!void {
-        const ns = self.client.getNamespace(options.namespace);
-
-        var value_buf: [4096]u8 = undefined;
-        const value = try wire.serializeSeqs(&value_buf, seqs);
-
-        var response = try self.client.sendRequest(
-            .queue_touch,
-            ns,
-            queue_name,
-            value,
-            "",
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) {
-            return mapStatusToError(response.status);
-        }
     }
 };
 

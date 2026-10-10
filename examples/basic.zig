@@ -120,21 +120,10 @@ pub fn main() !void {
     };
     defer dequeue_result.deinit();
 
-    var seqs_to_ack = std.ArrayListUnmanaged(u64){};
-    defer seqs_to_ack.deinit(allocator);
-
+    // No ack: queues are at-most-once today, and dequeue already acknowledged
+    // each message it handed out. Lower priority comes out first.
     for (dequeue_result.messages) |msg| {
         std.debug.print("  Message seq={d}: '{s}'\n", .{ msg.seq, msg.payload });
-        seqs_to_ack.append(allocator, msg.seq) catch return;
-    }
-
-    // Acknowledge messages
-    if (seqs_to_ack.items.len > 0) {
-        queue.ack("tasks", seqs_to_ack.items, .{}) catch |err| {
-            std.debug.print("ACK failed: {}\n", .{err});
-            return;
-        };
-        std.debug.print("\nACK {d} message(s)\n", .{seqs_to_ack.items.len});
     }
 
     std.debug.print("\nDone!\n", .{});
