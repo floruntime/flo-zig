@@ -173,6 +173,8 @@ pub const ProcessingSyncOptions = types.ProcessingSyncOptions;
 pub const MAGIC = types.MAGIC;
 pub const VERSION = types.VERSION;
 pub const TABLE_HASH = types.TABLE_HASH;
+pub const Reason = types.Reason;
+pub const Ran = types.Ran;
 
 // =============================================================================
 // Convenience Functions
