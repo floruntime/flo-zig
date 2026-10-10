@@ -569,6 +569,9 @@ pub const MGetResult = struct {
 pub const Message = struct {
     seq: u64,
     payload: []const u8,
+    enqueued_at_ms: i64 = 0,
+    delivery_count: u32 = 0,
+    priority: u8 = 0,
 
     pub fn deinit(self: *Message, allocator: std.mem.Allocator) void {
         allocator.free(self.payload);
