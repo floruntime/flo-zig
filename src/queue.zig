@@ -9,7 +9,6 @@ const Client = @import("client.zig").Client;
 
 const Allocator = std.mem.Allocator;
 const FloError = types.FloError;
-const StatusCode = types.StatusCode;
 
 /// Queue operations interface
 pub const Queue = struct {
@@ -44,7 +43,7 @@ pub const Queue = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         // Parse response to get sequence number
@@ -84,7 +83,7 @@ pub const Queue = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return wire.parseDequeueResponse(self.client.allocator, response.data);
@@ -113,7 +112,7 @@ pub const Queue = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -140,7 +139,7 @@ pub const Queue = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -163,7 +162,7 @@ pub const Queue = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return wire.parseDequeueResponse(self.client.allocator, response.data);
@@ -192,7 +191,7 @@ pub const Queue = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -222,22 +221,9 @@ pub const Queue = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return wire.parseDequeueResponse(self.client.allocator, response.data);
     }
 };
-
-/// Map StatusCode to FloError
-fn mapStatusToError(status: StatusCode) FloError {
-    return switch (status) {
-        .ok => unreachable,
-        .not_found => FloError.NotFound,
-        .bad_request => FloError.BadRequest,
-        .conflict => FloError.Conflict,
-        .unauthorized => FloError.Unauthorized,
-        .overloaded => FloError.Overloaded,
-        else => FloError.ServerError,
-    };
-}

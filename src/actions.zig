@@ -13,7 +13,6 @@ const wire = @import("wire.zig");
 const Client = @import("client.zig").Client;
 
 const FloError = types.FloError;
-const StatusCode = types.StatusCode;
 
 /// Low-level actions and worker operations.
 /// For a higher-level API, see `ActionWorker` in worker.zig.
@@ -95,7 +94,7 @@ pub const Actions = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -123,7 +122,7 @@ pub const Actions = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return parseActionInvokeResult(self.client.allocator, response.data);
@@ -152,7 +151,7 @@ pub const Actions = struct {
         }
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return parseActionRunStatus(self.client.allocator, response.data);
@@ -176,7 +175,7 @@ pub const Actions = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -279,7 +278,7 @@ pub const Actions = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -306,7 +305,7 @@ pub const Actions = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         // Server responds with [status:u8]
@@ -334,7 +333,7 @@ pub const Actions = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -356,7 +355,7 @@ pub const Actions = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -405,7 +404,7 @@ pub const Actions = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         if (response.data.len == 0) {
@@ -461,7 +460,7 @@ pub const Actions = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -506,7 +505,7 @@ pub const Actions = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -548,7 +547,7 @@ pub const Actions = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 };
@@ -781,18 +780,6 @@ fn parseActionRunStatus(allocator: std.mem.Allocator, data: []const u8) FloError
         .error_message = error_message,
         .retry_count = retry_count,
         .allocator = allocator,
-    };
-}
-
-/// Map status code to FloError
-fn mapStatusToError(status: StatusCode) FloError {
-    return switch (status) {
-        .not_found => FloError.NotFound,
-        .bad_request => FloError.BadRequest,
-        .conflict => FloError.Conflict,
-        .unauthorized => FloError.Unauthorized,
-        .overloaded => FloError.Overloaded,
-        else => FloError.ServerError,
     };
 }
 

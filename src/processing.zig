@@ -31,19 +31,6 @@ const Client = @import("client.zig").Client;
 const FloError = types.FloError;
 const Allocator = std.mem.Allocator;
 
-fn mapStatusToError(status: types.StatusCode) FloError {
-    return switch (status) {
-        .not_found => FloError.NotFound,
-        .bad_request => FloError.BadRequest,
-        .conflict => FloError.Conflict,
-        .unauthorized => FloError.Unauthorized,
-        .overloaded => FloError.Overloaded,
-        .rate_limited => FloError.RateLimited,
-        .internal_error => FloError.InternalError,
-        else => FloError.UnexpectedResponse,
-    };
-}
-
 const processing_status_names = [_][]const u8{
     "running", "stopped", "cancelled", "failed", "completed",
 };
@@ -82,7 +69,7 @@ pub const Processing = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
@@ -108,7 +95,7 @@ pub const Processing = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return parseProcessingStatus(allocator, response.data) catch return FloError.UnexpectedResponse;
@@ -136,7 +123,7 @@ pub const Processing = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return parseProcessingList(allocator, response.data) catch return FloError.UnexpectedResponse;
@@ -160,7 +147,7 @@ pub const Processing = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -182,7 +169,7 @@ pub const Processing = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -206,7 +193,7 @@ pub const Processing = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
@@ -231,7 +218,7 @@ pub const Processing = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -257,7 +244,7 @@ pub const Processing = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 

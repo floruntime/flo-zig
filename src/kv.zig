@@ -9,7 +9,6 @@ const Client = @import("client.zig").Client;
 
 const Allocator = std.mem.Allocator;
 const FloError = types.FloError;
-const StatusCode = types.StatusCode;
 
 /// KV operations interface
 pub const KV = struct {
@@ -41,7 +40,7 @@ pub const KV = struct {
         }
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         // Wire body: [version:u64 LE][value bytes]
@@ -81,7 +80,7 @@ pub const KV = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         if (response.data.len < 8) {
@@ -104,7 +103,7 @@ pub const KV = struct {
 
         const allow_not_found = options.if_match == null;
         if (response.status != .ok and !(allow_not_found and response.status == .not_found)) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -146,7 +145,7 @@ pub const KV = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         // Response: [count:u32 LE]([status:u8][key_len:u16][key][version:u64][value_len:u32][value])*
@@ -223,7 +222,7 @@ pub const KV = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         return wire.parseScanResponse(self.client.allocator, response.data);
@@ -256,7 +255,7 @@ pub const KV = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
 
         // Parse history response
@@ -285,7 +284,7 @@ pub const KV = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
         // Wire body: [version:u64][counter:i64 LE]
         if (response.data.len < 16) return FloError.IncompleteResponse;
@@ -310,7 +309,7 @@ pub const KV = struct {
         var response = try self.client.sendRequest(.kv_touch, ns, key, value_buf[0..8], builder.getOptions());
         defer response.deinit();
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -326,7 +325,7 @@ pub const KV = struct {
         var response = try self.client.sendRequest(.kv_persist, ns, key, "", builder.getOptions());
         defer response.deinit();
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -336,7 +335,7 @@ pub const KV = struct {
         var response = try self.client.sendRequest(.kv_exists, ns, key, "", "");
         defer response.deinit();
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
         // Wire body: [version:u64][1 byte 0/1]
         return response.data.len >= 9 and response.data[8] == 1;
@@ -358,7 +357,7 @@ pub const KV = struct {
         defer response.deinit();
         if (response.status == .not_found) return null;
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
         if (response.data.len < 8) return null;
         const version = std.mem.readInt(u64, response.data[0..8], .little);
@@ -389,7 +388,7 @@ pub const KV = struct {
         var response = try self.client.sendRequest(.kv_json_set, ns, key, value, "");
         defer response.deinit();
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
         const version = if (response.data.len >= 8)
             std.mem.readInt(u64, response.data[0..8], .little)
@@ -413,7 +412,7 @@ pub const KV = struct {
         var response = try self.client.sendRequest(.kv_json_del, ns, key, path_bytes, "");
         defer response.deinit();
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
         const version = if (response.data.len >= 8)
             std.mem.readInt(u64, response.data[0..8], .little)
@@ -453,7 +452,7 @@ pub const KV = struct {
         defer response.deinit();
 
         if (response.status != .ok) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
         // Wire body: [variant:u8=0][txn_id:u64 LE][pinned_hash:u64 LE]
         if (response.data.len < 17) return FloError.IncompleteResponse;
@@ -543,7 +542,7 @@ pub const Transaction = struct {
         );
         defer response.deinit();
 
-        if (response.status != .ok) return mapStatusToError(response.status);
+        if (response.status != .ok) return response.status.toError();
         const version = if (response.data.len >= 8)
             std.mem.readInt(u64, response.data[0..8], .little)
         else
@@ -563,7 +562,7 @@ pub const Transaction = struct {
         defer response.deinit();
 
         if (response.status == .not_found) return null;
-        if (response.status != .ok) return mapStatusToError(response.status);
+        if (response.status != .ok) return response.status.toError();
 
         if (response.data.len < 8) {
             const empty = self.client.allocator.dupe(u8, "") catch return FloError.ServerError;
@@ -582,7 +581,7 @@ pub const Transaction = struct {
         var response = try self.client.sendRequest(.kv_delete, self.namespace, key, "", opts);
         defer response.deinit();
         if (response.status != .ok and response.status != .not_found) {
-            return mapStatusToError(response.status);
+            return response.status.toError();
         }
     }
 
@@ -595,7 +594,7 @@ pub const Transaction = struct {
         std.mem.writeInt(i64, &value_buf, delta, .little);
         var response = try self.client.sendRequest(.kv_incr, self.namespace, key, value_buf[0..8], opts);
         defer response.deinit();
-        if (response.status != .ok) return mapStatusToError(response.status);
+        if (response.status != .ok) return response.status.toError();
         if (response.data.len < 8) return 0;
         return std.mem.readInt(i64, response.data[0..8], .little);
     }
@@ -609,7 +608,7 @@ pub const Transaction = struct {
         const value_buf = touchValue(ttl_ms);
         var response = try self.client.sendRequest(.kv_touch, self.namespace, key, value_buf[0..8], opts);
         defer response.deinit();
-        if (response.status != .ok) return mapStatusToError(response.status);
+        if (response.status != .ok) return response.status.toError();
     }
 
     /// Remove the TTL on a key inside the transaction.
@@ -619,7 +618,7 @@ pub const Transaction = struct {
         const opts = try self.buildOptions(&opts_buf);
         var response = try self.client.sendRequest(.kv_persist, self.namespace, key, "", opts);
         defer response.deinit();
-        if (response.status != .ok) return mapStatusToError(response.status);
+        if (response.status != .ok) return response.status.toError();
     }
 
     /// Check key existence inside the transaction.
@@ -629,7 +628,7 @@ pub const Transaction = struct {
         const opts = try self.buildOptions(&opts_buf);
         var response = try self.client.sendRequest(.kv_exists, self.namespace, key, "", opts);
         defer response.deinit();
-        if (response.status != .ok) return mapStatusToError(response.status);
+        if (response.status != .ok) return response.status.toError();
         // Wire body: [version:u64 LE][1 byte 0/1]
         if (response.data.len < 9) return false;
         return response.data[8] == 1;
@@ -675,7 +674,7 @@ pub const Transaction = struct {
         );
         defer response.deinit();
 
-        if (response.status != .ok) return mapStatusToError(response.status);
+        if (response.status != .ok) return response.status.toError();
         // Wire body: [variant:u8=1][commit_index:u64 LE][op_count:u16 LE]
         if (response.data.len < 11) return FloError.IncompleteResponse;
         return types.KVCommitResult{
@@ -700,7 +699,7 @@ pub const Transaction = struct {
             opts,
         );
         defer response.deinit();
-        if (response.status != .ok) return mapStatusToError(response.status);
+        if (response.status != .ok) return response.status.toError();
     }
 };
 
@@ -760,19 +759,6 @@ fn parseHistoryResponse(allocator: Allocator, data: []const u8) FloError![]types
     }
 
     return entries;
-}
-
-/// Map StatusCode to FloError
-fn mapStatusToError(status: StatusCode) FloError {
-    return switch (status) {
-        .ok => unreachable,
-        .not_found => FloError.NotFound,
-        .bad_request => FloError.BadRequest,
-        .conflict => FloError.Conflict,
-        .unauthorized => FloError.Unauthorized,
-        .overloaded => FloError.Overloaded,
-        else => FloError.ServerError,
-    };
 }
 
 test "put encodes ttl_ms as option 0x01 with an 8-byte millisecond value" {
@@ -835,4 +821,41 @@ test "scan sends [limit][cursor] in the value and reads the next cursor from the
     var first = try kv.scan("p", .{});
     defer first.deinit();
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, srv.lastValue());
+}
+
+test "status 12 and an unknown status each surface with their message, and the next reply is read whole" {
+    const test_server = @import("test_server.zig");
+    const ok_body = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0, 'v' };
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 12, .body = "shard offline" },
+        .{ .status = 0, .body = &ok_body },
+        .{ .status = 200, .body = "from the future" },
+        .{ .status = 0, .body = &ok_body },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var kv = KV.init(&client);
+
+    try std.testing.expectError(FloError.Unavailable, kv.get("k", .{}));
+    try std.testing.expectEqual(@as(u8, 12), client.lastError().?.code);
+    try std.testing.expectEqualStrings("shard offline", client.lastError().?.message);
+
+    var first = (try kv.get("k", .{})).?;
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 7), first.version);
+    try std.testing.expectEqualStrings("v", first.value);
+    try std.testing.expect(client.lastError() == null);
+
+    try std.testing.expectError(FloError.ServerError, kv.get("k", .{}));
+    try std.testing.expectEqual(@as(u8, 200), client.lastError().?.code);
+    try std.testing.expectEqualStrings("from the future", client.lastError().?.message);
+
+    var second = (try kv.get("k", .{})).?;
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("v", second.value);
 }

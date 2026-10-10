@@ -1,8 +1,14 @@
-//! A loopback server for tests that answers every request with OK and `body`,
-//! and keeps the last request's payload for the test to inspect.
+//! A loopback server for tests that answers every request with OK and `body`
+//! (or with `replies`, in order), and keeps the last request's payload for
+//! the test to inspect.
 
 const std = @import("std");
 const types = @import("types.zig");
+
+pub const Reply = struct {
+    status: u8,
+    body: []const u8 = "",
+};
 
 pub const OkServer = struct {
     server: std.net.Server,
@@ -12,6 +18,8 @@ pub const OkServer = struct {
     endpoint: []const u8 = "",
     /// Data sent back with every OK.
     body: []const u8 = "",
+    /// Replies for the first requests, in order; later ones get OK and `body`.
+    replies: []const Reply = &.{},
     last_payload_buf: [1024]u8 = undefined,
     last_payload_len: usize = 0,
 
@@ -58,20 +66,21 @@ pub const OkServer = struct {
             crc.update(payload);
             if (crc.final() != crc32) return;
             self.last_payload_len = payload_length;
-            _ = self.requests.fetchAdd(1, .release);
+            const n = self.requests.fetchAdd(1, .release);
+            const reply: Reply = if (n < self.replies.len) self.replies[n] else .{ .status = 0, .body = self.body };
 
             var resp = [_]u8{0} ** 32;
             std.mem.writeInt(u32, resp[0..4], types.MAGIC, .little);
-            std.mem.writeInt(u32, resp[4..8], @intCast(self.body.len), .little); // data_len
+            std.mem.writeInt(u32, resp[4..8], @intCast(reply.body.len), .little); // data_len
             std.mem.writeInt(u64, resp[8..16], request_id, .little);
             resp[20] = types.VERSION;
-            resp[21] = @intFromEnum(types.StatusCode.ok);
+            resp[21] = reply.status;
             var resp_crc = std.hash.Crc32.init();
             resp_crc.update(resp[0..16]);
             resp_crc.update(resp[20..32]);
             std.mem.writeInt(u32, resp[16..20], resp_crc.final(), .little);
             conn.stream.writeAll(&resp) catch return;
-            conn.stream.writeAll(self.body) catch return;
+            conn.stream.writeAll(reply.body) catch return;
         }
     }
 
