@@ -476,7 +476,7 @@ pub const Transaction = struct {
     ) FloError!types.PutResult {
         try self.checkAlive();
         var opts = options;
-        opts.routing_key = if (self.routing_key.len > 0) self.routing_key else null;
+        opts.routing_key = self.routing_key;
         return kvSet(self.client, self.namespace, key, value, opts, self.id);
     }
 
@@ -484,7 +484,7 @@ pub const Transaction = struct {
     /// **Caller owns the returned `GetResult` and must call `result.deinit(allocator)`.**
     pub fn get(self: *Transaction, key: []const u8) FloError!?types.GetResult {
         try self.checkAlive();
-        return kvGet(self.client, self.namespace, key, .{ .routing_key = if (self.routing_key.len > 0) self.routing_key else null }, self.id);
+        return kvGet(self.client, self.namespace, key, .{ .routing_key = self.routing_key }, self.id);
     }
 
     /// Buffer a delete inside the transaction.
@@ -621,7 +621,6 @@ pub const Transaction = struct {
     }
 };
 
-/// Put options as TLVs, shared by `KV.put` and `Transaction.put`.
 // kv.get and kv.set are table ops: the request is [namespace][key][body],
 // the body coded by the op's schema, field by field in order. An optional
 // field is a presence byte then its value; a field with a default is sent
@@ -648,8 +647,10 @@ const BodyWriter = struct {
             w.int(u64, x);
         } else w.put(&.{0});
     }
+    /// An empty routing key is none, as in the other SDKs.
     fn routingKey(w: *BodyWriter, k: ?[]const u8) void {
         const key = k orelse return w.put(&.{0});
+        if (key.len == 0) return w.put(&.{0});
         w.put(&.{1});
         w.int(u16, @intCast(key.len));
         w.put(key);
@@ -811,6 +812,8 @@ test "kv.get's body carries its wait, routing key and txn, and the read deadline
     w.put(&.{ 1, 1, 1, 2, 0, 'r', 'k', 0 });
     try std.testing.expectEqualSlices(u8, want[0..w.pos], body);
     try std.testing.expectError(FloError.BlockTooLong, encodeGetBody(&buf, .{ .wait_ms = types.MAX_WAIT_MS + 1 }, null));
+    // An empty routing key is sent absent.
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0 }, try encodeGetBody(&buf, .{ .routing_key = "" }, null));
 }
 
 test "answers decode whole or not at all" {

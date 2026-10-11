@@ -13,7 +13,7 @@ pub const VERSION: u8 = 0x02;
 /// The hash of the op table this SDK was built for, written into every
 /// request header. A server built from another table refuses the request,
 /// and its answers carry its own hash, which this SDK refuses.
-pub const TABLE_HASH: u64 = 0x28d9c77cf6f88fd5;
+pub const TABLE_HASH: u64 = 0x02e15ee74c0ad72c;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -43,7 +43,7 @@ pub const Reason = enum(u16) {
     no_such_transaction = 17,
     /// The routing key (the key, when none is given) isn't the one the
     /// transaction was begun with.
-    txn_routing_key = 18,
+    wrong_routing_key = 18,
     /// The transaction holds as many ops or bytes as it may.
     txn_too_large = 19,
     /// The shard holds as many waiting reads as it may.
