@@ -229,9 +229,9 @@ pub const Client = struct {
             const reason = if (data.len >= 3) std.enums.fromInt(types.Reason, std.mem.readInt(u16, data[0..2], .little)) else null;
             const ran = if (data.len >= 3) std.enums.fromInt(types.Ran, data[2]) else null;
             if (reason == null or ran == null) {
+                // last_error_code was cleared when this request began, so
+                // lastError names no earlier refusal.
                 if (data.len > 0) self.allocator.free(data);
-                // No refusal to report: lastError must not name an earlier one.
-                self.last_error_code = 0;
                 return FloError.IncompleteResponse;
             }
             self.last_error_code = response_header.status;
