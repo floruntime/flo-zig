@@ -872,6 +872,8 @@ test "a refusal whose body isn't [reason][ran][message] is refused, not guessed 
         .{ .status = 3, .body = "\x01\x00" },
         .{ .status = 3, .body = "\xff\xff\x00x" },
         .{ .status = 3, .body = "\x01\x00\x09x" },
+        // Reason 257: read as a byte it would pass as unknown_op.
+        .{ .status = 3, .body = "\x01\x01\x00x" },
     };
     try srv.start();
     defer srv.deinit();
@@ -880,5 +882,8 @@ test "a refusal whose body isn't [reason][ran][message] is refused, not guessed 
     defer client.deinit();
     try client.connect();
     var kv = KV.init(&client);
-    for (0..3) |_| try std.testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
+    for (0..4) |_| {
+        try std.testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
+        try std.testing.expect(client.lastError() == null);
+    }
 }

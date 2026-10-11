@@ -230,6 +230,8 @@ pub const Client = struct {
             const ran = if (data.len >= 3) std.enums.fromInt(types.Ran, data[2]) else null;
             if (reason == null or ran == null) {
                 if (data.len > 0) self.allocator.free(data);
+                // No refusal to report: lastError must not name an earlier one.
+                self.last_error_code = 0;
                 return FloError.IncompleteResponse;
             }
             self.last_error_code = response_header.status;
