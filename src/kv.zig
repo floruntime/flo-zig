@@ -18,75 +18,26 @@ pub const KV = struct {
         return .{ .client = client };
     }
 
-    /// Get a value by key.
-    /// Returns the value+version if found, null if key does not exist.
-    /// Use `block_ms` for long-polling (wait for key to appear).
+    /// Get a value by key. Returns the value and version, or null if the
+    /// key does not exist, also when a wait (`wait_ms`) ends without it.
     /// **Caller owns the returned `GetResult` and must call `result.deinit(allocator)`.**
     pub fn get(self: *KV, key: []const u8, options: types.GetOptions) FloError!?types.GetResult {
-        const ns = self.client.getNamespace(options.namespace);
-
-        var opts_buf: [16]u8 = undefined;
-        var builder = wire.OptionsBuilder.init(&opts_buf);
-
-        if (options.block_ms) |block| {
-            try builder.addU32(.block_ms, block);
-        }
-
-        var response = try self.client.sendRequest(.kv_get, ns, key, "", builder.getOptions());
-        defer response.deinit();
-
-        if (response.status == .not_found) {
-            return null;
-        }
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
-
-        // Wire body: [version:u64 LE][value bytes]
-        if (response.data.len < 8) {
-            const empty = self.client.allocator.dupe(u8, "") catch return FloError.ServerError;
-            return types.GetResult{ .value = empty, .version = 0 };
-        }
-        const version = std.mem.readInt(u64, response.data[0..8], .little);
-        const value = self.client.allocator.dupe(u8, response.data[8..]) catch return FloError.ServerError;
-        return types.GetResult{ .value = value, .version = version };
+        return kvGet(self.client, self.client.getNamespace(options.namespace), key, options, null);
     }
 
     /// Put a key-value pair and return the new version.
     ///
     /// The returned `version` may be passed to `PutOptions.cas_version` on the
-    /// next write to enforce optimistic concurrency.
+    /// next write to enforce optimistic concurrency. A `cas_version` that
+    /// isn't the key's, or a `condition` that doesn't hold, returns
+    /// `FloError.Conflict`; `client.lastError()` says which.
     pub fn put(
         self: *KV,
         key: []const u8,
         value: []const u8,
         options: types.PutOptions,
     ) FloError!types.PutResult {
-        const ns = self.client.getNamespace(options.namespace);
-
-        var opts_buf: [64]u8 = undefined;
-        var builder = wire.OptionsBuilder.init(&opts_buf);
-
-        try addPutOptions(&builder, options);
-
-        var response = try self.client.sendRequest(
-            .kv_put,
-            ns,
-            key,
-            value,
-            builder.getOptions(),
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
-
-        if (response.data.len < 8) {
-            return types.PutResult{ .version = 0 };
-        }
-        return types.PutResult{ .version = std.mem.readInt(u64, response.data[0..8], .little) };
+        return kvSet(self.client, self.client.getNamespace(options.namespace), key, value, options, null);
     }
 
     /// Delete a key. Succeeds for both OK and NOT_FOUND unless `if_match`
@@ -516,7 +467,7 @@ pub const Transaction = struct {
         if (self.done) return FloError.TxnFinished;
     }
 
-    /// Buffer a put inside the transaction.
+    /// Buffer a put inside the transaction; it has no version until commit (0).
     pub fn put(
         self: *Transaction,
         key: []const u8,
@@ -524,53 +475,16 @@ pub const Transaction = struct {
         options: types.PutOptions,
     ) FloError!types.PutResult {
         try self.checkAlive();
-
-        var opts_buf: [128]u8 = undefined;
-        var builder = wire.OptionsBuilder.init(&opts_buf);
-        if (self.routing_key.len > 0) {
-            try builder.addBytes(.routing_key, self.routing_key);
-        }
-        try builder.addU64(.txn_id, self.id);
-        try addPutOptions(&builder, options);
-
-        var response = try self.client.sendRequest(
-            .kv_put,
-            self.namespace,
-            key,
-            value,
-            builder.getOptions(),
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) return response.status.toError();
-        const version = if (response.data.len >= 8)
-            std.mem.readInt(u64, response.data[0..8], .little)
-        else
-            0;
-        return types.PutResult{ .version = version };
+        var opts = options;
+        opts.routing_key = if (self.routing_key.len > 0) self.routing_key else null;
+        return kvSet(self.client, self.namespace, key, value, opts, self.id);
     }
 
     /// Read a key inside the transaction (sees buffered writes).
     /// **Caller owns the returned `GetResult` and must call `result.deinit(allocator)`.**
     pub fn get(self: *Transaction, key: []const u8) FloError!?types.GetResult {
         try self.checkAlive();
-
-        var opts_buf: [64]u8 = undefined;
-        const opts = try self.buildOptions(&opts_buf);
-
-        var response = try self.client.sendRequest(.kv_get, self.namespace, key, "", opts);
-        defer response.deinit();
-
-        if (response.status == .not_found) return null;
-        if (response.status != .ok) return response.status.toError();
-
-        if (response.data.len < 8) {
-            const empty = self.client.allocator.dupe(u8, "") catch return FloError.ServerError;
-            return types.GetResult{ .value = empty, .version = 0 };
-        }
-        const version = std.mem.readInt(u64, response.data[0..8], .little);
-        const value = self.client.allocator.dupe(u8, response.data[8..]) catch return FloError.ServerError;
-        return types.GetResult{ .value = value, .version = version };
+        return kvGet(self.client, self.namespace, key, .{ .routing_key = if (self.routing_key.len > 0) self.routing_key else null }, self.id);
     }
 
     /// Buffer a delete inside the transaction.
@@ -663,14 +577,16 @@ pub const Transaction = struct {
         try self.checkAlive();
         self.done = true;
 
-        var opts_buf: [64]u8 = undefined;
-        const opts = try self.buildOptions(&opts_buf);
+        // The id names the transaction's shard: no routing key.
+        var opts_buf: [16]u8 = undefined;
+        var builder = wire.OptionsBuilder.init(&opts_buf);
+        try builder.addU64(.txn_id, self.id);
         var response = try self.client.sendRequest(
             .kv_commit_txn,
             self.namespace,
-            self.routing_key,
             "",
-            opts,
+            "",
+            builder.getOptions(),
         );
         defer response.deinit();
 
@@ -689,14 +605,16 @@ pub const Transaction = struct {
         if (self.done) return;
         self.done = true;
 
-        var opts_buf: [64]u8 = undefined;
-        const opts = try self.buildOptions(&opts_buf);
+        // The id names the transaction's shard: no routing key.
+        var opts_buf: [16]u8 = undefined;
+        var builder = wire.OptionsBuilder.init(&opts_buf);
+        try builder.addU64(.txn_id, self.id);
         var response = try self.client.sendRequest(
             .kv_rollback_txn,
             self.namespace,
-            self.routing_key,
             "",
-            opts,
+            "",
+            builder.getOptions(),
         );
         defer response.deinit();
         if (response.status != .ok) return response.status.toError();
@@ -704,11 +622,113 @@ pub const Transaction = struct {
 };
 
 /// Put options as TLVs, shared by `KV.put` and `Transaction.put`.
-fn addPutOptions(builder: *wire.OptionsBuilder, options: types.PutOptions) FloError!void {
-    if (options.ttl_ms) |ttl| try builder.addU64(.ttl_ms, ttl);
-    if (options.cas_version) |v| try builder.addU64(.cas_version, v);
-    if (options.if_not_exists) try builder.addFlag(.if_not_exists);
-    if (options.if_exists) try builder.addFlag(.if_exists);
+// kv.get and kv.set are table ops: the request is [namespace][key][body],
+// the body coded by the op's schema, field by field in order. An optional
+// field is a presence byte then its value; a field with a default is sent
+// present. A byte string has a length prefix as wide as its bound needs.
+
+/// The longest routing key; its length prefix is a u16.
+const MAX_ROUTING_KEY = 4096;
+
+const BodyWriter = struct {
+    buf: []u8,
+    pos: usize = 0,
+
+    fn put(w: *BodyWriter, bytes: []const u8) void {
+        @memcpy(w.buf[w.pos..][0..bytes.len], bytes);
+        w.pos += bytes.len;
+    }
+    fn int(w: *BodyWriter, comptime T: type, v: T) void {
+        std.mem.writeInt(T, w.buf[w.pos..][0..@sizeOf(T)], v, .little);
+        w.pos += @sizeOf(T);
+    }
+    fn optU64(w: *BodyWriter, v: ?u64) void {
+        if (v) |x| {
+            w.put(&.{1});
+            w.int(u64, x);
+        } else w.put(&.{0});
+    }
+    fn routingKey(w: *BodyWriter, k: ?[]const u8) void {
+        const key = k orelse return w.put(&.{0});
+        w.put(&.{1});
+        w.int(u16, @intCast(key.len));
+        w.put(key);
+    }
+};
+
+/// The most a kv.get body can take: wait_ms, wait_for, routing_key, txn.
+const MAX_GET_BODY = 9 + 2 + 3 + MAX_ROUTING_KEY + 9;
+
+/// kv.get's request: wait_ms, wait_for, routing_key, txn.
+fn encodeGetBody(buf: *[MAX_GET_BODY]u8, options: types.GetOptions, txn: ?u64) FloError![]const u8 {
+    if (options.wait_ms > types.MAX_WAIT_MS) return FloError.BlockTooLong;
+    if ((options.routing_key orelse "").len > MAX_ROUTING_KEY) return FloError.KeyTooLarge;
+    var w: BodyWriter = .{ .buf = buf };
+    w.put(&.{1});
+    w.int(u64, options.wait_ms);
+    w.put(&.{ 1, @intFromEnum(options.wait_for) });
+    w.routingKey(options.routing_key);
+    w.optU64(txn);
+    return w.buf[0..w.pos];
+}
+
+/// The size of kv.set's body for `value`, at most.
+fn setBodySize(value: []const u8) usize {
+    return 4 + value.len + 9 + 2 + 9 + 3 + MAX_ROUTING_KEY + 9;
+}
+
+/// kv.set's request: value, ttl_ms, condition, cas_version, routing_key, txn.
+fn encodeSetBody(buf: []u8, value: []const u8, options: types.PutOptions, txn: ?u64) FloError![]const u8 {
+    if (value.len > types.MAX_KV_VALUE_SIZE) return FloError.ValueTooLarge;
+    if ((options.routing_key orelse "").len > MAX_ROUTING_KEY) return FloError.KeyTooLarge;
+    var w: BodyWriter = .{ .buf = buf };
+    w.int(u32, @intCast(value.len));
+    w.put(value);
+    w.optU64(if (options.ttl_ms) |t| if (t > 0) t else null else null);
+    w.put(&.{ 1, @intFromEnum(options.condition) });
+    w.optU64(options.cas_version);
+    w.routingKey(options.routing_key);
+    w.optU64(txn);
+    return w.buf[0..w.pos];
+}
+
+/// kv.get, inside transaction `txn` when given.
+fn kvGet(client: *Client, namespace: []const u8, key: []const u8, options: types.GetOptions, txn: ?u64) FloError!?types.GetResult {
+    var buf: [MAX_GET_BODY]u8 = undefined;
+    const body = try encodeGetBody(&buf, options, txn);
+    var response = try client.sendRequest(.kv_get, namespace, key, body, "");
+    defer response.deinit();
+    // Absent; any other not-found (no such transaction) is an error.
+    if (response.status == .not_found and client.last_error_reason == .not_found) return null;
+    if (response.status != .ok) return response.status.toError();
+    return try decodeGetAnswer(client.allocator, response.data);
+}
+
+/// kv.set, inside transaction `txn` when given.
+fn kvSet(client: *Client, namespace: []const u8, key: []const u8, value: []const u8, options: types.PutOptions, txn: ?u64) FloError!types.PutResult {
+    const buf = client.allocator.alloc(u8, setBodySize(value)) catch return FloError.ServerError;
+    defer client.allocator.free(buf);
+    const body = try encodeSetBody(buf, value, options, txn);
+    var response = try client.sendRequest(.kv_put, namespace, key, body, "");
+    defer response.deinit();
+    if (response.status != .ok) return response.status.toError();
+    return try decodeSetAnswer(response.data);
+}
+
+/// kv.get's answer: [version:u64][value_len:u32][value], whole.
+fn decodeGetAnswer(allocator: Allocator, data: []const u8) FloError!types.GetResult {
+    if (data.len < 12) return FloError.IncompleteResponse;
+    const n = std.mem.readInt(u32, data[8..12], .little);
+    if (data.len != 12 + @as(usize, n)) return FloError.IncompleteResponse;
+    const value = allocator.dupe(u8, data[12..]) catch return FloError.ServerError;
+    return .{ .version = std.mem.readInt(u64, data[0..8], .little), .value = value };
+}
+
+/// kv.set's answer: its version, absent (0) inside a transaction.
+fn decodeSetAnswer(data: []const u8) FloError!types.PutResult {
+    if (data.len == 1 and data[0] == 0) return .{ .version = 0 };
+    if (data.len == 9 and data[0] == 1) return .{ .version = std.mem.readInt(u64, data[1..9], .little) };
+    return FloError.IncompleteResponse;
 }
 
 /// KV touch carries its TTL as the request value: 8 bytes, u64 LE milliseconds.
@@ -761,30 +781,48 @@ fn parseHistoryResponse(allocator: Allocator, data: []const u8) FloError![]types
     return entries;
 }
 
-test "put encodes ttl_ms as option 0x01 with an 8-byte millisecond value" {
-    var buf: [64]u8 = undefined;
-    var builder = wire.OptionsBuilder.init(&buf);
-    try addPutOptions(&builder, .{ .ttl_ms = 1500 });
+test "kv.set's body carries every field in order" {
+    var buf: [setBodySize("v")]u8 = undefined;
+    const body = try encodeSetBody(&buf, "v", .{ .ttl_ms = 1500, .condition = .if_absent, .cas_version = 7, .routing_key = "rk" }, 9);
+    var want: [43]u8 = undefined;
+    var w: BodyWriter = .{ .buf = &want };
+    w.int(u32, 1);
+    w.put("v");
+    w.optU64(1500);
+    w.put(&.{ 1, 1 });
+    w.optU64(7);
+    w.put(&.{ 1, 2, 0, 'r', 'k' });
+    w.optU64(9);
+    try std.testing.expectEqualSlices(u8, want[0..w.pos], body);
 
-    var expected: [10]u8 = undefined;
-    expected[0] = 0x01;
-    expected[1] = 8;
-    std.mem.writeInt(u64, expected[2..10], 1500, .little);
-    try std.testing.expectEqualSlices(u8, &expected, builder.getOptions());
+    // A TTL of 0 is none, and the defaults go present.
+    const plain = try encodeSetBody(&buf, "", .{ .ttl_ms = 0 }, null);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 }, plain);
+    try std.testing.expectError(FloError.ValueTooLarge, encodeSetBody(&buf, &[_]u8{0} ** (types.MAX_KV_VALUE_SIZE + 1), .{}, null));
 }
 
-test "put encodes every option in tag order" {
-    var buf: [64]u8 = undefined;
-    var builder = wire.OptionsBuilder.init(&buf);
-    try addPutOptions(&builder, .{ .ttl_ms = 1500, .cas_version = 7, .if_not_exists = true, .if_exists = true });
+test "kv.get's body carries its wait, routing key and txn, and the read deadline covers the wait" {
+    var buf: [MAX_GET_BODY]u8 = undefined;
+    const body = try encodeGetBody(&buf, .{ .wait_ms = 5000, .wait_for = .change, .routing_key = "rk" }, null);
+    var want: [32]u8 = undefined;
+    var w: BodyWriter = .{ .buf = &want };
+    w.put(&.{1});
+    w.int(u64, 5000);
+    w.put(&.{ 1, 1, 1, 2, 0, 'r', 'k', 0 });
+    try std.testing.expectEqualSlices(u8, want[0..w.pos], body);
+    try std.testing.expectError(FloError.BlockTooLong, encodeGetBody(&buf, .{ .wait_ms = types.MAX_WAIT_MS + 1 }, null));
+}
 
-    var expected: [24]u8 = undefined;
-    expected[0..2].* = .{ 0x01, 8 };
-    std.mem.writeInt(u64, expected[2..10], 1500, .little);
-    expected[10..12].* = .{ 0x02, 8 };
-    std.mem.writeInt(u64, expected[12..20], 7, .little);
-    expected[20..24].* = .{ 0x03, 0, 0x04, 0 };
-    try std.testing.expectEqualSlices(u8, &expected, builder.getOptions());
+test "answers decode whole or not at all" {
+    const a = std.testing.allocator;
+    var r = try decodeGetAnswer(a, &.{ 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 'h', 'i' });
+    defer r.deinit(a);
+    try std.testing.expectEqual(@as(u64, 4), r.version);
+    try std.testing.expectEqualStrings("hi", r.value);
+    try std.testing.expectError(FloError.IncompleteResponse, decodeGetAnswer(a, &.{ 4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 'h', 'i' }));
+    try std.testing.expectEqual(@as(u64, 9), (try decodeSetAnswer(&.{ 1, 9, 0, 0, 0, 0, 0, 0, 0 })).version);
+    try std.testing.expectEqual(@as(u64, 0), (try decodeSetAnswer(&.{0})).version);
+    try std.testing.expectError(FloError.IncompleteResponse, decodeSetAnswer(&.{2}));
 }
 
 test "touch encodes its TTL as an 8-byte millisecond value" {
@@ -825,7 +863,8 @@ test "scan sends [limit][cursor] in the value and reads the next cursor from the
 
 test "status 12 and an unknown status each surface with their message, and the next reply is read whole" {
     const test_server = @import("test_server.zig");
-    const ok_body = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0, 'v' };
+    // A kv.get answer: [version:u64][value_len:u32][value].
+    const ok_body = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 'v' };
     var srv = try test_server.OkServer.listen();
     srv.replies = &.{
         // Refusal bodies: [reason:u16][ran:u8][message].

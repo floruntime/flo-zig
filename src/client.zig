@@ -191,7 +191,7 @@ pub const Client = struct {
         );
         self.request_id += 1;
 
-        const timeout_ms: u64 = if (self.timeout_ms == 0) 0 else @as(u64, self.timeout_ms) + blockingWaitMs(op_code, options);
+        const timeout_ms: u64 = if (self.timeout_ms == 0) 0 else @as(u64, self.timeout_ms) + blockingWaitMs(op_code, value, options);
         setSocketTimeout(stream.handle, timeout_ms) catch {
             self.disconnect();
             return FloError.ConnectionFailed;
@@ -306,13 +306,15 @@ pub fn isConnectionError(err: anyerror) bool {
 /// How long the server may hold a request on purpose: the longest block_ms /
 /// wait_ms in its options, or for an action await without block_ms the
 /// server's 30 s default; 0 if none.
-fn blockingWaitMs(op_code: OpCode, options: []const u8) u64 {
+fn blockingWaitMs(op_code: OpCode, value: []const u8, options: []const u8) u64 {
+    // kv.get's body opens with wait_ms: [present:u8][u64].
+    if (op_code == .kv_get) return if (value.len >= 9 and value[0] == 1) std.mem.readInt(u64, value[1..9], .little) else 0;
     var longest: u64 = 0;
     var has_block_ms = false;
     var it = wire.OptionsIterator.init(options);
     while (it.next()) |opt| {
-        if (opt.tag != .block_ms and opt.tag != .wait_ms) continue;
-        if (opt.tag == .block_ms) has_block_ms = true;
+        if (opt.tag != .block_ms) continue;
+        has_block_ms = true;
         longest = @max(longest, opt.asU32() orelse 0);
     }
     if (op_code == .action_await and !has_block_ms) return types.DEFAULT_WORKER_BLOCK_MS;
@@ -453,18 +455,23 @@ test "a blocking request waits timeout_ms plus its block_ms" {
     try opts.addU32(.block_ms, 600);
 
     var timer = try std.time.Timer.start();
-    try std.testing.expectError(FloError.Timeout, client.sendRequest(.kv_get, "default", "k", "", opts.getOptions()));
+    try std.testing.expectError(FloError.Timeout, client.sendRequest(.queue_dequeue, "default", "k", "", opts.getOptions()));
     try std.testing.expect(timer.read() >= 650 * std.time.ns_per_ms);
 }
 
 test "an action await without block_ms is given the server's 30 s on top of timeout_ms" {
-    try std.testing.expectEqual(@as(u64, 30_000), blockingWaitMs(.action_await, ""));
+    try std.testing.expectEqual(@as(u64, 30_000), blockingWaitMs(.action_await, "", ""));
 
     var opts_buf: [8]u8 = undefined;
     var opts = wire.OptionsBuilder.init(&opts_buf);
     try opts.addU32(.block_ms, 0);
-    try std.testing.expectEqual(@as(u64, 0), blockingWaitMs(.action_await, opts.getOptions()));
-    try std.testing.expectEqual(@as(u64, 0), blockingWaitMs(.kv_get, ""));
+    try std.testing.expectEqual(@as(u64, 0), blockingWaitMs(.action_await, "", opts.getOptions()));
+    try std.testing.expectEqual(@as(u64, 0), blockingWaitMs(.kv_get, "", ""));
+    // kv.get's wait is its body's first field.
+    var body: [9]u8 = undefined;
+    body[0] = 1;
+    std.mem.writeInt(u64, body[1..9], 5000, .little);
+    try std.testing.expectEqual(@as(u64, 5000), blockingWaitMs(.kv_get, &body, ""));
 }
 
 test "an answer from another op table is refused unread, naming both tables" {
@@ -676,7 +683,7 @@ test "timeout_ms 0 never times out, even with a block_ms" {
 
     // The call ends only when the server hangs up.
     var timer = try std.time.Timer.start();
-    try std.testing.expectError(FloError.UnexpectedEof, client.sendRequest(.kv_get, "default", "k", "", opts.getOptions()));
+    try std.testing.expectError(FloError.UnexpectedEof, client.sendRequest(.queue_dequeue, "default", "k", "", opts.getOptions()));
     try std.testing.expect(timer.read() >= 500 * std.time.ns_per_ms);
 }
 

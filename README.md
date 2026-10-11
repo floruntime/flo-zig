@@ -114,8 +114,11 @@ var kv = flo.KV.init(&client);
 // Get value (returns null if not found)
 const value = try kv.get("key", .{});
 
-// Get with long-polling (block waiting for key to appear)
-const value = try kv.get("key", .{ .block_ms = 5000 });
+// Wait up to 5 seconds for the key to exist (answers at once if it does)
+const value = try kv.get("key", .{ .wait_ms = 5000 });
+
+// Wait up to 5 seconds for the key's next version
+const value = try kv.get("key", .{ .wait_ms = 5000, .wait_for = .change });
 
 // Put value (uses client's default namespace)
 try kv.put("key", "value", .{});
@@ -124,7 +127,7 @@ try kv.put("key", "value", .{});
 try kv.put("key", "value", .{
     .ttl_ms = 3_600_000,        // Expire after 1 hour
     .cas_version = 5,           // Compare-and-swap
-    .if_not_exists = true,      // Only set if key doesn't exist
+    .condition = .if_absent,    // Only set if key doesn't exist (or .if_present)
 });
 
 // Put to different namespace (override default)

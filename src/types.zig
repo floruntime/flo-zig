@@ -13,7 +13,7 @@ pub const VERSION: u8 = 0x02;
 /// The hash of the op table this SDK was built for, written into every
 /// request header. A server built from another table refuses the request,
 /// and its answers carry its own hash, which this SDK refuses.
-pub const TABLE_HASH: u64 = 0x2827f6f0631754fe;
+pub const TABLE_HASH: u64 = 0x28d9c77cf6f88fd5;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -31,6 +31,29 @@ pub const Reason = enum(u16) {
     answer_lost = 11,
     /// A refusal from an op family the server hasn't classified yet.
     unclassified = 12,
+    /// What the request names doesn't exist.
+    not_found = 13,
+    /// The key is in a prefix the server keeps for itself.
+    reserved_key = 14,
+    /// The write's cas_version isn't the key's version.
+    cas_mismatch = 15,
+    /// The write's condition didn't hold.
+    condition_failed = 16,
+    /// No open transaction has this id here.
+    no_such_transaction = 17,
+    /// The routing key (the key, when none is given) isn't the one the
+    /// transaction was begun with.
+    txn_routing_key = 18,
+    /// The transaction holds as many ops or bytes as it may.
+    txn_too_large = 19,
+    /// The shard holds as many waiting reads as it may.
+    too_many_waiters = 20,
+    /// Two fields given together that don't go together.
+    conflicting_fields = 21,
+    /// The shard stopped taking writes until the node restarts.
+    writes_stopped = 22,
+    /// Too many writes wait for commit.
+    too_many_proposals = 23,
 };
 
 /// Whether a refused request took effect: retry logic reads this, not the
@@ -50,6 +73,25 @@ pub const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024; // 16 MB practical limit
 /// Longest blocking wait (block_ms / wait_ms) the server accepts: 5 minutes.
 /// The server refuses anything longer with bad_request.
 pub const MAX_BLOCK_MS: u32 = 300_000;
+/// Longest a KV get may wait (wait_ms).
+pub const MAX_WAIT_MS: u64 = 300_000;
+/// Longest value a KV put takes.
+pub const MAX_KV_VALUE_SIZE: usize = 253_817;
+
+/// What a KV get with wait_ms waits for.
+pub const WaitFor = enum(u8) {
+    /// The key to exist; one that exists answers at once.
+    exists = 0,
+    /// The key's next version.
+    change = 1,
+};
+
+/// When a KV put may write.
+pub const Condition = enum(u8) {
+    always = 0,
+    if_absent = 1,
+    if_present = 2,
+};
 /// Long-poll wait a worker uses when its config says 0. A worker always
 /// long-polls, since 0 (don't wait) would spin its poll loop against the server.
 pub const DEFAULT_WORKER_BLOCK_MS: u32 = 30_000;
@@ -314,7 +356,6 @@ pub const OptionTag = enum(u8) {
     priority = 0x10, // u8: Message priority (0-255, lower is dequeued first)
     count = 0x15, // u32: Number of messages to dequeue
     block_ms = 0x17, // u32: Blocking wait for data (0=don't wait, max 300000)
-    wait_ms = 0x18, // u32: Watch timeout - wait for NEXT version change (0=don't wait, max 300000)
 
     // Stream Options (0x20 - 0x2F) - StreamID-native ONLY
     // 0x20 reserved
@@ -551,8 +592,12 @@ pub const DequeueResult = struct {
 pub const GetOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Block waiting for key to appear, in ms (null or 0 = don't wait, max 300000)
-    block_ms: ?u32 = null,
+    /// Wait up to this long for what `wait_for` names (0 = don't wait, max 300000)
+    wait_ms: u64 = 0,
+    /// The key to exist (the default), or its next version
+    wait_for: WaitFor = .exists,
+    /// Routes the request in place of the key
+    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV put operations
@@ -561,9 +606,12 @@ pub const PutOptions = struct {
     namespace: ?[]const u8 = null,
     /// Expire the key after this many milliseconds (0 = no expiration)
     ttl_ms: ?u64 = null,
+    /// When the write may happen
+    condition: Condition = .always,
+    /// The key's version the write requires; 0 means it doesn't exist
     cas_version: ?u64 = null,
-    if_not_exists: bool = false,
-    if_exists: bool = false,
+    /// Routes the request in place of the key
+    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV delete operations
