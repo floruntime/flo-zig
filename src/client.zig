@@ -37,6 +37,8 @@ pub const Client = struct {
     timeout_ms: u32 = 5_000,
     debug: bool = false,
     last_error_code: u8 = 0,
+    last_error_reason: types.Reason = .unclassified,
+    last_error_ran: types.Ran = .no,
     last_error_len: usize = 0,
     last_error_buf: [512]u8 = undefined,
     foreign_server: ?ForeignServer = null,
@@ -63,6 +65,9 @@ pub const Client = struct {
     /// SDK doesn't know, and the server's message from the body.
     pub const LastError = struct {
         code: u8,
+        reason: types.Reason,
+        /// Whether the request took effect.
+        ran: types.Ran,
         message: []const u8,
     };
 
@@ -220,9 +225,21 @@ pub const Client = struct {
         } else &[_]u8{};
 
         if (response_header.status != 0) {
+            // A refusal's body: [reason:u16][ran:u8][message].
+            const reason = if (data.len >= 3) std.enums.fromInt(types.Reason, std.mem.readInt(u16, data[0..2], .little)) else null;
+            const ran = if (data.len >= 3) std.enums.fromInt(types.Ran, data[2]) else null;
+            if (reason == null or ran == null) {
+                if (data.len > 0) self.allocator.free(data);
+                // No refusal to report: lastError must not name an earlier one.
+                self.last_error_code = 0;
+                return FloError.IncompleteResponse;
+            }
             self.last_error_code = response_header.status;
-            self.last_error_len = @min(data.len, self.last_error_buf.len);
-            @memcpy(self.last_error_buf[0..self.last_error_len], data[0..self.last_error_len]);
+            self.last_error_reason = reason.?;
+            self.last_error_ran = ran.?;
+            const message = data[3..];
+            self.last_error_len = @min(message.len, self.last_error_buf.len);
+            @memcpy(self.last_error_buf[0..self.last_error_len], message[0..self.last_error_len]);
         }
 
         return wire.RawResponse{
@@ -253,7 +270,7 @@ pub const Client = struct {
     /// null for a missing key leaves code 2 (not_found).
     pub fn lastError(self: *const Self) ?LastError {
         if (self.last_error_code == 0) return null;
-        return .{ .code = self.last_error_code, .message = self.last_error_buf[0..self.last_error_len] };
+        return .{ .code = self.last_error_code, .reason = self.last_error_reason, .ran = self.last_error_ran, .message = self.last_error_buf[0..self.last_error_len] };
     }
 
     /// Get the next request ID

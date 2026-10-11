@@ -13,7 +13,35 @@ pub const VERSION: u8 = 0x02;
 /// The hash of the op table this SDK was built for, written into every
 /// request header. A server built from another table refuses the request,
 /// and its answers carry its own hash, which this SDK refuses.
-pub const TABLE_HASH: u64 = 0x4e9243eeab771a02;
+pub const TABLE_HASH: u64 = 0x2827f6f0631754fe;
+
+/// Why the server refused a request. Mirrors the server's list; the table
+/// hash covers it, so a server can't send one this SDK doesn't know.
+pub const Reason = enum(u16) {
+    unknown_op = 1,
+    malformed = 2,
+    field_too_long = 3,
+    out_of_range = 4,
+    leader_unknown = 5,
+    shard_busy = 6,
+    table_mismatch = 7,
+    unknown_flag = 8,
+    internal = 9,
+    committed_not_applied = 10,
+    answer_lost = 11,
+    /// A refusal from an op family the server hasn't classified yet.
+    unclassified = 12,
+};
+
+/// Whether a refused request took effect: retry logic reads this, not the
+/// message.
+pub const Ran = enum(u8) {
+    no = 0,
+    /// It took effect; don't resend it.
+    yes = 1,
+    /// It may still take effect; check before resending.
+    unknown = 2,
+};
 
 /// Size limits (for client-side validation)
 pub const MAX_NAMESPACE_SIZE: usize = 255;

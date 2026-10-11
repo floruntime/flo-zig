@@ -828,9 +828,10 @@ test "status 12 and an unknown status each surface with their message, and the n
     const ok_body = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0, 'v' };
     var srv = try test_server.OkServer.listen();
     srv.replies = &.{
-        .{ .status = 12, .body = "shard offline" },
+        // Refusal bodies: [reason:u16][ran:u8][message].
+        .{ .status = 12, .body = "\x0c\x00\x00shard offline" },
         .{ .status = 0, .body = &ok_body },
-        .{ .status = 200, .body = "from the future" },
+        .{ .status = 200, .body = "\x0a\x00\x01from the future" },
         .{ .status = 0, .body = &ok_body },
     };
     try srv.start();
@@ -844,6 +845,8 @@ test "status 12 and an unknown status each surface with their message, and the n
     try std.testing.expectError(FloError.Unavailable, kv.get("k", .{}));
     try std.testing.expectEqual(@as(u8, 12), client.lastError().?.code);
     try std.testing.expectEqualStrings("shard offline", client.lastError().?.message);
+    try std.testing.expectEqual(types.Reason.unclassified, client.lastError().?.reason);
+    try std.testing.expectEqual(types.Ran.no, client.lastError().?.ran);
 
     var first = (try kv.get("k", .{})).?;
     defer first.deinit(std.testing.allocator);
@@ -854,8 +857,33 @@ test "status 12 and an unknown status each surface with their message, and the n
     try std.testing.expectError(FloError.ServerError, kv.get("k", .{}));
     try std.testing.expectEqual(@as(u8, 200), client.lastError().?.code);
     try std.testing.expectEqualStrings("from the future", client.lastError().?.message);
+    try std.testing.expectEqual(types.Reason.committed_not_applied, client.lastError().?.reason);
+    try std.testing.expectEqual(types.Ran.yes, client.lastError().?.ran);
 
     var second = (try kv.get("k", .{})).?;
     defer second.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("v", second.value);
+}
+
+test "a refusal whose body isn't [reason][ran][message] is refused, not guessed at" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 3, .body = "\x01\x00" },
+        .{ .status = 3, .body = "\xff\xff\x00x" },
+        .{ .status = 3, .body = "\x01\x00\x09x" },
+        // Reason 257: read as a byte it would pass as unknown_op.
+        .{ .status = 3, .body = "\x01\x01\x00x" },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var kv = KV.init(&client);
+    for (0..4) |_| {
+        try std.testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
+        try std.testing.expect(client.lastError() == null);
+    }
 }
