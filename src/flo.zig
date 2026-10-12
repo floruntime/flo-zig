@@ -78,13 +78,12 @@ pub const OpCode = types.OpCode;
 
 // Result types
 pub const ScanResult = types.ScanResult;
-pub const KVEntry = types.KVEntry;
 pub const Message = types.Message;
 pub const DequeueResult = types.DequeueResult;
 pub const VersionEntry = types.VersionEntry;
 pub const PutResult = types.PutResult;
 pub const GetResult = types.GetResult;
-pub const KVBeginResult = types.KVBeginResult;
+pub const IncrResult = types.IncrResult;
 pub const KVCommitResult = types.KVCommitResult;
 pub const StreamRecord = types.StreamRecord;
 pub const StreamReadResult = types.StreamReadResult;

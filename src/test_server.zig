@@ -20,8 +20,9 @@ pub const OkServer = struct {
     body: []const u8 = "",
     /// Replies for the first requests, in order; later ones get OK and `body`.
     replies: []const Reply = &.{},
-    last_payload_buf: [1024]u8 = undefined,
+    last_payload_buf: [8192]u8 = undefined,
     last_payload_len: usize = 0,
+    last_op: u16 = 0,
 
     /// Listen on an ephemeral port. Call `start` once the value is at its
     /// final address.
@@ -66,6 +67,7 @@ pub const OkServer = struct {
             crc.update(payload);
             if (crc.final() != crc32) return;
             self.last_payload_len = payload_length;
+            self.last_op = std.mem.readInt(u16, req[20..22], .little);
             const n = self.requests.fetchAdd(1, .release);
             const reply: Reply = if (n < self.replies.len) self.replies[n] else .{ .status = 0, .body = self.body };
 
@@ -96,6 +98,24 @@ pub const OkServer = struct {
         const value_len = std.mem.readInt(u32, p[off..][0..4], .little);
         off += 4;
         return p[off..][0..value_len];
+    }
+
+    /// The key of the last request: [ns_len:u16][ns][key_len:u16][key]...
+    pub fn lastKey(self: *OkServer) []const u8 {
+        _ = self.requests.load(.acquire);
+        const p = self.last_payload_buf[0..self.last_payload_len];
+        const off = 2 + std.mem.readInt(u16, p[0..2], .little);
+        const key_len = std.mem.readInt(u16, p[off..][0..2], .little);
+        return p[off + 2 ..][0..key_len];
+    }
+
+    /// The body of the last request, which must be a table op's:
+    /// everything after its key.
+    pub fn lastBody(self: *OkServer) []const u8 {
+        const key = self.lastKey();
+        const p = self.last_payload_buf[0..self.last_payload_len];
+        const off = @intFromPtr(key.ptr) - @intFromPtr(p.ptr) + key.len;
+        return p[off..];
     }
 
     fn readAll(stream: std.net.Stream, buf: []u8) !void {

@@ -133,23 +133,80 @@ try kv.put("key", "value", .{
 // Put to different namespace (override default)
 try kv.put("key", "value", .{ .namespace = "other-ns" });
 
-// Delete key
-try kv.delete("key", .{});
+// Delete key: returns whether it existed (a missing key is not an error)
+const existed = try kv.delete("key", .{});
+// Delete only if the key is still at version 5
+_ = try kv.delete("key", .{ .cas_version = 5 });
 
-// Scan keys with prefix
-var result = try kv.scan("prefix:", .{
-    .limit = 100,
-});
-defer result.deinit();
+// Scan key names with a prefix ("" for all); limit is 1-1024, default 100
+var page = try kv.scan("prefix:", .{ .limit = 100 });
+defer page.deinit();
+for (page.keys) |name| std.debug.print("{s}\n", .{name});
 
-// Next page: pass back the cursor the previous page returned
-if (result.has_more) {
-    var next = try kv.scan("prefix:", .{ .limit = 100, .cursor = result.cursor });
+// Next page: pass back the cursor; it is null on the last page
+if (page.cursor) |cursor| {
+    var next = try kv.scan("prefix:", .{ .limit = 100, .cursor = cursor });
     defer next.deinit();
 }
 
-// Get version history
+// Version history, newest first (limit 1-65, default 10); each entry has
+// version, at_ms (write time) and value
 const versions = try kv.history("key", .{ .limit = 10 });
+defer {
+    for (versions) |*v| v.deinit(allocator);
+    allocator.free(versions);
+}
+
+// Many keys at once (1-256): one entry per key, in order, with `found`
+var many = try kv.mget(&.{ "a", "b", "c" }, .{});
+defer many.deinit();
+
+// Counters: returns the new value and version
+const counter = try kv.incr("hits", .{ .delta = 5 });
+
+// TTL: set it on an existing key, or clear it with 0
+try kv.expire("session", 30_000, .{});
+try kv.expire("session", 0, .{});
+// Renew a lease only if you still hold its version
+try kv.expire("lease", 30_000, .{ .cas_version = 7 });
+
+const present = try kv.exists("key", .{});
+
+// JSON documents; path "" or "$" is the whole document
+_ = try kv.jsonSet("user:1", "$", "{\"name\":\"ada\"}", .{});
+if (try kv.jsonGet("user:1", "$.name", .{})) |found| {
+    var doc = found;
+    defer doc.deinit(allocator);
+}
+// Returns the new version, or null when "$" deleted the key
+_ = try kv.jsonDel("user:1", "$.name", .{});
+```
+
+Ops that take a `routing_key` option route by it in place of the key, so
+keys that share one live on the same shard.
+
+The client sends requests of at most 8 KiB (`Client.max_request_size`), so a
+`put` or `jsonSet` whose value is near that size or larger returns
+`error.BufferTooSmall` without sending anything; `mget` splits its keys
+across as many requests as it needs.
+
+#### Transactions
+
+A transaction is pinned to one routing key's shard. Inside it, `put`,
+`get`, `delete`, `incr`, `expire` and `exists` are routed by that key and
+buffered until commit; `scan`, `mget`, `history` and the JSON ops are
+refused with `error.TxnUnsupportedOp`.
+
+```zig
+var txn = try kv.begin("account:42", .{});
+defer txn.deinit();
+errdefer txn.rollback() catch {};
+
+_ = try txn.put("account:42:balance", "100", .{});
+try txn.incr("account:42:ops", 1);
+try txn.expire("account:42:lock", 0);
+
+const committed = try txn.commit(); // commit_index, op_count
 ```
 
 ### Queue Operations
