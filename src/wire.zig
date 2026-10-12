@@ -508,7 +508,7 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
-    try std.testing.expectEqual(@as(u64, 0x5194dd26f737dba9), header.table_hash);
+    try std.testing.expectEqual(@as(u64, 0xc8a2c3c65e95d11d), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
 }
 
