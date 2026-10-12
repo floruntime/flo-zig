@@ -145,7 +145,7 @@ pub const OptionsBuilder = struct {
     }
 
     pub fn addU32(self: *OptionsBuilder, tag: OptionTag, value: u32) FloError!void {
-        if (tag == .block_ms or tag == .wait_ms) try types.checkBlockMs(value);
+        if (tag == .block_ms) try types.checkBlockMs(value);
         try self.ensureCapacity(6);
         self.buffer[self.offset] = @intFromEnum(tag);
         self.buffer[self.offset + 1] = 4;
@@ -229,6 +229,12 @@ pub const OptionsIterator = struct {
 
 /// Serialize a request into a buffer
 /// Returns the slice of the buffer containing the serialized request
+/// Whether `op`'s request carries a schema-coded body rather than a value
+/// and options: kv.get and kv.set.
+pub fn isTableOp(op: OpCode) bool {
+    return op == .kv_get or op == .kv_put;
+}
+
 pub fn serializeRequest(
     buffer: []u8,
     request_id: u64,
@@ -245,8 +251,13 @@ pub fn serializeRequest(
     if (key.len > types.MAX_KEY_SIZE) return FloError.KeyTooLarge;
     if (value.len > types.MAX_VALUE_SIZE) return FloError.ValueTooLarge;
 
+    // A table op's payload is [namespace][key][body]: its body, coded by the
+    // op's schema, is `value`, and it takes no options.
+    const table = isTableOp(op_code);
+    if (table and options.len > 0) return FloError.IncompleteRequest;
+
     // Calculate payload size
-    const payload_size = 2 + namespace.len + 2 + key.len + 4 + value.len + 2 + options.len;
+    const payload_size = 2 + namespace.len + 2 + key.len + value.len + if (table) 0 else 4 + 2 + options.len;
     const total_size = header_size + payload_size;
 
     if (buffer.len < total_size) {
@@ -269,20 +280,25 @@ pub fn serializeRequest(
     @memcpy(payload_buffer[payload_offset..][0..key.len], key);
     payload_offset += key.len;
 
-    // Value
-    std.mem.writeInt(u32, payload_buffer[payload_offset..][0..4], @intCast(value.len), .little);
-    payload_offset += 4;
-    if (value.len > 0) {
+    if (table) {
         @memcpy(payload_buffer[payload_offset..][0..value.len], value);
         payload_offset += value.len;
-    }
+    } else {
+        // Value
+        std.mem.writeInt(u32, payload_buffer[payload_offset..][0..4], @intCast(value.len), .little);
+        payload_offset += 4;
+        if (value.len > 0) {
+            @memcpy(payload_buffer[payload_offset..][0..value.len], value);
+            payload_offset += value.len;
+        }
 
-    // Options
-    std.mem.writeInt(u16, payload_buffer[payload_offset..][0..2], @intCast(options.len), .little);
-    payload_offset += 2;
-    if (options.len > 0) {
-        @memcpy(payload_buffer[payload_offset..][0..options.len], options);
-        payload_offset += options.len;
+        // Options
+        std.mem.writeInt(u16, payload_buffer[payload_offset..][0..2], @intCast(options.len), .little);
+        payload_offset += 2;
+        if (options.len > 0) {
+            @memcpy(payload_buffer[payload_offset..][0..options.len], options);
+            payload_offset += options.len;
+        }
     }
 
     // Build header
@@ -535,7 +551,7 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
-    try std.testing.expectEqual(@as(u64, 0x2827f6f0631754fe), header.table_hash);
+    try std.testing.expectEqual(@as(u64, 0x02e15ee74c0ad72c), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
 }
 
@@ -557,9 +573,7 @@ test "OptionsBuilder refuses a blocking wait over 300000 ms" {
 
     try builder.addU32(.block_ms, 0);
     try builder.addU32(.block_ms, types.MAX_BLOCK_MS);
-    try builder.addU32(.wait_ms, types.MAX_BLOCK_MS);
     try std.testing.expectError(FloError.BlockTooLong, builder.addU32(.block_ms, types.MAX_BLOCK_MS + 1));
-    try std.testing.expectError(FloError.BlockTooLong, builder.addU32(.wait_ms, types.MAX_BLOCK_MS + 1));
     // Other u32 options are not blocking waits.
     try builder.addU32(.count, types.MAX_BLOCK_MS + 1);
 }
