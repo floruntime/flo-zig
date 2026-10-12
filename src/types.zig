@@ -13,7 +13,7 @@ pub const VERSION: u8 = 0x02;
 /// The hash of the op table this SDK was built for, written into every
 /// request header. A server built from another table refuses the request,
 /// and its answers carry its own hash, which this SDK refuses.
-pub const TABLE_HASH: u64 = 0x02e15ee74c0ad72c;
+pub const TABLE_HASH: u64 = 0xc93e40aa0f2795fe;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -54,6 +54,10 @@ pub const Reason = enum(u16) {
     writes_stopped = 22,
     /// Too many writes wait for commit.
     too_many_proposals = 23,
+    /// The key's value isn't the kind the op needs (a counter, a JSON document).
+    wrong_type = 24,
+    /// The shard holds as many open transactions as it may.
+    too_many_transactions = 25,
 };
 
 /// Whether a refused request took effect: retry logic reads this, not the
@@ -77,6 +81,20 @@ pub const MAX_BLOCK_MS: u32 = 300_000;
 pub const MAX_WAIT_MS: u64 = 300_000;
 /// Longest value a KV put takes.
 pub const MAX_KV_VALUE_SIZE: usize = 253_817;
+/// The longest JSON document kv.json_set takes.
+pub const MAX_JSON_DOCUMENT_SIZE: usize = 252_819;
+/// The longest JSON path.
+pub const MAX_JSON_PATH: usize = 1024;
+/// The most names one kv.scan page holds.
+pub const MAX_SCAN: u32 = 1024;
+/// The most versions kv.history returns.
+pub const MAX_HISTORY: u32 = 65;
+/// The most keys one kv.mget takes.
+pub const MAX_MGET: usize = 256;
+/// The longest key a kv.mget names.
+pub const MAX_MGET_KEY: usize = 4096;
+/// The longest TTL: milliseconds whose nanoseconds fit a u64.
+pub const MAX_TTL_MS: u64 = 18_446_744_073_709;
 
 /// What a KV get with wait_ms waits for.
 pub const WaitFor = enum(u8) {
@@ -183,12 +201,11 @@ pub const OpCode = enum(u16) {
     kv_json_set = 0x10D,
     kv_json_del = 0x10E,
     // KV per-shard transactions
-    kv_begin_txn = 0x110,
-    kv_commit_txn = 0x111,
-    kv_rollback_txn = 0x112,
-    // KV extended (TTL lifecycle, exists)
-    kv_touch = 0x113,
-    kv_persist = 0x114,
+    kv_txn_begin = 0x110,
+    kv_txn_commit = 0x111,
+    kv_txn_rollback = 0x112,
+    // KV extended (TTL, exists)
+    kv_expire = 0x113,
     kv_exists = 0x115,
 
     // ── Streams (0x130 – 0x14F) ──
@@ -343,14 +360,7 @@ pub const StatusCode = enum(u8) {
 
 /// Option tags for TLV-encoded operation parameters
 pub const OptionTag = enum(u8) {
-    // KV Options (0x01 - 0x0F)
-    ttl_ms = 0x01, // u64: KV time-to-live in milliseconds (0 = no expiration)
-    cas_version = 0x02, // u64: Expected version for compare-and-swap
-    if_not_exists = 0x03, // void: Only set if key doesn't exist (NX)
-    if_exists = 0x04, // void: Only set if key exists (XX)
-    limit = 0x05, // u32: Maximum number of results for scan/list operations
-    routing_key = 0x08, // string: Explicit routing key for shard co-location
-    txn_id = 0x09, // u64: Transaction ID for per-shard transactions
+    limit = 0x05, // u32: Maximum number of results for list operations
 
     // Queue Options (0x10 - 0x1F)
     priority = 0x10, // u8: Message priority (0-255, lower is dequeued first)
@@ -451,41 +461,25 @@ pub const FloError = error{
 // Result Types
 // =============================================================================
 
-/// KV entry from scan results
-pub const KVEntry = struct {
-    key: []const u8,
-    value: ?[]const u8,
-
-    pub fn deinit(self: *KVEntry, allocator: std.mem.Allocator) void {
-        allocator.free(self.key);
-        if (self.value) |v| {
-            allocator.free(v);
-        }
-    }
-};
-
-/// Result of a KV scan operation
+/// One page of a KV scan: the key names, without values, and the cursor
+/// for the next page (null on the last). Free with `deinit`.
 pub const ScanResult = struct {
-    entries: []KVEntry,
-    cursor: ?[]const u8, // null if no more pages
-    has_more: bool,
+    keys: [][]const u8,
+    cursor: ?[]const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ScanResult) void {
-        for (self.entries) |*entry| {
-            entry.deinit(self.allocator);
-        }
-        self.allocator.free(self.entries);
-        if (self.cursor) |c| {
-            self.allocator.free(c);
-        }
+        for (self.keys) |k| self.allocator.free(k);
+        self.allocator.free(self.keys);
+        if (self.cursor) |c| self.allocator.free(c);
     }
 };
 
 /// KV version entry from history
 pub const VersionEntry = struct {
     version: u64,
-    timestamp: i64,
+    /// When the version was written, in Unix milliseconds.
+    at_ms: i64,
     value: []const u8,
 
     pub fn deinit(self: *VersionEntry, allocator: std.mem.Allocator) void {
@@ -501,14 +495,10 @@ pub const PutResult = struct {
     version: u64,
 };
 
-/// Result of a successful KV transaction begin.
-///
-/// `txn_id` is the server-assigned transaction handle. `pinned_hash` is the
-/// partition hash this transaction is bound to — every key written or read
-/// inside the transaction must hash to the same partition.
-pub const KVBeginResult = struct {
-    txn_id: u64,
-    pinned_hash: u64,
+/// Result of a KV incr: the counter's new value and the key's new version.
+pub const IncrResult = struct {
+    value: i64,
+    version: u64,
 };
 
 /// Result of a successful KV transaction commit.
@@ -618,58 +608,85 @@ pub const PutOptions = struct {
 pub const DeleteOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// CAS guard — when set, the delete only succeeds if the current key
-    /// version equals `if_match`. Returns `FloError.Conflict` otherwise.
-    /// Use this for race-free "only the owner deletes" patterns.
-    if_match: ?u64 = null,
+    /// The key's version the delete requires; another version returns
+    /// `FloError.Conflict`. Use this for race-free "only the owner deletes".
+    cas_version: ?u64 = null,
+    /// Routes the request in place of the key
+    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV scan operations
 pub const ScanOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+    /// The cursor the previous page returned; null for the first page.
     cursor: ?[]const u8 = null,
-    limit: ?u32 = null,
+    /// Names per page, 1 to 1024.
+    limit: u32 = MAX_SCAN,
 };
 
 /// Options for KV history operations
 pub const HistoryOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    limit: ?u32 = null,
+    /// Versions to return, newest first, 1 to 65.
+    limit: u32 = 10,
+    /// Routes the request in place of the key
+    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV incr operations
 pub const KVIncrOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Defaults to +1 when null. Negative values decrement.
-    delta: ?i64 = null,
+    /// Negative values decrement.
+    delta: i64 = 1,
+    /// Routes the request in place of the key
+    routing_key: ?[]const u8 = null,
 };
 
-/// Options for KV touch / persist operations
-pub const KVTouchOptions = struct {
+/// Options for KV expire operations
+pub const KVExpireOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// CAS guard — when set, the touch/persist only succeeds if the current
-    /// key version equals `if_match`. Use this for race-free lease renewal.
-    if_match: ?u64 = null,
+    /// The key's version the expire requires; use this for race-free lease
+    /// renewal.
+    cas_version: ?u64 = null,
+    /// Routes the request in place of the key
+    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV exists operations
 pub const KVExistsOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+    /// Routes the request in place of the key
+    routing_key: ?[]const u8 = null,
 };
 
-/// Options for KV JSON.* operations
+/// Options for KV JSON operations
 pub const KVJsonOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+    /// Routes the request in place of the key
+    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV mget operations
 pub const KVMGetOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+};
+
+/// Options for a delete or expire inside a KV transaction
+pub const KVTxnWriteOptions = struct {
+    /// The key's version the write requires; another version fails the
+    /// write with `FloError.Conflict`.
+    cas_version: ?u64 = null,
+};
+
+/// Options for KV transaction begin
+pub const KVBeginOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
 };

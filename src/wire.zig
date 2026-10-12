@@ -227,14 +227,24 @@ pub const OptionsIterator = struct {
 // Request Serialization
 // =============================================================================
 
-/// Serialize a request into a buffer
-/// Returns the slice of the buffer containing the serialized request
 /// Whether `op`'s request carries a schema-coded body rather than a value
-/// and options: kv.get and kv.set.
+/// and options: every KV op.
 pub fn isTableOp(op: OpCode) bool {
-    return op == .kv_get or op == .kv_put;
+    return switch (op) {
+        .kv_put, .kv_get, .kv_mget, .kv_delete, .kv_scan, .kv_history, .kv_incr, .kv_json_get, .kv_json_set, .kv_json_del, .kv_txn_begin, .kv_txn_commit, .kv_txn_rollback, .kv_expire, .kv_exists => true,
+        else => false,
+    };
 }
 
+/// The size of a request's frame, header included.
+pub fn requestSize(op_code: OpCode, namespace: []const u8, key: []const u8, value: []const u8, options: []const u8) usize {
+    const envelope = @sizeOf(RequestHeader) + 2 + namespace.len + 2 + key.len + value.len;
+    // A table op's payload is [namespace][key][body]: no value length, no options.
+    return envelope + if (isTableOp(op_code)) 0 else 4 + 2 + options.len;
+}
+
+/// Serialize a request into a buffer
+/// Returns the slice of the buffer containing the serialized request
 pub fn serializeRequest(
     buffer: []u8,
     request_id: u64,
@@ -256,9 +266,8 @@ pub fn serializeRequest(
     const table = isTableOp(op_code);
     if (table and options.len > 0) return FloError.IncompleteRequest;
 
-    // Calculate payload size
-    const payload_size = 2 + namespace.len + 2 + key.len + value.len + if (table) 0 else 4 + 2 + options.len;
-    const total_size = header_size + payload_size;
+    const total_size = requestSize(op_code, namespace, key, value, options);
+    const payload_size = total_size - header_size;
 
     if (buffer.len < total_size) {
         return FloError.BufferTooSmall;
@@ -376,58 +385,6 @@ pub fn parseListTrailer(data: []const u8, offset: usize) FloError!ListTrailer {
     };
 }
 
-/// Parse a scan response
-/// Format: [count:u32]([key_len:u16][key][value_len:u32][value])*[has_more:u8][cursor_len:u16][cursor]
-pub fn parseScanResponse(allocator: Allocator, data: []const u8) !types.ScanResult {
-    if (data.len < 4) return FloError.IncompleteResponse;
-
-    var offset: usize = 0;
-    const count = std.mem.readInt(u32, data[offset..][0..4], .little);
-    offset += 4;
-    // Each entry is at least its two length fields; a count the data can't
-    // hold is refused before it sizes an allocation.
-    if (count > (data.len - offset) / (2 + 4)) return FloError.IncompleteResponse;
-
-    var entries = try allocator.alloc(types.KVEntry, count);
-    var parsed: usize = 0;
-    errdefer {
-        for (entries[0..parsed]) |*e| e.deinit(allocator);
-        allocator.free(entries);
-    }
-
-    while (parsed < count) {
-        if (data.len < offset + 2) return FloError.IncompleteResponse;
-        const key_len = std.mem.readInt(u16, data[offset..][0..2], .little);
-        offset += 2;
-        if (data.len < offset + key_len) return FloError.IncompleteResponse;
-        const key_bytes = data[offset..][0..key_len];
-        offset += key_len;
-
-        if (data.len < offset + 4) return FloError.IncompleteResponse;
-        const value_len = std.mem.readInt(u32, data[offset..][0..4], .little);
-        offset += 4;
-        if (data.len < offset + value_len) return FloError.IncompleteResponse;
-        const value_bytes = data[offset..][0..value_len];
-        offset += value_len;
-
-        const key = try allocator.dupe(u8, key_bytes);
-        errdefer allocator.free(key);
-        const value = if (value_len > 0) try allocator.dupe(u8, value_bytes) else null;
-        entries[parsed] = .{ .key = key, .value = value };
-        parsed += 1;
-    }
-
-    const trailer = try parseListTrailer(data, offset);
-    const cursor = if (trailer.cursor) |c| try allocator.dupe(u8, c) else null;
-
-    return types.ScanResult{
-        .entries = entries,
-        .cursor = cursor,
-        .has_more = trailer.has_more,
-        .allocator = allocator,
-    };
-}
-
 /// Parse a dequeue response
 /// Format: [count:u32][messages...]
 /// Message format: [seq:u64][payload_len:u32][payload][enqueued_at_ms:i64][delivery_count:u32][priority:u8]
@@ -509,7 +466,7 @@ test "OptionsBuilder and Iterator roundtrip" {
     var buffer: [64]u8 = undefined;
     var builder = OptionsBuilder.init(&buffer);
 
-    try builder.addU64(.ttl_ms, 3_600_000);
+    try builder.addU64(.max_age_seconds, 3_600_000);
     try builder.addU8(.priority, 5);
     try builder.addBytes(.partition_key, "abc123");
 
@@ -517,9 +474,9 @@ test "OptionsBuilder and Iterator roundtrip" {
 
     var iter = OptionsIterator.init(options);
 
-    const ttl_opt = iter.next().?;
-    try std.testing.expectEqual(OptionTag.ttl_ms, ttl_opt.tag);
-    try std.testing.expectEqual(@as(u64, 3_600_000), ttl_opt.asU64().?);
+    const age_opt = iter.next().?;
+    try std.testing.expectEqual(OptionTag.max_age_seconds, age_opt.tag);
+    try std.testing.expectEqual(@as(u64, 3_600_000), age_opt.asU64().?);
 
     const priority_opt = iter.next().?;
     try std.testing.expectEqual(OptionTag.priority, priority_opt.tag);
@@ -551,7 +508,7 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
-    try std.testing.expectEqual(@as(u64, 0x02e15ee74c0ad72c), header.table_hash);
+    try std.testing.expectEqual(@as(u64, 0xc93e40aa0f2795fe), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
 }
 
@@ -609,12 +566,6 @@ test "parseDequeueResponse reads every message as the server writes it" {
         try std.testing.expectEqual(w.deliveries, got.delivery_count);
         try std.testing.expectEqual(w.priority, got.priority);
     }
-}
-
-test "parseScanResponse refuses a count its data can't hold" {
-    var data: [4]u8 = undefined;
-    std.mem.writeInt(u32, &data, std.math.maxInt(u32), .little);
-    try std.testing.expectError(FloError.IncompleteResponse, parseScanResponse(std.testing.allocator, &data));
 }
 
 test "parseDequeueResponse refuses a cut trailer and a count its data can't hold, freeing only what it parsed" {

@@ -77,20 +77,16 @@ pub fn main() !void {
     };
     defer scan_result.deinit();
 
-    for (scan_result.entries) |entry| {
-        if (entry.value) |v| {
-            std.debug.print("  {s} = '{s}'\n", .{ entry.key, v });
-        } else {
-            std.debug.print("  {s}\n", .{entry.key});
-        }
+    for (scan_result.keys) |key| {
+        std.debug.print("  {s}\n", .{key});
     }
 
     // Delete the key
-    kv.delete("greeting", .{}) catch |err| {
+    const existed = kv.delete("greeting", .{}) catch |err| {
         std.debug.print("DELETE failed: {}\n", .{err});
         return;
     };
-    std.debug.print("\nDELETE greeting\n", .{});
+    std.debug.print("\nDELETE greeting (existed: {})\n", .{existed});
 
     // =============================================================================
     // Queue Operations
