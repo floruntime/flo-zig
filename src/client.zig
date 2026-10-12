@@ -166,10 +166,10 @@ pub const Client = struct {
         return self.stream != null;
     }
 
-    /// The largest request frame (header included) the client sends; a
-    /// bigger one is refused with `FloError.BufferTooSmall` before any byte
+    /// The largest request frame (header included) the server takes; a
+    /// bigger one is refused with `FloError.PayloadTooLarge` before any byte
     /// goes out.
-    pub const max_request_size = 8192;
+    pub const max_request_size = 256 * 1024;
 
     /// Send a request and receive response (low-level)
     pub fn sendRequest(
@@ -183,10 +183,14 @@ pub const Client = struct {
         const stream = self.stream orelse return FloError.NotConnected;
         self.last_error_code = 0;
 
-        // Serialize request
-        var send_buf: [max_request_size]u8 = undefined;
+        // Serialize request: small ones on the stack, the rest on the heap.
+        const size = wire.requestSize(op_code, namespace, key, value, options);
+        if (size > max_request_size) return FloError.PayloadTooLarge;
+        var stack_buf: [8192]u8 = undefined;
+        const heap_buf: ?[]u8 = if (size > stack_buf.len) try self.allocator.alloc(u8, size) else null;
+        defer if (heap_buf) |b| self.allocator.free(b);
         const serialized = try wire.serializeRequest(
-            &send_buf,
+            heap_buf orelse &stack_buf,
             self.request_id,
             op_code,
             namespace,

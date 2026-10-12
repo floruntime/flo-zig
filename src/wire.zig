@@ -236,6 +236,13 @@ pub fn isTableOp(op: OpCode) bool {
     };
 }
 
+/// The size of a request's frame, header included.
+pub fn requestSize(op_code: OpCode, namespace: []const u8, key: []const u8, value: []const u8, options: []const u8) usize {
+    const envelope = @sizeOf(RequestHeader) + 2 + namespace.len + 2 + key.len + value.len;
+    // A table op's payload is [namespace][key][body]: no value length, no options.
+    return envelope + if (isTableOp(op_code)) 0 else 4 + 2 + options.len;
+}
+
 /// Serialize a request into a buffer
 /// Returns the slice of the buffer containing the serialized request
 pub fn serializeRequest(
@@ -259,9 +266,8 @@ pub fn serializeRequest(
     const table = isTableOp(op_code);
     if (table and options.len > 0) return FloError.IncompleteRequest;
 
-    // Calculate payload size
-    const payload_size = 2 + namespace.len + 2 + key.len + value.len + if (table) 0 else 4 + 2 + options.len;
-    const total_size = header_size + payload_size;
+    const total_size = requestSize(op_code, namespace, key, value, options);
+    const payload_size = total_size - header_size;
 
     if (buffer.len < total_size) {
         return FloError.BufferTooSmall;
@@ -502,7 +508,7 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
-    try std.testing.expectEqual(@as(u64, 0x8aa29e7a0c35fd78), header.table_hash);
+    try std.testing.expectEqual(@as(u64, 0xc93e40aa0f2795fe), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
 }
 

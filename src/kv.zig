@@ -56,7 +56,7 @@ pub const KV = struct {
     /// as many keys as fit one answer, and this asks again from where it
     /// stopped until every key is answered.
     ///
-    /// Takes 1 to 256 keys. **Caller owns the returned `MGetResult` and must
+    /// Takes 1 to 256 keys of at most 4096 bytes. **Caller owns the returned `MGetResult` and must
     /// call `result.deinit()`.**
     pub fn mget(
         self: *KV,
@@ -64,7 +64,7 @@ pub const KV = struct {
         options: types.KVMGetOptions,
     ) FloError!types.MGetResult {
         if (keys.len == 0 or keys.len > types.MAX_MGET) return FloError.BadRequest;
-        for (keys) |k| if (k.len > std.math.maxInt(u16)) return FloError.KeyTooLarge;
+        for (keys) |k| if (k.len > types.MAX_MGET_KEY) return FloError.KeyTooLarge;
         const ns = self.client.getNamespace(options.namespace);
         const allocator = self.client.allocator;
 
@@ -79,7 +79,7 @@ pub const KV = struct {
         }
 
         while (filled < keys.len) {
-            const end = mgetChunkEnd(ns, keys, filled) orelse return FloError.BufferTooSmall;
+            const end = mgetChunkEnd(keys, filled);
             const chunk = keys[filled..end];
             const buf = try allocator.alloc(u8, mgetBodySize(chunk));
             defer allocator.free(buf);
@@ -116,7 +116,7 @@ pub const KV = struct {
         return decodeScanAnswer(self.client.allocator, response.data);
     }
 
-    /// Get a key's versions, newest first.
+    /// Get a key's versions, newest first; a missing key has none.
     /// **Caller owns the returned slice and must free each entry with `entry.deinit(allocator)`,
     /// then free the slice itself with `allocator.free(entries)`.**
     pub fn history(
@@ -124,10 +124,13 @@ pub const KV = struct {
         key: []const u8,
         options: types.HistoryOptions,
     ) FloError![]types.VersionEntry {
-        var buf: [5]u8 = undefined;
-        const body = try encodeHistoryBody(&buf, options.limit);
-        var response = try call(self.client, .kv_history, self.client.getNamespace(options.namespace), key, body);
+        var buf: [MAX_HISTORY_BODY]u8 = undefined;
+        const body = try encodeHistoryBody(&buf, options.limit, options.routing_key);
+        var response = try self.client.sendRequest(.kv_history, self.client.getNamespace(options.namespace), key, body, "");
         defer response.deinit();
+        // A missing key has no versions.
+        if (response.status == .not_found and self.client.last_error_reason == .not_found) return self.client.allocator.alloc(types.VersionEntry, 0);
+        if (response.status != .ok) return response.status.toError();
         return decodeHistoryAnswer(self.client.allocator, response.data);
     }
 
@@ -314,9 +317,9 @@ pub const Transaction = struct {
     }
 
     /// Buffer a delete inside the transaction.
-    pub fn delete(self: *Transaction, key: []const u8) FloError!void {
+    pub fn delete(self: *Transaction, key: []const u8, options: types.KVTxnWriteOptions) FloError!void {
         try self.checkAlive();
-        _ = try kvDelete(self.client, self.namespace, key, null, self.routing_key, self.id);
+        _ = try kvDelete(self.client, self.namespace, key, options.cas_version, self.routing_key, self.id);
     }
 
     /// Buffer an atomic counter increment inside the transaction; its value
@@ -328,9 +331,9 @@ pub const Transaction = struct {
 
     /// Buffer a TTL change inside the transaction, in milliseconds;
     /// `ttl_ms = 0` clears the TTL.
-    pub fn expire(self: *Transaction, key: []const u8, ttl_ms: u64) FloError!void {
+    pub fn expire(self: *Transaction, key: []const u8, ttl_ms: u64, options: types.KVTxnWriteOptions) FloError!void {
         try self.checkAlive();
-        return kvExpire(self.client, self.namespace, key, ttl_ms, null, self.routing_key, self.id);
+        return kvExpire(self.client, self.namespace, key, ttl_ms, options.cas_version, self.routing_key, self.id);
     }
 
     /// Check key existence inside the transaction (sees buffered writes).
@@ -508,12 +511,16 @@ fn encodeScanBody(buf: *[MAX_SCAN_BODY]u8, limit: u32, cursor: []const u8) FloEr
     return w.written();
 }
 
-/// kv.history's request: limit.
-fn encodeHistoryBody(buf: *[5]u8, limit: u32) FloError![]const u8 {
+const MAX_HISTORY_BODY = 5 + ROUTING_KEY_FIELD;
+
+/// kv.history's request: limit, routing_key.
+fn encodeHistoryBody(buf: *[MAX_HISTORY_BODY]u8, limit: u32, routing_key: ?[]const u8) FloError![]const u8 {
     if (limit < 1 or limit > types.MAX_HISTORY) return FloError.BadRequest;
+    try checkRoutingKey(routing_key);
     var w: BodyWriter = .{ .buf = buf };
     w.put(&.{1});
     w.int(u32, limit);
+    w.routingKey(routing_key);
     return w.written();
 }
 
@@ -531,17 +538,19 @@ fn encodeMgetBody(buf: []u8, keys: []const []const u8) []const u8 {
     return w.written();
 }
 
+/// The longest kv.mget body the server takes.
+const MAX_MGET_BODY = 257_949;
+
 /// Where the mget request that starts at `keys[start]` ends: as many keys as
-/// fit the client's largest request frame. Null when not even one does.
-fn mgetChunkEnd(namespace: []const u8, keys: []const []const u8, start: usize) ?usize {
-    const fixed = @sizeOf(wire.RequestHeader) + 2 + namespace.len + 2 + 2;
-    var size: usize = fixed;
+/// fit one body. Keys are at most 4096 bytes, so at least one always does.
+fn mgetChunkEnd(keys: []const []const u8, start: usize) usize {
+    var size: usize = 2;
     var end = start;
     while (end < keys.len) : (end += 1) {
         size += 2 + keys[end].len;
-        if (size > Client.max_request_size) break;
+        if (size > MAX_MGET_BODY) break;
     }
-    return if (end == start) null else end;
+    return end;
 }
 
 const MAX_INCR_BODY = 9 + ROUTING_KEY_FIELD + 9;
@@ -926,8 +935,9 @@ test "the other KV ops' requests match the server's schemas byte for byte" {
     try expectHex("010700000000000000010200726b00", try encodeDeleteBody(&del, 7, "rk", null));
     var scan: [MAX_SCAN_BODY]u8 = undefined;
     try expectHex("0102000000026331", try encodeScanBody(&scan, 2, "c1"));
-    var hist: [5]u8 = undefined;
-    try expectHex("0102000000", try encodeHistoryBody(&hist, 2));
+    var hist: [MAX_HISTORY_BODY]u8 = undefined;
+    try expectHex("010200000000", try encodeHistoryBody(&hist, 2, null));
+    try expectHex("0102000000010200726b", try encodeHistoryBody(&hist, 2, "rk"));
     const keys = [_][]const u8{ "a", "b" };
     var mget: [mgetBodySize(&keys)]u8 = undefined;
     try expectHex("0200010061010062", encodeMgetBody(&mget, &keys));
@@ -1116,23 +1126,18 @@ test "mget asks again from next until every key is answered" {
     try testing.expect(!result.entries[1].found);
 }
 
-test "an mget too big for one request frame is split across requests that each fit" {
+test "an mget too big for one body is split across bodies that each fit" {
     var keys: [200][]const u8 = undefined;
-    const key = "k" ** 40;
+    const key = "k" ** types.MAX_MGET_KEY;
     for (&keys) |*k| k.* = key;
-    const end = mgetChunkEnd("default", &keys, 0).?;
+    const end = mgetChunkEnd(&keys, 0);
     try testing.expect(end > 0 and end < keys.len);
-    var body_buf: [Client.max_request_size]u8 = undefined;
-    var frame: [Client.max_request_size]u8 = undefined;
-    // The chunk fits, and one key more wouldn't.
-    _ = try wire.serializeRequest(&frame, 1, .kv_mget, "default", "", encodeMgetBody(&body_buf, keys[0..end]), "");
-    var big: [Client.max_request_size + 64]u8 = undefined;
-    const over = try wire.serializeRequest(&big, 1, .kv_mget, "default", "", encodeMgetBody(&body_buf, keys[0 .. end + 1]), "");
-    try testing.expect(over.len > Client.max_request_size);
-    // The rest starts where the chunk ended; a key that can't fit alone has no chunk.
-    try testing.expectEqual(@as(usize, keys.len), mgetChunkEnd("default", &keys, end).?);
-    const huge = [_][]const u8{"h" ** Client.max_request_size};
-    try testing.expect(mgetChunkEnd("default", &huge, 0) == null);
+    try testing.expect(mgetBodySize(keys[0..end]) <= MAX_MGET_BODY);
+    try testing.expect(mgetBodySize(keys[0 .. end + 1]) > MAX_MGET_BODY);
+    // A full body still fits the request frame.
+    try testing.expect(wire.requestSize(.kv_mget, "default", "", &[_]u8{0} ** MAX_MGET_BODY, "") <= Client.max_request_size);
+    // The next chunk starts where this one ended.
+    try testing.expectEqual(2 * end, mgetChunkEnd(&keys, end));
 }
 
 test "delete says whether the key existed; a missing key is no error" {
@@ -1189,16 +1194,16 @@ test "transaction ops carry the txn and its routing key; commit and rollback car
     try testing.expectEqual(@as(u64, 1), txn.id);
     try testing.expectEqual(@as(u64, 2), txn.pinned_hash);
 
-    try txn.delete("k");
+    try txn.delete("k", .{ .cas_version = 7 });
     try testing.expectEqual(op(.kv_delete), srv.last_op);
     try testing.expectEqualStrings("k", srv.lastKey());
-    try expectHex("00010200726b010100000000000000", srv.lastBody());
+    try expectHex("010700000000000000010200726b010100000000000000", srv.lastBody());
 
     try txn.incr("n", -5);
     try testing.expectEqual(op(.kv_incr), srv.last_op);
     try expectHex("01fbffffffffffffff010200726b010100000000000000", srv.lastBody());
 
-    try txn.expire("k", 60000);
+    try txn.expire("k", 60000, .{});
     try testing.expectEqual(op(.kv_expire), srv.last_op);
     try expectHex("60ea00000000000000010200726b010100000000000000", srv.lastBody());
 
@@ -1212,7 +1217,7 @@ test "transaction ops carry the txn and its routing key; commit and rollback car
     try expectHex("0100000000000000", srv.lastBody());
     try testing.expectEqual(@as(u64, 10), committed.commit_index);
     try testing.expectEqual(@as(u16, 2), committed.op_count);
-    try testing.expectError(FloError.TxnFinished, txn.delete("k"));
+    try testing.expectError(FloError.TxnFinished, txn.delete("k", .{}));
     try txn.rollback(); // a no-op after commit
 
     var other = try kv.begin("rk", .{});
@@ -1254,10 +1259,9 @@ test "requests out of bounds are refused before a round trip" {
     const doc = try testing.allocator.alloc(u8, types.MAX_JSON_DOCUMENT_SIZE + 1);
     defer testing.allocator.free(doc);
     try testing.expectError(FloError.ValueTooLarge, kv.jsonSet("k", "$", doc, .{}));
-    // A body that fits its bound but not the client's request frame is
-    // refused whole, before any byte goes out.
-    try testing.expectError(FloError.BufferTooSmall, kv.put("k", doc[0..Client.max_request_size], .{}));
-    try testing.expectError(FloError.BufferTooSmall, kv.jsonSet("k", "$", doc[0..Client.max_request_size], .{}));
+    const long_key = "k" ** (types.MAX_MGET_KEY + 1);
+    try testing.expectError(FloError.KeyTooLarge, kv.mget(&.{long_key}, .{}));
+    try testing.expectError(FloError.KeyTooLarge, kv.history("k", .{ .routing_key = rk }));
     try testing.expectEqual(@as(u32, 0), srv.requests.load(.acquire));
     try testing.expect(client.isConnected());
 }
@@ -1284,10 +1288,10 @@ test "scan sends its limit and cursor and returns names and the next cursor" {
     try testing.expectEqualStrings("bb", result.keys[1]);
     try testing.expectEqualStrings("c2", result.cursor.?);
 
-    // First page: an empty cursor, and the default limit.
+    // First page: an empty cursor, and the default limit, the server's.
     var first = try kv.scan("p", .{});
     defer first.deinit();
-    try expectHex("016400000000", srv.lastBody());
+    try expectHex("010004000000", srv.lastBody());
     try testing.expect(first.cursor == null);
 }
 
@@ -1398,4 +1402,55 @@ test "a refusal whose body isn't [reason][ran][message] is refused, not guessed 
         try std.testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
         try std.testing.expect(client.lastError() == null);
     }
+}
+
+test "values up to the server's bounds go out in one frame; a frame over it is refused unsent" {
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 0, .body = hex("010900000000000000") }, // put
+        .{ .status = 0, .body = hex("0300000000000000") }, // json_set
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var kv = KV.init(&client);
+
+    const value = try testing.allocator.alloc(u8, 200 * 1024);
+    defer testing.allocator.free(value);
+    @memset(value, 'v');
+    try testing.expectEqual(@as(u64, 9), (try kv.put("k", value, .{})).version);
+    try testing.expectEqualSlices(u8, value, srv.lastBody()[4..][0..value.len]);
+    try testing.expectEqual(@as(u64, 3), (try kv.jsonSet("k", "$", value, .{})).version);
+    try testing.expectEqualSlices(u8, value, srv.lastBody()[8..][0..value.len]);
+
+    const over = try testing.allocator.alloc(u8, Client.max_request_size);
+    defer testing.allocator.free(over);
+    try testing.expectError(FloError.PayloadTooLarge, client.sendRequest(.kv_put, "default", "k", over, ""));
+    try testing.expectEqual(@as(u32, 2), srv.requests.load(.acquire));
+    try testing.expect(client.isConnected());
+}
+
+test "history of a missing key is empty" {
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 0, .body = hex("00") },
+        .{ .status = 2, .body = "\x0d\x00\x00missing" },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var kv = KV.init(&client);
+
+    for (0..2) |_| {
+        const versions = try kv.history("gone", .{ .routing_key = "rk" });
+        defer testing.allocator.free(versions);
+        try testing.expectEqual(@as(usize, 0), versions.len);
+    }
+    try expectHex("010a000000010200726b", srv.lastBody());
 }

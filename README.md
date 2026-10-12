@@ -138,7 +138,7 @@ const existed = try kv.delete("key", .{});
 // Delete only if the key is still at version 5
 _ = try kv.delete("key", .{ .cas_version = 5 });
 
-// Scan key names with a prefix ("" for all); limit is 1-1024, default 100
+// Scan key names with a prefix ("" for all); limit is 1-1024, default 1024
 var page = try kv.scan("prefix:", .{ .limit = 100 });
 defer page.deinit();
 for (page.keys) |name| std.debug.print("{s}\n", .{name});
@@ -150,14 +150,15 @@ if (page.cursor) |cursor| {
 }
 
 // Version history, newest first (limit 1-65, default 10); each entry has
-// version, at_ms (write time) and value
+// version, at_ms (write time) and value. A missing key has no versions.
 const versions = try kv.history("key", .{ .limit = 10 });
 defer {
     for (versions) |*v| v.deinit(allocator);
     allocator.free(versions);
 }
 
-// Many keys at once (1-256): one entry per key, in order, with `found`
+// Many keys at once (1-256, each at most 4096 bytes): one entry per key, in
+// order, with `found`
 var many = try kv.mget(&.{ "a", "b", "c" }, .{});
 defer many.deinit();
 
@@ -185,10 +186,10 @@ _ = try kv.jsonDel("user:1", "$.name", .{});
 Ops that take a `routing_key` option route by it in place of the key, so
 keys that share one live on the same shard.
 
-The client sends requests of at most 8 KiB (`Client.max_request_size`), so a
-`put` or `jsonSet` whose value is near that size or larger returns
-`error.BufferTooSmall` without sending anything; `mget` splits its keys
-across as many requests as it needs.
+A request frame is at most 256 KiB (`Client.max_request_size`), enough for
+the largest value (253817 bytes) or JSON document the server takes; a bigger
+frame returns `error.PayloadTooLarge` without sending anything. `mget`
+splits its keys across as many requests as it needs.
 
 #### Transactions
 
@@ -204,7 +205,8 @@ errdefer txn.rollback() catch {};
 
 _ = try txn.put("account:42:balance", "100", .{});
 try txn.incr("account:42:ops", 1);
-try txn.expire("account:42:lock", 0);
+try txn.expire("account:42:lock", 0, .{});
+try txn.delete("account:42:hold", .{ .cas_version = 3 });
 
 const committed = try txn.commit(); // commit_index, op_count
 ```

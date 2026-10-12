@@ -20,7 +20,7 @@ pub const OkServer = struct {
     body: []const u8 = "",
     /// Replies for the first requests, in order; later ones get OK and `body`.
     replies: []const Reply = &.{},
-    last_payload_buf: [8192]u8 = undefined,
+    last_payload_buf: [256 * 1024]u8 = undefined,
     last_payload_len: usize = 0,
     last_op: u16 = 0,
 

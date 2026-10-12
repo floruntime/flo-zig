@@ -13,7 +13,7 @@ pub const VERSION: u8 = 0x02;
 /// The hash of the op table this SDK was built for, written into every
 /// request header. A server built from another table refuses the request,
 /// and its answers carry its own hash, which this SDK refuses.
-pub const TABLE_HASH: u64 = 0x8aa29e7a0c35fd78;
+pub const TABLE_HASH: u64 = 0xc93e40aa0f2795fe;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -91,6 +91,8 @@ pub const MAX_SCAN: u32 = 1024;
 pub const MAX_HISTORY: u32 = 65;
 /// The most keys one kv.mget takes.
 pub const MAX_MGET: usize = 256;
+/// The longest key a kv.mget names.
+pub const MAX_MGET_KEY: usize = 4096;
 /// The longest TTL: milliseconds whose nanoseconds fit a u64.
 pub const MAX_TTL_MS: u64 = 18_446_744_073_709;
 
@@ -620,7 +622,7 @@ pub const ScanOptions = struct {
     /// The cursor the previous page returned; null for the first page.
     cursor: ?[]const u8 = null,
     /// Names per page, 1 to 1024.
-    limit: u32 = 100,
+    limit: u32 = MAX_SCAN,
 };
 
 /// Options for KV history operations
@@ -629,6 +631,8 @@ pub const HistoryOptions = struct {
     namespace: ?[]const u8 = null,
     /// Versions to return, newest first, 1 to 65.
     limit: u32 = 10,
+    /// Routes the request in place of the key
+    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV incr operations
@@ -672,6 +676,13 @@ pub const KVJsonOptions = struct {
 pub const KVMGetOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+};
+
+/// Options for a delete or expire inside a KV transaction
+pub const KVTxnWriteOptions = struct {
+    /// The key's version the write requires; another version fails the
+    /// write with `FloError.Conflict`.
+    cas_version: ?u64 = null,
 };
 
 /// Options for KV transaction begin
