@@ -28,7 +28,7 @@ pub const ClientOptions = struct {
     debug: bool = false,
     /// How a request the server refused without running it is sent again.
     /// `.{ .max_attempts = 1 }` turns retrying off.
-    retry: retry.RetryPolicy = .{ .max_attempts = 4, .initial_backoff_ms = 50, .max_backoff_ms = 1000 },
+    retry: retry.RetryPolicy = .{},
 };
 
 /// Flo client for communicating with the server
@@ -200,7 +200,7 @@ pub const Client = struct {
             resp.deinit();
             const ms = wait.next(self.prng.random());
             if (self.debug) std.log.info("[flo] status {d}, not run: retrying in {d}ms", .{ self.last_error_code, ms });
-            std.Thread.sleep(ms * std.time.ns_per_ms);
+            std.Thread.sleep(retry.nsFromMs(ms));
         }
     }
 

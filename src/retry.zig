@@ -26,6 +26,12 @@ pub const RetryPolicy = struct {
     }
 };
 
+/// `ms` in nanoseconds, saturating: a huge backoff setting waits very long
+/// rather than overflowing.
+pub fn nsFromMs(ms: u64) u64 {
+    return ms *| std.time.ns_per_ms;
+}
+
 /// Whether an answer with `status` and the refusal body's `ran` is one the
 /// server says it didn't run, of a kind worth sending again.
 pub fn isRefusedUnrun(status: types.StatusCode, ran: types.Ran) bool {
@@ -111,4 +117,9 @@ test "a policy with max below initial waits at most initial" {
     // A zero-length wait is still a valid bound.
     var zero = Backoff.init(0, 0);
     try std.testing.expectEqual(@as(u64, 0), zero.next(prng.random()));
+}
+
+test "a huge backoff converts to nanoseconds without overflowing" {
+    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), nsFromMs(50));
+    try std.testing.expectEqual(std.math.maxInt(u64), nsFromMs(std.math.maxInt(u64)));
 }
