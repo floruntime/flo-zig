@@ -514,7 +514,8 @@ afresh.
 The action and stream workers wait the same way between failed polls, from
 100 ms up to 5 s, starting again from 100 ms after a poll that succeeds; `stop()`
 ends a wait within about 10 ms. A stream worker retries a group join refused
-this way instead of stopping.
+this way instead of stopping. `WorkerConfig` and `StreamWorkerConfig` take a `retry` field
+for the connection each worker opens.
 
 ```zig
 // Up to 8 tries, waiting at most 2 s between them

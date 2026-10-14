@@ -69,6 +69,8 @@ pub const StreamWorkerConfig = struct {
     metadata: ?[]const u8 = null,
     /// Optional machine ID
     machine_id: ?[]const u8 = null,
+    /// How its connection retries refused-but-not-run requests.
+    retry: retry_mod.RetryPolicy = .{},
 
     /// Get the list of streams to consume from.
     pub fn getStreams(self: *const StreamWorkerConfig) []const []const u8 {
@@ -139,6 +141,7 @@ pub const StreamWorker = struct {
 
         var client = Client.init(allocator, config.endpoint, .{
             .namespace = config.namespace,
+            .retry = config.retry,
         });
         errdefer client.deinit();
 
@@ -606,14 +609,26 @@ test "StreamWorker retries a group join the server refused without running" {
     try srv.start();
     defer srv.deinit();
 
-    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events" }, handler);
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .retry = .{ .max_attempts = 1 } }, handler);
     defer w.deinit();
-    w.client.retry.max_attempts = 1;
     w.running = true;
 
     try w.joinGroups();
     try std.testing.expectEqual(@as(u32, 4), srv.requests.load(.acquire));
     try std.testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.stream_group_join)), srv.last_op);
+}
+
+test "StreamWorker gives its connection the retry policy it is configured with" {
+    const handler = struct {
+        fn handle(_: *StreamContext) anyerror!void {}
+    }.handle;
+    var srv = try @import("test_server.zig").OkServer.listen();
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .retry = .{ .max_attempts = 7, .initial_backoff_ms = 30, .max_backoff_ms = 9 } }, handler);
+    defer w.deinit();
+    try std.testing.expectEqual(retry_mod.RetryPolicy{ .max_attempts = 7, .initial_backoff_ms = 30, .max_backoff_ms = 30 }, w.client.retry);
 }
 
 test "StreamWorker gives up a group join on any other refusal" {
