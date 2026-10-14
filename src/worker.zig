@@ -36,6 +36,7 @@ const types = @import("types.zig");
 const client_mod = @import("client.zig");
 const Client = client_mod.Client;
 const Actions = @import("actions.zig").Actions;
+const retry_mod = @import("retry.zig");
 
 const FloError = types.FloError;
 const TaskAssignment = types.TaskAssignment;
@@ -60,6 +61,8 @@ pub const WorkerConfig = struct {
     metadata: ?[]const u8 = null,
     /// Optional machine ID
     machine_id: ?[]const u8 = null,
+    /// How its connection retries refused-but-not-run requests.
+    retry: retry_mod.RetryPolicy = .{},
 };
 
 /// Context passed to action handlers.
@@ -180,6 +183,7 @@ pub const ActionWorker = struct {
 
         var client = Client.init(allocator, config.endpoint, .{
             .namespace = config.namespace,
+            .retry = config.retry,
         });
         errdefer client.deinit();
 
@@ -265,6 +269,7 @@ pub const ActionWorker = struct {
 
         self.running = true;
         self.last_heartbeat_ns = std.time.nanoTimestamp();
+        var failed = retry_mod.workerBackoff();
 
         // Main polling loop
         while (self.running) {
@@ -297,10 +302,13 @@ pub const ActionWorker = struct {
                     std.log.warn("[flo-worker] Connection lost: {}, reconnecting...", .{err});
                     self.client.disconnect();
                 } else {
-                    std.log.err("[flo-worker] Await error: {}, retrying...", .{err});
-                    std.Thread.sleep(1 * std.time.ns_per_s);
+                    const ms = failed.next(self.client.prng.random());
+                    std.log.err("[flo-worker] Await error: {}, retrying in {d}ms...", .{ err, ms });
+                    types.pauseWhileRunning(&self.running, ms);
                 }
+                continue;
             };
+            failed.reset();
         }
 
         std.log.info("[flo-worker] Worker stopped", .{});
@@ -575,6 +583,24 @@ test "ActionWorker.init turns block_ms 0 into 30000" {
         w.client.deinit();
     }
     try std.testing.expectEqual(@as(u32, 30000), w.config.block_ms);
+}
+
+test "ActionWorker gives its connection the retry policy it is configured with" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var endpoint_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "127.0.0.1:{d}", .{server.listen_address.getPort()});
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = endpoint, .retry = .{ .max_attempts = 7, .initial_backoff_ms = 30, .max_backoff_ms = 9 } });
+    // Not deinit: it sends a deregister the listener never answers.
+    defer {
+        w.handlers.deinit();
+        w.action_names.deinit(std.testing.allocator);
+        std.testing.allocator.free(w.worker_id);
+        w.client.deinit();
+    }
+    try std.testing.expectEqual(retry_mod.RetryPolicy{ .max_attempts = 7, .initial_backoff_ms = 30, .max_backoff_ms = 30 }, w.client.retry);
 }
 
 fn runWorker(w: *ActionWorker) void {

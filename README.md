@@ -88,6 +88,8 @@ var client = flo.Client.init(allocator, "localhost:9000", .{
     .namespace = "myapp",
     .timeout_ms = 10_000,  // 10 second timeout
     .debug = true,
+    // Retries of refused, not-run requests (these are the defaults)
+    .retry = .{ .max_attempts = 4, .initial_backoff_ms = 50, .max_backoff_ms = 1000 },
 });
 
 // Connect to server
@@ -479,15 +481,51 @@ All operations return `flo.FloError` which includes:
 - `BadRequest` - Invalid request
 - `Conflict` - CAS conflict
 - `Unauthorized` - Authentication required
-- `Overloaded` - Server overloaded (retryable)
+- `Overloaded` - Server overloaded, and the client's retries ran out
 - `RateLimited` - Request rate limit exceeded
-- `Unavailable` - No leader, or the shard isn't taking writes or is offline (retryable; an offline shard needs an operator)
+- `Unavailable` - No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (an offline shard needs an operator)
 - `InternalError` - Internal server error (not retryable: the write may have committed)
 - `UnexpectedResponse` - Unexpected response format
 - `ServerError` - Generic server error, including status codes this SDK doesn't know
 
 Zig errors carry no payload: after a failed call, `client.lastError()` gives the
 numeric status and the server's message.
+
+### Retries
+
+When the server refuses a request as `overloaded` or `unavailable` and says it
+didn't run it (`client.lastError().?.ran == .no`), the client sends it again
+itself, as a new request with a new request id, after a jittered wait. Because
+the server never ran it, this is safe for writes too. Any other refusal, or one
+that may have run, comes straight back.
+
+| `RetryPolicy` field | Default | |
+|---|---|---|
+| `max_attempts` | 4 | Tries in all, the first included; 1 turns retrying off |
+| `initial_backoff_ms` | 50 | Ceiling of the first wait; it doubles each retry |
+| `max_backoff_ms` | 1000 | Largest ceiling (raised to `initial_backoff_ms` if below it) |
+
+Each wait is uniform between 0 and its ceiling, so with the defaults a refused
+request is given back after at most about 350 ms of waiting, as
+`error.Overloaded` or `error.Unavailable` with `lastError()` describing the last
+refusal. The request goes again on the same connection; the server routes it
+afresh.
+
+The action and stream workers wait the same way between failed polls, from
+100 ms up to 5 s, starting again from 100 ms after a poll that succeeds; `stop()`
+ends a wait within about 10 ms. A stream worker retries a group join refused
+this way instead of stopping. `WorkerConfig` and `StreamWorkerConfig` take a `retry` field
+for the connection each worker opens.
+
+```zig
+// Up to 8 tries, waiting at most 2 s between them
+var client = flo.Client.init(allocator, "localhost:9000", .{
+    .retry = .{ .max_attempts = 8, .initial_backoff_ms = 100, .max_backoff_ms = 2000 },
+});
+
+// No retries
+var client = flo.Client.init(allocator, "localhost:9000", .{ .retry = .{ .max_attempts = 1 } });
+```
 
 ## Building
 
