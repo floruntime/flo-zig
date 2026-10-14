@@ -23,6 +23,8 @@ pub const OkServer = struct {
     last_payload_buf: [256 * 1024]u8 = undefined,
     last_payload_len: usize = 0,
     last_op: u16 = 0,
+    /// The request ids of the first requests, in order.
+    ids: [16]u64 = undefined,
 
     /// Listen on an ephemeral port. Call `start` once the value is at its
     /// final address.
@@ -68,7 +70,9 @@ pub const OkServer = struct {
             if (crc.final() != crc32) return;
             self.last_payload_len = payload_length;
             self.last_op = std.mem.readInt(u16, req[20..22], .little);
-            const n = self.requests.fetchAdd(1, .release);
+            const n = self.requests.load(.monotonic);
+            if (n < self.ids.len) self.ids[n] = request_id;
+            _ = self.requests.fetchAdd(1, .release);
             const reply: Reply = if (n < self.replies.len) self.replies[n] else .{ .status = 0, .body = self.body };
 
             var resp = [_]u8{0} ** 32;

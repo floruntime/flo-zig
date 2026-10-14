@@ -36,6 +36,7 @@ const types = @import("types.zig");
 const client_mod = @import("client.zig");
 const Client = client_mod.Client;
 const Actions = @import("actions.zig").Actions;
+const retry_mod = @import("retry.zig");
 
 const FloError = types.FloError;
 const TaskAssignment = types.TaskAssignment;
@@ -265,6 +266,7 @@ pub const ActionWorker = struct {
 
         self.running = true;
         self.last_heartbeat_ns = std.time.nanoTimestamp();
+        var failed = retry_mod.workerBackoff();
 
         // Main polling loop
         while (self.running) {
@@ -297,10 +299,13 @@ pub const ActionWorker = struct {
                     std.log.warn("[flo-worker] Connection lost: {}, reconnecting...", .{err});
                     self.client.disconnect();
                 } else {
-                    std.log.err("[flo-worker] Await error: {}, retrying...", .{err});
-                    std.Thread.sleep(1 * std.time.ns_per_s);
+                    const ms = failed.next(self.client.prng.random());
+                    std.log.err("[flo-worker] Await error: {}, retrying in {d}ms...", .{ err, ms });
+                    types.pauseWhileRunning(&self.running, ms);
                 }
+                continue;
             };
+            failed.reset();
         }
 
         std.log.info("[flo-worker] Worker stopped", .{});

@@ -181,6 +181,7 @@ pub const Ran = types.Ran;
 
 /// Client configuration options
 pub const ClientOptions = @import("client.zig").ClientOptions;
+pub const RetryPolicy = @import("retry.zig").RetryPolicy;
 
 /// Create a new connected client
 pub fn connect(allocator: std.mem.Allocator, endpoint: []const u8, options: ClientOptions) FloError!Client {
@@ -200,6 +201,7 @@ test {
     _ = @import("types.zig");
     _ = @import("wire.zig");
     _ = @import("client.zig");
+    _ = @import("retry.zig");
     _ = @import("kv.zig");
     _ = @import("queue.zig");
     _ = @import("stream.zig");

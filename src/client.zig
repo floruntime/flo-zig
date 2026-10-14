@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
+const retry = @import("retry.zig");
 
 const Allocator = std.mem.Allocator;
 const FloError = types.FloError;
@@ -25,6 +26,9 @@ pub const ClientOptions = struct {
     timeout_ms: u32 = 5_000,
     /// Enable debug logging
     debug: bool = false,
+    /// How a request the server refused without running it is sent again.
+    /// `.{ .max_attempts = 1 }` turns retrying off.
+    retry: retry.RetryPolicy = .{ .max_attempts = 4, .initial_backoff_ms = 50, .max_backoff_ms = 1000 },
 };
 
 /// Flo client for communicating with the server
@@ -42,6 +46,8 @@ pub const Client = struct {
     last_error_len: usize = 0,
     last_error_buf: [512]u8 = undefined,
     foreign_server: ?ForeignServer = null,
+    retry: retry.RetryPolicy = .{},
+    prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
 
     const Self = @This();
 
@@ -79,6 +85,8 @@ pub const Client = struct {
             .namespace = options.namespace,
             .timeout_ms = options.timeout_ms,
             .debug = options.debug,
+            .retry = options.retry.normalized(),
+            .prng = retry.seededPrng(),
         };
     }
 
@@ -171,8 +179,41 @@ pub const Client = struct {
     /// goes out.
     pub const max_request_size = 256 * 1024;
 
-    /// Send a request and receive response (low-level)
+    /// Send a request and receive response (low-level). A request the server
+    /// refuses without running it is sent again, as `retry` allows; after
+    /// the last try its refusal is returned like any other.
     pub fn sendRequest(
+        self: *Self,
+        op_code: OpCode,
+        namespace: []const u8,
+        key: []const u8,
+        value: []const u8,
+        options: []const u8,
+    ) FloError!wire.RawResponse {
+        var wait = retry.Backoff.init(self.retry.initial_backoff_ms, self.retry.max_backoff_ms);
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            var resp = try self.sendOnce(op_code, namespace, key, value, options);
+            // last_error_ran is set only when the refusal's body decoded.
+            if (attempt >= self.retry.max_attempts or self.last_error_code != @intFromEnum(resp.status) or
+                !retry.isRefusedUnrun(resp.status, self.last_error_ran)) return resp;
+            resp.deinit();
+            const ms = wait.next(self.prng.random());
+            if (self.debug) std.log.info("[flo] status {d}, not run: retrying in {d}ms", .{ self.last_error_code, ms });
+            std.Thread.sleep(ms * std.time.ns_per_ms);
+        }
+    }
+
+    /// Whether err is a refusal of the last request that the server says it
+    /// didn't run, of a kind worth trying again later.
+    pub fn refusedUnrun(self: *const Self, err: anyerror) bool {
+        if (err != FloError.Overloaded and err != FloError.Unavailable) return false;
+        const last = self.lastError() orelse return false;
+        return retry.isRefusedUnrun(@enumFromInt(last.code), last.ran);
+    }
+
+    /// Send a request once, under a new request id, and receive its response.
+    fn sendOnce(
         self: *Self,
         op_code: OpCode,
         namespace: []const u8,
@@ -712,4 +753,76 @@ test "two requests on one connection each read their whole response" {
         try std.testing.expectEqual(@as(usize, 0), resp.data.len);
     }
     try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.monotonic));
+}
+
+const fast_retry: retry.RetryPolicy = .{ .max_attempts = 4, .initial_backoff_ms = 1, .max_backoff_ms = 2 };
+
+/// Sends one kv.get to a started server; returns the response's status, or
+/// the error.
+fn getThrough(srv: *@import("test_server.zig").OkServer, policy: retry.RetryPolicy) !StatusCode {
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{ .retry = policy });
+    defer client.deinit();
+    try client.connect();
+    var resp = try client.sendRequest(.kv_get, "default", "k", "", "");
+    defer resp.deinit();
+    if (resp.status != .ok) {
+        const last = client.lastError().?;
+        try std.testing.expectEqual(@intFromEnum(resp.status), last.code);
+        try std.testing.expectEqualStrings("busy", last.message);
+    }
+    return resp.status;
+}
+
+test "a refusal the server didn't run is sent again as a new request" {
+    for ([_]u8{ 10, 12 }) |status| {
+        var srv = try @import("test_server.zig").OkServer.listen();
+        srv.replies = &.{.{ .status = status, .body = "\x0c\x00\x00busy" }};
+        try srv.start();
+        defer srv.deinit();
+        try std.testing.expectEqual(StatusCode.ok, try getThrough(&srv, fast_retry));
+        try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.acquire));
+        try std.testing.expect(srv.ids[0] != srv.ids[1]);
+    }
+}
+
+test "only refusals that didn't run are retried" {
+    const Case = struct { reply: @import("test_server.zig").Reply, want: anyerror!StatusCode };
+    const cases = [_]Case{
+        .{ .reply = .{ .status = 10, .body = "\x0c\x00\x02busy" }, .want = .overloaded }, // may have run
+        .{ .reply = .{ .status = 12, .body = "\x0c\x00\x01busy" }, .want = .unavailable }, // ran
+        .{ .reply = .{ .status = 8, .body = "\x0c\x00\x00busy" }, .want = .conflict },
+        .{ .reply = .{ .status = 10, .body = "\x0c\x00" }, .want = FloError.IncompleteResponse }, // no ran byte
+    };
+    for (cases) |c| {
+        var srv = try @import("test_server.zig").OkServer.listen();
+        srv.replies = &.{ c.reply, c.reply, c.reply, c.reply };
+        try srv.start();
+        defer srv.deinit();
+        const got = getThrough(&srv, fast_retry);
+        if (c.want) |want| {
+            try std.testing.expectEqual(want, try got);
+        } else |err| try std.testing.expectError(err, got);
+        try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
+    }
+}
+
+test "retries stop at max_attempts and return the last refusal" {
+    for ([_]u32{ 4, 1 }) |attempts| {
+        var srv = try @import("test_server.zig").OkServer.listen();
+        const refused: @import("test_server.zig").Reply = .{ .status = 10, .body = "\x0c\x00\x00busy" };
+        srv.replies = &.{ refused, refused, refused, refused, refused };
+        try srv.start();
+        defer srv.deinit();
+        var policy = fast_retry;
+        policy.max_attempts = attempts;
+        const status = try getThrough(&srv, policy);
+        try std.testing.expectEqual(FloError.Overloaded, status.toError());
+        try std.testing.expectEqual(attempts, srv.requests.load(.acquire));
+    }
+}
+
+test "a client's retry policy is normalised: max below initial becomes initial" {
+    var client = Client.init(std.testing.allocator, "localhost:9000", .{ .retry = .{ .initial_backoff_ms = 200, .max_backoff_ms = 5 } });
+    defer client.deinit();
+    try std.testing.expectEqual(@as(u64, 200), client.retry.max_backoff_ms);
 }

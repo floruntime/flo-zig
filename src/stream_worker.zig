@@ -33,6 +33,7 @@ const client_mod = @import("client.zig");
 const Client = client_mod.Client;
 const Stream = @import("stream.zig").Stream;
 const Actions = @import("actions.zig").Actions;
+const retry_mod = @import("retry.zig");
 
 const FloError = types.FloError;
 const StreamRecord = types.StreamRecord;
@@ -209,7 +210,11 @@ pub const StreamWorker = struct {
             self.consumer_name,
         });
 
+        // Set before the join, so stop() ends a join that is backing off.
+        self.running = true;
+        errdefer self.running = false;
         try self.joinGroups();
+        if (!self.running) return;
 
         // Register in worker registry with all streams as processes
         var process_names = try self.allocator.alloc([]u8, stream_list.len);
@@ -249,10 +254,10 @@ pub const StreamWorker = struct {
             std.log.warn("[flo-stream-worker] Failed to register in worker registry: {}", .{err});
         };
 
-        self.running = true;
         self.last_heartbeat_ns = std.time.nanoTimestamp();
 
         var stream_idx: usize = 0;
+        var failed = retry_mod.workerBackoff();
 
         // Main polling loop
         while (self.running) {
@@ -280,15 +285,18 @@ pub const StreamWorker = struct {
                 continue;
             }
 
-            self.pollAndProcess(stream_list[stream_idx]) catch |err| {
+            if (self.pollAndProcess(stream_list[stream_idx])) {
+                failed.reset();
+            } else |err| {
                 if (client_mod.isConnectionError(err)) {
                     std.log.warn("[flo-stream-worker] Connection lost: {}, reconnecting...", .{err});
                     self.client.disconnect();
                 } else {
-                    std.log.err("[flo-stream-worker] GroupRead error: {}, retrying...", .{err});
-                    std.Thread.sleep(1 * std.time.ns_per_s);
+                    const ms = failed.next(self.client.prng.random());
+                    std.log.err("[flo-stream-worker] GroupRead error: {}, retrying in {d}ms...", .{ err, ms });
+                    types.pauseWhileRunning(&self.running, ms);
                 }
-            };
+            }
 
             // Round-robin across streams
             stream_idx = (stream_idx + 1) % stream_list.len;
@@ -307,15 +315,30 @@ pub const StreamWorker = struct {
         try self.joinGroups();
     }
 
+    /// Join the group on every stream. A join the server refused without
+    /// running it (overloaded or unavailable, past the client's own retries)
+    /// is tried again with the worker backoff until it succeeds or the
+    /// worker stops; any other error is returned.
     fn joinGroups(self: *Self) !void {
         var stream = self.streamApi();
         for (self.config.getStreams()) |stream_name| {
-            try stream.groupJoin(
-                stream_name,
-                self.config.group,
-                self.consumer_name,
-                .{ .namespace = self.config.namespace },
-            );
+            var failed = retry_mod.workerBackoff();
+            while (true) {
+                stream.groupJoin(
+                    stream_name,
+                    self.config.group,
+                    self.consumer_name,
+                    .{ .namespace = self.config.namespace },
+                ) catch |err| {
+                    if (!self.client.refusedUnrun(err)) return err;
+                    const ms = failed.next(self.client.prng.random());
+                    std.log.warn("[flo-stream-worker] [{s}] Group join refused: {}, retrying in {d}ms...", .{ stream_name, err, ms });
+                    types.pauseWhileRunning(&self.running, ms);
+                    if (!@atomicLoad(bool, &self.running, .monotonic)) return;
+                    continue;
+                };
+                break;
+            }
         }
     }
 
@@ -571,6 +594,43 @@ test "StreamWorker sends requests on its own connection after init returns" {
 
     w.drain();
     try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.monotonic));
+}
+
+test "StreamWorker retries a group join the server refused without running" {
+    const handler = struct {
+        fn handle(_: *StreamContext) anyerror!void {}
+    }.handle;
+    const refused: @import("test_server.zig").Reply = .{ .status = 10, .body = "\x0c\x00\x00busy" };
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.replies = &.{ refused, refused, refused };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events" }, handler);
+    defer w.deinit();
+    w.client.retry.max_attempts = 1;
+    w.running = true;
+
+    try w.joinGroups();
+    try std.testing.expectEqual(@as(u32, 4), srv.requests.load(.acquire));
+    try std.testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.stream_group_join)), srv.last_op);
+}
+
+test "StreamWorker gives up a group join on any other refusal" {
+    const handler = struct {
+        fn handle(_: *StreamContext) anyerror!void {}
+    }.handle;
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.replies = &.{.{ .status = 10, .body = "\x0c\x00\x02busy" }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events" }, handler);
+    defer w.deinit();
+    w.running = true;
+
+    try std.testing.expectError(FloError.Overloaded, w.joinGroups());
+    try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
 }
 
 test "StreamWorker paces group reads that come back empty at once" {

@@ -1354,7 +1354,8 @@ test "status 12 and an unknown status each surface with their message, and the n
     try srv.start();
     defer srv.deinit();
 
-    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    // Not retried, so the second call reads the next reply.
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{ .retry = .{ .max_attempts = 1 } });
     defer client.deinit();
     try client.connect();
     var kv = KV.init(&client);
