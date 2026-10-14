@@ -455,16 +455,6 @@ try processing.stop(job_id, .{});
 // Force-cancel a job
 try processing.cancel(job_id, .{});
 
-// Create a savepoint
-const sp_id = try processing.savepoint(allocator, job_id, .{});
-defer allocator.free(sp_id);
-
-// Restore from savepoint
-try processing.restore(job_id, sp_id, .{});
-
-// Change parallelism
-try processing.rescale(job_id, 8, .{});
-
 // Declarative sync (submit from YAML bytes)
 var result = try processing.syncBytes(allocator, yaml_bytes, .{});
 defer result.deinit();

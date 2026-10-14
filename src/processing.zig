@@ -1,7 +1,6 @@
 //! Flo Processing Operations
 //!
-//! Stream processing job management: submit, status, list, stop, cancel,
-//! savepoint, restore, rescale.
+//! Stream processing job management: submit, status, list, stop, cancel.
 //!
 //! ## Example
 //!
@@ -173,81 +172,6 @@ pub const Processing = struct {
         }
     }
 
-    /// Trigger a savepoint for a processing job.
-    /// Returns the savepoint ID (caller owns the slice).
-    pub fn savepoint(
-        self: *Self,
-        allocator: Allocator,
-        job_id: []const u8,
-        options: types.ProcessingSavepointOptions,
-    ) FloError![]u8 {
-        const ns = self.client.getNamespace(options.namespace);
-
-        var response = try self.client.sendRequest(
-            .processing_savepoint,
-            ns,
-            job_id,
-            "",
-            "",
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
-
-        return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
-    }
-
-    /// Restore a processing job from a savepoint.
-    pub fn restore(
-        self: *Self,
-        job_id: []const u8,
-        savepoint_id: []const u8,
-        options: types.ProcessingRestoreOptions,
-    ) FloError!void {
-        const ns = self.client.getNamespace(options.namespace);
-
-        var response = try self.client.sendRequest(
-            .processing_restore,
-            ns,
-            job_id,
-            savepoint_id,
-            "",
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
-    }
-
-    /// Change the parallelism of a processing job.
-    pub fn rescale(
-        self: *Self,
-        job_id: []const u8,
-        parallelism: u32,
-        options: types.ProcessingRescaleOptions,
-    ) FloError!void {
-        const ns = self.client.getNamespace(options.namespace);
-
-        var value_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &value_buf, parallelism, .little);
-
-        var response = try self.client.sendRequest(
-            .processing_rescale,
-            ns,
-            job_id,
-            &value_buf,
-            "",
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
-    }
-
     // =========================================================================
     // Declarative Sync
     // =========================================================================
@@ -283,7 +207,7 @@ pub const Processing = struct {
 /// Parse the binary wire format for processing job status.
 ///
 /// Wire format: [job_id_len:u16][job_id][name_len:u16][name][status:u8]
-///              [parallelism:u32][batch_size:u32][records_processed:u64][created_at:i64]
+///              [batch_size:u32][records_processed:u64][created_at:i64]
 fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.ProcessingStatusResult {
     var pos: usize = 0;
 
@@ -316,11 +240,6 @@ fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.Processi
     const status_owned = try allocator.dupe(u8, status_str);
     errdefer allocator.free(status_owned);
 
-    // Read parallelism (u32)
-    if (pos + 4 > data.len) return error.UnexpectedEndOfData;
-    const parallelism = std.mem.readInt(u32, data[pos..][0..4], .little);
-    pos += 4;
-
     // Read batch_size (u32)
     if (pos + 4 > data.len) return error.UnexpectedEndOfData;
     const batch_size = std.mem.readInt(u32, data[pos..][0..4], .little);
@@ -339,7 +258,6 @@ fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.Processi
         .job_id = job_id,
         .name = name,
         .status = status_owned,
-        .parallelism = parallelism,
         .batch_size = batch_size,
         .records_processed = records_processed,
         .created_at = created_at,
@@ -350,7 +268,7 @@ fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.Processi
 /// Parse the binary wire format for processing job list.
 ///
 /// Wire format: [count:u32]([name_len:u16][name][job_id_len:u16][job_id]
-///              [status_len:u16][status][parallelism:u32][created_at:i64])*
+///              [status_len:u16][status][created_at:i64])*
 ///              [has_more:u8][cursor_len:u16][cursor]
 fn parseProcessingList(allocator: Allocator, data: []const u8) !types.ProcessingListResult {
     if (data.len < 4) return error.UnexpectedEndOfData;
@@ -396,11 +314,6 @@ fn parseProcessingList(allocator: Allocator, data: []const u8) !types.Processing
         errdefer allocator.free(status_str);
         pos += status_len;
 
-        // Read parallelism (u32)
-        if (pos + 4 > data.len) return error.UnexpectedEndOfData;
-        const parallelism = std.mem.readInt(u32, data[pos..][0..4], .little);
-        pos += 4;
-
         // Read created_at (i64)
         if (pos + 8 > data.len) return error.UnexpectedEndOfData;
         const created_at = std.mem.readInt(i64, data[pos..][0..8], .little);
@@ -410,7 +323,6 @@ fn parseProcessingList(allocator: Allocator, data: []const u8) !types.Processing
             .name = name,
             .job_id = job_id,
             .status = status_str,
-            .parallelism = parallelism,
             .created_at = created_at,
         };
     }
@@ -480,4 +392,31 @@ test "list sends [limit][cursor] in the value and returns the next cursor" {
     try std.testing.expectEqual(@as(usize, 0), result.entries.len);
     try std.testing.expect(result.has_more);
     try std.testing.expectEqualStrings("c2", result.cursor.?);
+}
+
+test "status and list answers decode per the server's layouts" {
+    const a = std.testing.allocator;
+    // job_id "j1", name "p", status 1 (stopped), batch_size 50, records 1234, created_at 99
+    const status_body = [_]u8{ 2, 0, 'j', '1', 1, 0, 'p', 1, 50, 0, 0, 0 } ++
+        [_]u8{ 0xd2, 0x04, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 99, 0, 0, 0, 0, 0, 0, 0 };
+    var st = try parseProcessingStatus(a, &status_body);
+    defer st.deinit();
+    try std.testing.expectEqualStrings("j1", st.job_id);
+    try std.testing.expectEqualStrings("p", st.name);
+    try std.testing.expectEqualStrings("stopped", st.status);
+    try std.testing.expectEqual(@as(u32, 50), st.batch_size);
+    try std.testing.expectEqual(@as(u64, 1234), st.records_processed);
+    try std.testing.expectEqual(@as(i64, 99), st.created_at);
+
+    // One entry: name "p", job_id "j1", status "running", created_at 7; no more pages.
+    const list_body = [_]u8{ 1, 0, 0, 0, 1, 0, 'p', 2, 0, 'j', '1', 7, 0 } ++ "running".* ++
+        [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 0 };
+    var list = try parseProcessingList(a, &list_body);
+    defer list.deinit();
+    try std.testing.expectEqual(@as(usize, 1), list.entries.len);
+    try std.testing.expectEqualStrings("p", list.entries[0].name);
+    try std.testing.expectEqualStrings("j1", list.entries[0].job_id);
+    try std.testing.expectEqualStrings("running", list.entries[0].status);
+    try std.testing.expectEqual(@as(i64, 7), list.entries[0].created_at);
+    try std.testing.expect(!list.has_more);
 }
