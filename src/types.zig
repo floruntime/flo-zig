@@ -901,7 +901,7 @@ pub const StreamGroupReadOptions = struct {
 pub const StreamGroupAckOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Consumer ID (required for correct ack matching)
+    /// Consumer ID. Sent, but the server doesn't check it: any consumer can ack an entry.
     consumer: []const u8 = "",
 };
 
@@ -909,7 +909,7 @@ pub const StreamGroupAckOptions = struct {
 pub const StreamGroupNackOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Consumer ID (required for correct nack matching)
+    /// Consumer ID. Sent, but the server doesn't check it: any consumer can nack an entry.
     consumer: []const u8 = "",
 };
 
