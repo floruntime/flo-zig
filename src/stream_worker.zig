@@ -267,7 +267,7 @@ pub const StreamWorker = struct {
             if (!self.client.isConnected()) {
                 self.reconnect() catch |err| {
                     std.log.err("[flo-stream-worker] Reconnect failed: {}, retrying...", .{err});
-                    std.Thread.sleep(1 * std.time.ns_per_s);
+                    types.pauseWhileRunning(&self.running, 1_000);
                     continue;
                 };
             }
@@ -311,9 +311,10 @@ pub const StreamWorker = struct {
         });
     }
 
-    /// Open a fresh connection and join the groups on it again.
+    /// Open a fresh connection and join the groups on it again. Gives up
+    /// once the worker is stopped.
     fn reconnect(self: *Self) !void {
-        try self.client.reconnect();
+        try self.client.reconnectWhile(&self.running);
         errdefer self.client.disconnect();
         try self.joinGroups();
     }
@@ -416,12 +417,16 @@ pub const StreamWorker = struct {
         for (result.records) |record| {
             self.active_tasks += 1;
             defer self.active_tasks -= 1;
-            self.processRecord(stream_name, record);
+            // Once a result has gone astray with its connection, the rest of
+            // the batch is not run: it was read on the lost connection, and
+            // stays pending for this consumer until the server hands it out
+            // again (claim or the pending sweeper).
+            if (self.processRecord(stream_name, record) == .connection_lost) break;
         }
     }
 
     /// Process a single record with auto-ack/nack.
-    fn processRecord(self: *Self, stream_name: []const u8, record: StreamRecord) void {
+    fn processRecord(self: *Self, stream_name: []const u8, record: StreamRecord) Delivery {
         var ctx = StreamContext{
             .record = record,
             .namespace = self.config.namespace,
@@ -431,35 +436,62 @@ pub const StreamWorker = struct {
             .allocator = self.allocator,
         };
 
-        var stream = self.streamApi();
+        // The handler's outcome alone decides ack or nack: an ack that can't
+        // be delivered is never turned into a nack.
         if (self.handler(&ctx)) {
-            // Success - auto-ack
             self.messages_processed += 1;
-            var ids = [_]StreamID{record.id};
-            stream.groupAck(
-                stream_name,
-                self.config.group,
-                &ids,
-                .{ .namespace = self.config.namespace },
-            ) catch |err| {
-                std.log.err("[flo-stream-worker] Failed to ack record {}: {}", .{ record.id, err });
-            };
+            return self.report(stream_name, record.id, .ack);
         } else |err| {
-            // Failure - nack
             self.messages_failed += 1;
             std.log.err("[flo-stream-worker] Record {} failed: {}", .{ record.id, err });
-            var ids = [_]StreamID{record.id};
-            stream.groupNack(
-                stream_name,
-                self.config.group,
-                &ids,
-                .{ .namespace = self.config.namespace },
-            ) catch |nack_err| {
-                std.log.err("[flo-stream-worker] Failed to nack record {}: {}", .{ record.id, nack_err });
+            return self.report(stream_name, record.id, .nack);
+        }
+    }
+
+    const Delivery = enum { delivered, refused, connection_lost };
+
+    /// Deliver a record's ack or nack. A send lost to a dropped connection or
+    /// a timeout is sent again, unchanged, on a fresh connection that has
+    /// rejoined the groups, up to max_result_sends in all. A refusal is not
+    /// sent again: the server answered. An undelivered result is logged and
+    /// the record stays pending, so it may be handled again.
+    fn report(self: *Self, stream_name: []const u8, id: StreamID, kind: enum { ack, nack }) Delivery {
+        var stream = self.streamApi();
+        const ids = [_]StreamID{id};
+        var sends: u32 = 0;
+        var lost = false;
+        while (true) {
+            sends += 1;
+            const result = switch (kind) {
+                .ack => stream.groupAck(stream_name, self.config.group, &ids, .{ .namespace = self.config.namespace }),
+                .nack => stream.groupNack(stream_name, self.config.group, &ids, .{ .namespace = self.config.namespace }),
             };
+            const err = if (result) return if (lost) .connection_lost else .delivered else |e| e;
+            if (!client_mod.isConnectionError(err)) {
+                types.logDropped("[flo-stream-worker] {s} of record {} refused: {}; dropped", .{ @tagName(kind), id, err });
+                return if (lost) .connection_lost else .refused;
+            }
+            lost = true;
+            if (sends >= max_result_sends) {
+                types.logDropped("[flo-stream-worker] {s} of record {} not delivered after {d} sends: {}; dropped", .{ @tagName(kind), id, sends, err });
+                return .connection_lost;
+            }
+            self.client.disconnect();
+            self.reconnect() catch |rerr| {
+                if (!@atomicLoad(bool, &self.running, .monotonic)) {
+                    types.logDropped("[flo-stream-worker] {s} of record {} not delivered: worker stopping; dropped", .{ @tagName(kind), id });
+                } else {
+                    types.logDropped("[flo-stream-worker] {s} of record {} not delivered: reconnect failed: {}; dropped", .{ @tagName(kind), id, rerr });
+                }
+                return .connection_lost;
+            };
+            std.log.warn("[flo-stream-worker] {s} of record {} lost: {}; resending", .{ @tagName(kind), id, err });
         }
     }
 };
+
+/// Sends of one ack or nack, the first included, before it is dropped.
+const max_result_sends = 3;
 
 /// Generate a random worker ID.
 fn generateWorkerId(allocator: Allocator) ![]u8 {
@@ -665,4 +697,66 @@ test "StreamWorker paces group reads that come back empty at once" {
     for (0..4) |_| try w.pollAndProcess("events");
     try std.testing.expectEqual(@as(u32, 4), w.backoff.early_empties);
     try std.testing.expect(timer.read() >= 340 * std.time.ns_per_ms);
+}
+
+test "StreamWorker resends an ack lost with its connection, never nacks it, and runs no more of the batch" {
+    const counting = struct {
+        var handled: u32 = 0;
+        fn handle(_: *StreamContext) anyerror!void {
+            handled += 1;
+        }
+    };
+    // [count:u32] then per record: [seq:u64][ts:u64][tier:u8][partition:u32]
+    // [key_present:u8][payload_len:u32]["hi"][header_count:u32]
+    const record = "\x00" ** 8 ++ "\x00" ++ "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4;
+    const records = "\x02\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ record ++ "\x08" ++ "\x00" ** 7 ++ record;
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = records } } },
+        .{ .op = .stream_group_ack, .nth = 0, .action = .drop },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, counting.handle);
+    defer w.deinit();
+    w.running = true;
+    try w.pollAndProcess("events");
+
+    try std.testing.expectEqual(@as(u32, 1), counting.handled);
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.stream_group_ack));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_nack));
+    // The group is joined again on the new connection before the resend.
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_join));
+    try std.testing.expect(@import("test_server.zig").sameApartFromId(srv.requestOf(.stream_group_ack, 0), srv.requestOf(.stream_group_ack, 1)));
+}
+
+test "StreamWorker does not resend an ack the server refused, and runs the rest of the batch" {
+    const counting = struct {
+        var handled: u32 = 0;
+        fn handle(_: *StreamContext) anyerror!void {
+            handled += 1;
+        }
+    };
+    const record = "\x00" ** 8 ++ "\x00" ++ "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4;
+    const records = "\x02\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ record ++ "\x08" ++ "\x00" ** 7 ++ record;
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = records } } },
+        .{ .op = .stream_group_ack, .nth = 0, .action = .{ .reply = .{ .status = @intFromEnum(types.StatusCode.conflict), .body = "\x09\x00\x01gone" } } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, counting.handle);
+    defer w.deinit();
+    w.running = true;
+    try w.pollAndProcess("events");
+
+    try std.testing.expectEqual(@as(u32, 2), counting.handled);
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.stream_group_ack));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_nack));
+    try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
 }

@@ -132,6 +132,155 @@ pub const OkServer = struct {
     }
 };
 
+/// A loopback server for worker tests that serves one connection after
+/// another and answers each request as the first matching `Rule` says
+/// (empty OK by default). It keeps every request's op and raw bytes, header
+/// included.
+pub const ScriptServer = struct {
+    pub const Action = union(enum) {
+        reply: Reply,
+        /// Hang up without answering.
+        drop,
+        /// Never answer; wait for the client to hang up.
+        stall,
+    };
+
+    pub const Rule = struct {
+        op: types.OpCode,
+        /// Which request with `op` (0 = the first) this rule answers; null
+        /// for all of them.
+        nth: ?u32 = null,
+        action: Action,
+    };
+
+    pub const Request = struct {
+        op: types.OpCode,
+        len: usize,
+        bytes: [512]u8,
+    };
+
+    server: std.net.Server,
+    thread: std.Thread = undefined,
+    rules: []const Rule = &.{},
+    endpoint_buf: [32]u8 = undefined,
+    endpoint: []const u8 = "",
+    stopping: std.atomic.Value(bool) = .init(false),
+    connections: std.atomic.Value(u32) = .init(0),
+    mutex: std.Thread.Mutex = .{},
+    log: [64]Request = undefined,
+    count: usize = 0,
+
+    pub fn listen() !ScriptServer {
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+        return .{ .server = try addr.listen(.{}) };
+    }
+
+    pub fn start(self: *ScriptServer) !void {
+        self.endpoint = try std.fmt.bufPrint(&self.endpoint_buf, "127.0.0.1:{d}", .{self.server.listen_address.getPort()});
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    /// Wait for the client to hang up its connection, then stop listening.
+    pub fn deinit(self: *ScriptServer) void {
+        self.stopping.store(true, .release);
+        if (std.net.tcpConnectToAddress(self.server.listen_address)) |s| s.close() else |_| {}
+        self.thread.join();
+        self.server.deinit();
+    }
+
+    /// How many requests with `op` arrived.
+    pub fn countOf(self: *ScriptServer, op: types.OpCode) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var n: u32 = 0;
+        for (self.log[0..self.count]) |r| n += @intFromBool(r.op == op);
+        return n;
+    }
+
+    /// The `nth` request with `op` (0 = the first), header included.
+    pub fn requestOf(self: *ScriptServer, op: types.OpCode, nth: u32) []const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var n: u32 = 0;
+        for (self.log[0..self.count]) |*r| {
+            if (r.op != op) continue;
+            if (n == nth) return r.bytes[0..r.len];
+            n += 1;
+        }
+        return "";
+    }
+
+    fn serve(self: *ScriptServer) void {
+        var seen = std.EnumArray(types.OpCode, u32).initFill(0);
+        while (true) {
+            const conn = self.server.accept() catch return;
+            defer conn.stream.close();
+            if (self.stopping.load(.acquire)) return;
+            _ = self.connections.fetchAdd(1, .monotonic);
+            while (true) {
+                var req: Request = undefined;
+                OkServer.readAll(conn.stream, req.bytes[0..32]) catch break;
+                const payload_length = std.mem.readInt(u32, req.bytes[4..8], .little);
+                const request_id = std.mem.readInt(u64, req.bytes[8..16], .little);
+                req.op = @enumFromInt(std.mem.readInt(u16, req.bytes[20..22], .little));
+                if (32 + payload_length > req.bytes.len) return;
+                OkServer.readAll(conn.stream, req.bytes[32..][0..payload_length]) catch break;
+                req.len = 32 + payload_length;
+
+                const nth = seen.get(req.op);
+                seen.set(req.op, nth + 1);
+                var action: Action = .{ .reply = .{ .status = 0 } };
+                for (self.rules) |rule| {
+                    if (rule.op == req.op and (rule.nth == null or rule.nth.? == nth)) {
+                        action = rule.action;
+                        break;
+                    }
+                }
+                {
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+                    if (self.count < self.log.len) {
+                        self.log[self.count] = req;
+                        self.count += 1;
+                    }
+                }
+                switch (action) {
+                    .drop => break,
+                    .stall => {
+                        var buf: [256]u8 = undefined;
+                        while ((conn.stream.read(&buf) catch 0) > 0) {}
+                        break;
+                    },
+                    .reply => |r| reply(conn.stream, request_id, r) catch break,
+                }
+            }
+        }
+    }
+
+    fn reply(stream: std.net.Stream, request_id: u64, r: Reply) !void {
+        var h = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, h[0..4], types.MAGIC, .little);
+        std.mem.writeInt(u32, h[4..8], @intCast(r.body.len), .little);
+        std.mem.writeInt(u64, h[8..16], request_id, .little);
+        h[20] = types.VERSION;
+        h[21] = r.status;
+        std.mem.writeInt(u64, h[24..32], types.TABLE_HASH, .little);
+        var crc = std.hash.Crc32.init();
+        crc.update(h[0..16]);
+        crc.update(h[20..32]);
+        std.mem.writeInt(u32, h[16..20], crc.final(), .little);
+        try stream.writeAll(&h);
+        try stream.writeAll(r.body);
+    }
+};
+
+/// Whether two requests are the same apart from their request id and the
+/// header CRC that covers it.
+pub fn sameApartFromId(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len or a.len < 32) return false;
+    return std.mem.eql(u8, a[0..8], b[0..8]) and std.mem.eql(u8, a[20..], b[20..]);
+}
+
 /// Overwrite the stack below the caller, as later calls would, so a pointer
 /// into a returned function's frame no longer reads as what it held.
 pub noinline fn clobberStack() void {
