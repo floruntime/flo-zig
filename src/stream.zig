@@ -465,16 +465,15 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
     const count = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
 
-    var records = allocator.alloc(types.StreamRecord, count) catch return FloError.OutOfMemory;
+    const records = allocator.alloc(types.StreamRecord, count) catch return FloError.OutOfMemory;
+    // Only records[0..i] are filled; an answer cut short frees those alone.
+    var i: u32 = 0;
     errdefer {
-        for (records) |*r| {
-            r.deinit(allocator);
-        }
+        for (records[0..i]) |*r| r.deinit(allocator);
         allocator.free(records);
     }
 
-    var i: u32 = 0;
-    while (i < count and pos < data.len) : (i += 1) {
+    while (i < count) : (i += 1) {
         // Read sequence
         if (pos + 8 > data.len) return FloError.IncompleteResponse;
         const sequence = std.mem.readInt(u64, data[pos..][0..8], .little);
@@ -489,7 +488,7 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
         if (pos + 1 > data.len) return FloError.IncompleteResponse;
         const tier_byte = data[pos];
         pos += 1;
-        const tier: types.StorageTier = @enumFromInt(tier_byte);
+        const tier = std.meta.intToEnum(types.StorageTier, tier_byte) catch return FloError.IncompleteResponse;
 
         // Skip partition
         if (pos + 4 > data.len) return FloError.IncompleteResponse;
@@ -510,6 +509,7 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
             stream_name = allocator.dupe(u8, data[pos..][0..key_len]) catch return FloError.OutOfMemory;
             pos += key_len;
         }
+        errdefer if (stream_name.len > 0) allocator.free(stream_name);
 
         // Read payload
         if (pos + 4 > data.len) return FloError.IncompleteResponse;
@@ -518,13 +518,11 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
 
         if (pos + payload_len > data.len) return FloError.IncompleteResponse;
         const payload = allocator.dupe(u8, data[pos..][0..payload_len]) catch return FloError.OutOfMemory;
+        errdefer allocator.free(payload);
         pos += payload_len;
 
         // Read headers: [header_count:u32]([key_len:u32][key][val_len:u32][val])*
-        if (pos + 4 > data.len) {
-            allocator.free(payload);
-            return FloError.IncompleteResponse;
-        }
+        if (pos + 4 > data.len) return FloError.IncompleteResponse;
         const header_count = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
 
@@ -534,33 +532,18 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
             const headers_start = pos;
             var h: u32 = 0;
             while (h < header_count) : (h += 1) {
-                if (pos + 4 > data.len) {
-                    allocator.free(payload);
-                    return FloError.IncompleteResponse;
-                }
+                if (pos + 4 > data.len) return FloError.IncompleteResponse;
                 const hkey_len = std.mem.readInt(u32, data[pos..][0..4], .little);
                 pos += 4;
-                if (pos + hkey_len > data.len) {
-                    allocator.free(payload);
-                    return FloError.IncompleteResponse;
-                }
+                if (pos + hkey_len > data.len) return FloError.IncompleteResponse;
                 pos += hkey_len;
-                if (pos + 4 > data.len) {
-                    allocator.free(payload);
-                    return FloError.IncompleteResponse;
-                }
+                if (pos + 4 > data.len) return FloError.IncompleteResponse;
                 const hval_len = std.mem.readInt(u32, data[pos..][0..4], .little);
                 pos += 4;
-                if (pos + hval_len > data.len) {
-                    allocator.free(payload);
-                    return FloError.IncompleteResponse;
-                }
+                if (pos + hval_len > data.len) return FloError.IncompleteResponse;
                 pos += hval_len;
             }
-            headers = allocator.dupe(u8, data[headers_start..pos]) catch {
-                allocator.free(payload);
-                return FloError.OutOfMemory;
-            };
+            headers = allocator.dupe(u8, data[headers_start..pos]) catch return FloError.OutOfMemory;
         }
 
         records[i] = .{
@@ -576,7 +559,7 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
     }
 
     return types.StreamReadResult{
-        .records = records[0..i],
+        .records = records,
         .allocator = allocator,
     };
 }
@@ -592,4 +575,63 @@ test "Stream init" {
 
     const stream = Stream.init(&client);
     _ = stream;
+}
+
+test "a record's tier byte reads as the server sends it: 0 hot, 1 warm, anything else refused" {
+    // [count=1][seq][ts][tier][partition][key_present=0][payload_len=0][header_count=0]
+    var buf = [_]u8{0} ** (4 + 8 + 8 + 1 + 4 + 1 + 4 + 4);
+    std.mem.writeInt(u32, buf[0..4], 1, .little);
+    for ([_]struct { u8, types.StorageTier }{ .{ 0, .hot }, .{ 1, .warm } }) |c| {
+        buf[20] = c[0];
+        var result = try parseStreamReadResponse(std.testing.allocator, &buf);
+        defer result.deinit();
+        try std.testing.expectEqual(c[1], result.records[0].tier);
+    }
+    buf[20] = 2;
+    try std.testing.expectError(FloError.IncompleteResponse, parseStreamReadResponse(std.testing.allocator, &buf));
+}
+
+/// A read answer of `n` records, each with a stream name, payload and one header.
+fn testReadAnswer(a: std.mem.Allocator, list: *std.ArrayList(u8), n: u32) !void {
+    try list.appendSlice(a, &std.mem.toBytes(n));
+    for (0..n) |_| {
+        try list.appendSlice(a, &([_]u8{0} ** 16)); // seq, ts
+        try list.append(a, 0); // tier
+        try list.appendSlice(a, &([_]u8{0} ** 4)); // partition
+        try list.append(a, 1); // key_present
+        try list.appendSlice(a, &std.mem.toBytes(@as(u32, 1)));
+        try list.append(a, 's');
+        try list.appendSlice(a, &std.mem.toBytes(@as(u32, 2)));
+        try list.appendSlice(a, "hi");
+        try list.appendSlice(a, &std.mem.toBytes(@as(u32, 1)));
+        try list.appendSlice(a, &std.mem.toBytes(@as(u32, 1)));
+        try list.append(a, 'k');
+        try list.appendSlice(a, &std.mem.toBytes(@as(u32, 1)));
+        try list.append(a, 'v');
+    }
+}
+
+test "a read answer cut anywhere is refused without leaking or freeing what it never filled" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(a);
+    try testReadAnswer(a, &list, 2);
+    var whole = try parseStreamReadResponse(a, list.items);
+    whole.deinit();
+    for (4..list.items.len) |n| {
+        try std.testing.expectError(FloError.IncompleteResponse, parseStreamReadResponse(a, list.items[0..n]));
+    }
+}
+
+fn parseAndFree(a: std.mem.Allocator, data: []const u8) !void {
+    var result = try parseStreamReadResponse(a, data);
+    result.deinit();
+}
+
+test "a read answer that runs out of memory partway frees what it filled" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(a);
+    try testReadAnswer(a, &list, 3);
+    try std.testing.checkAllAllocationFailures(a, parseAndFree, .{list.items});
 }
