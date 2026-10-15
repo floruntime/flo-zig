@@ -591,13 +591,10 @@ test "a record's tier byte reads as the server sends it: 0 hot, 1 warm, anything
     try std.testing.expectError(FloError.IncompleteResponse, parseStreamReadResponse(std.testing.allocator, &buf));
 }
 
-test "a read answer cut anywhere is refused without leaking or freeing what it never filled" {
-    // Two records, the first with a stream name, payload and one header.
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    const a = std.testing.allocator;
-    try list.appendSlice(a, &std.mem.toBytes(@as(u32, 2)));
-    for (0..2) |_| {
+/// A read answer of `n` records, each with a stream name, payload and one header.
+fn testReadAnswer(a: std.mem.Allocator, list: *std.ArrayList(u8), n: u32) !void {
+    try list.appendSlice(a, &std.mem.toBytes(n));
+    for (0..n) |_| {
         try list.appendSlice(a, &([_]u8{0} ** 16)); // seq, ts
         try list.append(a, 0); // tier
         try list.appendSlice(a, &([_]u8{0} ** 4)); // partition
@@ -612,9 +609,29 @@ test "a read answer cut anywhere is refused without leaking or freeing what it n
         try list.appendSlice(a, &std.mem.toBytes(@as(u32, 1)));
         try list.append(a, 'v');
     }
+}
+
+test "a read answer cut anywhere is refused without leaking or freeing what it never filled" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(a);
+    try testReadAnswer(a, &list, 2);
     var whole = try parseStreamReadResponse(a, list.items);
     whole.deinit();
     for (4..list.items.len) |n| {
         try std.testing.expectError(FloError.IncompleteResponse, parseStreamReadResponse(a, list.items[0..n]));
     }
+}
+
+fn parseAndFree(a: std.mem.Allocator, data: []const u8) !void {
+    var result = try parseStreamReadResponse(a, data);
+    result.deinit();
+}
+
+test "a read answer that runs out of memory partway frees what it filled" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(a);
+    try testReadAnswer(a, &list, 3);
+    try std.testing.checkAllAllocationFailures(a, parseAndFree, .{list.items});
 }
