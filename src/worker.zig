@@ -276,7 +276,7 @@ pub const ActionWorker = struct {
             if (!self.client.isConnected()) {
                 self.reconnect() catch |err| {
                     std.log.err("[flo-worker] Reconnect failed: {}, retrying...", .{err});
-                    std.Thread.sleep(1 * std.time.ns_per_s);
+                    types.pauseWhileRunning(&self.running, 1_000);
                     continue;
                 };
             }
@@ -314,9 +314,24 @@ pub const ActionWorker = struct {
         std.log.info("[flo-worker] Worker stopped", .{});
     }
 
-    /// Open a fresh connection and register on it again.
+    /// Open a fresh connection and register on it again. Gives up once the
+    /// worker is stopped.
     fn reconnect(self: *Self) !void {
-        try self.client.reconnect();
+        try self.client.reconnectWhile(&self.running);
+        errdefer self.client.disconnect();
+        try self.registerWorker();
+    }
+
+    /// Reconnect to resend a lost result. A stopping worker still tries,
+    /// for about stopping_reconnect_ms, so a result produced as it stops
+    /// isn't lost to a brief drop, yet stop isn't held up for long.
+    fn reconnectForResult(self: *Self) !void {
+        if (@atomicLoad(bool, &self.running, .monotonic)) {
+            if (self.reconnect()) return else |err| {
+                if (@atomicLoad(bool, &self.running, .monotonic)) return err;
+            }
+        }
+        try self.client.reconnectFor(stopping_reconnect_ms);
         errdefer self.client.disconnect();
         try self.registerWorker();
     }
@@ -348,7 +363,7 @@ pub const ActionWorker = struct {
     /// Stop the worker immediately.
     pub fn stop(self: *Self) void {
         std.log.info("[flo-worker] Stopping worker...", .{});
-        self.running = false;
+        @atomicStore(bool, &self.running, false, .monotonic);
     }
 
     /// Initiate graceful drain — finish current tasks but accept no new ones.
@@ -432,13 +447,7 @@ pub const ActionWorker = struct {
         // Get handler
         const handler = self.handlers.get(task.task_type) orelse {
             std.log.err("[flo-worker] No handler for action: {s}", .{task.task_type});
-            actions.fail(
-                self.worker_id,
-                task.task_type,
-                task.task_id,
-                "No handler registered",
-                .{ .namespace = self.config.namespace },
-            ) catch {};
+            _ = self.report(task, .{ .fail = .{ .message = "No handler registered" } });
             return;
         };
 
@@ -457,66 +466,86 @@ pub const ActionWorker = struct {
             .worker_id = self.worker_id,
         };
 
-        // Execute handler
+        // The handler's outcome alone decides complete or fail: a complete
+        // that can't be delivered is never turned into a fail.
         if (handler(&ctx)) |handler_result| {
-            switch (handler_result) {
-                .bytes => |data| {
+            const sent = switch (handler_result) {
+                .bytes => |data| blk: {
                     defer self.allocator.free(data);
-
-                    // Raw bytes — complete with default outcome
-                    actions.complete(
-                        self.worker_id,
-                        task.task_type,
-                        task.task_id,
-                        data,
-                        .{ .namespace = self.config.namespace },
-                    ) catch |err| {
-                        std.log.err("[flo-worker] Failed to report completion: {}", .{err});
-                    };
+                    break :blk self.report(task, .{ .complete = .{ .data = data } });
                 },
-                .result => |ar| {
-                    if (ar.owned) {
-                        defer self.allocator.free(ar.data);
-                    }
-
-                    // Named outcome
-                    actions.complete(
-                        self.worker_id,
-                        task.task_type,
-                        task.task_id,
-                        ar.data,
-                        .{ .namespace = self.config.namespace, .outcome = ar.outcome },
-                    ) catch |err| {
-                        std.log.err("[flo-worker] Failed to report completion: {}", .{err});
-                    };
+                .result => |ar| blk: {
+                    defer if (ar.owned) self.allocator.free(ar.data);
+                    break :blk self.report(task, .{ .complete = .{ .data = ar.data, .outcome = ar.outcome } });
                 },
-            }
-
-            std.log.info("[flo-worker] Action completed: {s}", .{task.task_type});
+            };
+            if (sent) std.log.info("[flo-worker] Action completed: {s} (task={s})", .{ task.task_type, task.task_id });
         } else |err| {
             // Failure — check if non-retryable
             var error_buf: [256]u8 = undefined;
             const error_msg = std.fmt.bufPrint(&error_buf, "{}", .{err}) catch "Unknown error";
 
-            const retry = err != error.NonRetryable;
-
             std.log.err("[flo-worker] Action failed: {s} - {s}", .{ task.task_type, error_msg });
+            _ = self.report(task, .{ .fail = .{ .message = error_msg, .retry = err != error.NonRetryable } });
+        }
+    }
 
-            actions.fail(
-                self.worker_id,
-                task.task_type,
-                task.task_id,
-                error_msg,
-                .{
+    /// A task's result, as the handler decided it.
+    const Report = union(enum) {
+        complete: struct { data: []const u8, outcome: []const u8 = "success" },
+        fail: struct { message: []const u8, retry: bool = false },
+    };
+
+    /// Deliver a task's result. A send lost to a dropped connection or a
+    /// timeout is sent again, unchanged, on a fresh connection, up to
+    /// max_result_sends in all; the server may then see it twice, which it
+    /// must treat as one. A refusal is not sent again: the server answered.
+    /// Returns whether the server accepted it; otherwise the drop is logged
+    /// and the task is left to its lease, so it may run again.
+    fn report(self: *Self, task: *const TaskAssignment, rep: Report) bool {
+        const kind = @tagName(rep);
+        var actions = self.api();
+        var sends: u32 = 0;
+        while (true) {
+            sends += 1;
+            const result = switch (rep) {
+                .complete => |c| actions.complete(self.worker_id, task.task_type, task.task_id, c.data, .{
                     .namespace = self.config.namespace,
-                    .retry = retry,
-                },
-            ) catch |fail_err| {
-                std.log.err("[flo-worker] Failed to report failure: {}", .{fail_err});
+                    .outcome = c.outcome,
+                }),
+                .fail => |f| actions.fail(self.worker_id, task.task_type, task.task_id, f.message, .{
+                    .namespace = self.config.namespace,
+                    .retry = f.retry,
+                }),
             };
+            const err = if (result) return true else |e| e;
+            if (!client_mod.isConnectionError(err)) {
+                types.logDropped("[flo-worker] {s} for task {s} refused: {}; dropped", .{ kind, task.task_id, err });
+                return false;
+            }
+            if (sends >= max_result_sends) {
+                types.logDropped("[flo-worker] {s} for task {s} not delivered after {d} sends: {}; dropped", .{ kind, task.task_id, sends, err });
+                return false;
+            }
+            self.client.disconnect();
+            self.reconnectForResult() catch |rerr| {
+                if (!@atomicLoad(bool, &self.running, .monotonic)) {
+                    types.logDropped("[flo-worker] {s} for task {s} not delivered: worker stopping and reconnect failed: {}; dropped", .{ kind, task.task_id, rerr });
+                } else {
+                    types.logDropped("[flo-worker] {s} for task {s} not delivered: reconnect failed: {}; dropped", .{ kind, task.task_id, rerr });
+                }
+                return false;
+            };
+            std.log.warn("[flo-worker] {s} for task {s} lost: {}; resending", .{ kind, task.task_id, err });
         }
     }
 };
+
+/// How long a stopping worker keeps trying to reconnect to resend a result.
+const stopping_reconnect_ms = 2_000;
+
+/// Sends of one result, the first included, before it is dropped.
+const max_result_sends = 3;
 
 /// Generate a random worker ID.
 fn generateWorkerId(allocator: Allocator) ![]u8 {
@@ -665,4 +694,151 @@ test "ActionWorker paces awaits that come back empty at once" {
     for (0..4) |_| try w.pollAndExecute();
     try std.testing.expectEqual(@as(u32, 4), w.backoff.early_empties);
     try std.testing.expect(timer.read() >= 340 * std.time.ns_per_ms);
+}
+
+const ScriptServer = @import("test_server.zig").ScriptServer;
+
+// [task_id_len:u16]["t1"][task_type_len:u16]["job"][created_at:i64][attempt:u32][has_caller:u8]
+const test_task = "\x02\x00t1\x03\x00job" ++ "\x00" ** 8 ++ "\x01\x00\x00\x00" ++ "\x00";
+
+const test_handlers = struct {
+    fn ok(ctx: *ActionContext) anyerror!ActionHandlerResult {
+        return .{ .bytes = try ctx.allocator.dupe(u8, "done") };
+    }
+};
+
+/// Init a worker on `srv` with action "job", then poll once: the await gets
+/// `test_task` and the handler runs.
+fn pollOnce(srv: *ScriptServer, w: *ActionWorker, timeout_ms: u32) !void {
+    w.* = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    w.client.timeout_ms = timeout_ms;
+    try w.registerAction("job", test_handlers.ok);
+    w.running = true;
+    try w.pollAndExecute();
+}
+
+test "ActionWorker resends a complete lost with its connection, unchanged, and never fails the task" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } },
+        .{ .op = .action_complete, .nth = 0, .action = .drop },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w: ActionWorker = undefined;
+    try pollOnce(&srv, &w, 5_000);
+    defer w.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.action_complete));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_fail));
+    // Registered again on the new connection before the resend.
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
+    try std.testing.expectEqual(@as(u32, 2), srv.connections.load(.monotonic));
+    const first = srv.requestOf(.action_complete, 0);
+    const second = srv.requestOf(.action_complete, 1);
+    try std.testing.expect(!std.mem.eql(u8, first[8..16], second[8..16]));
+    try std.testing.expect(@import("test_server.zig").sameApartFromId(first, second));
+}
+
+test "ActionWorker resends a complete that timed out and never fails the task" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } },
+        .{ .op = .action_complete, .nth = 0, .action = .stall },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w: ActionWorker = undefined;
+    try pollOnce(&srv, &w, 200);
+    defer w.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.action_complete));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_fail));
+}
+
+test "ActionWorker does not resend a complete the server refused" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } },
+        .{ .op = .action_complete, .action = .{ .reply = .{ .status = @intFromEnum(types.StatusCode.conflict), .body = "\x09\x00\x01gone" } } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w: ActionWorker = undefined;
+    try pollOnce(&srv, &w, 5_000);
+    defer w.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_complete));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_fail));
+    try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
+}
+
+test "ActionWorker sends a result at most three times, then drops it" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } },
+        .{ .op = .action_complete, .action = .drop },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w: ActionWorker = undefined;
+    try pollOnce(&srv, &w, 5_000);
+    defer w.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), srv.countOf(.action_complete));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_fail));
+}
+
+/// Init a worker on `srv`, take `test_task`, stop the worker, then run the
+/// task, so its result is reported while stopping.
+fn executeWhileStopping(srv: *ScriptServer, w: *ActionWorker) !void {
+    w.* = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    try w.registerAction("job", test_handlers.ok);
+    w.running = true;
+    var actions = w.api();
+    var task = (try actions.awaitTask(w.worker_id, w.action_names.items, .{ .block_ms = 100 })).?;
+    defer task.deinit();
+    w.stop();
+    w.executeTask(&task);
+}
+
+test "ActionWorker still resends a lost result while stopping" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } },
+        .{ .op = .action_complete, .nth = 0, .action = .drop },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w: ActionWorker = undefined;
+    try executeWhileStopping(&srv, &w);
+    defer w.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.action_complete));
+    try std.testing.expectEqual(@as(u32, 2), srv.connections.load(.monotonic));
+}
+
+test "ActionWorker drops a lost result after about 2 s of reconnecting while stopping" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } },
+        .{ .op = .action_complete, .nth = 0, .action = .close },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var timer = try std.time.Timer.start();
+    var w: ActionWorker = undefined;
+    try executeWhileStopping(&srv, &w);
+    defer w.deinit();
+    const elapsed_ms = timer.read() / std.time.ns_per_ms;
+
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_complete));
+    try std.testing.expect(!w.client.isConnected());
+    try std.testing.expect(elapsed_ms >= 1_900 and elapsed_ms < 4_000);
 }

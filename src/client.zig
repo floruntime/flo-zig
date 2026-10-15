@@ -143,20 +143,38 @@ pub const Client = struct {
     /// Reconnect with exponential backoff.
     /// Retries up to ~5 minutes with delays: 1s, 2s, 4s, 8s, 16s, 30s (cap).
     pub fn reconnect(self: *Self) FloError!void {
+        const always = true;
+        return self.reconnectLoop(&always, 5 * 60 * 1_000);
+    }
+
+    /// `reconnect`, giving up with `FloError.ConnectionFailed` once
+    /// `running` turns false; a wait between tries ends within about 10 ms.
+    pub fn reconnectWhile(self: *Self, running: *const bool) FloError!void {
+        return self.reconnectLoop(running, 5 * 60 * 1_000);
+    }
+
+    /// `reconnect`, giving up with `FloError.ConnectionFailed` after about
+    /// `max_total_ms`.
+    pub fn reconnectFor(self: *Self, max_total_ms: u64) FloError!void {
+        const always = true;
+        return self.reconnectLoop(&always, max_total_ms);
+    }
+
+    fn reconnectLoop(self: *Self, running: *const bool, max_total_ms: u64) FloError!void {
         self.disconnect();
 
         const max_delay_ms: u64 = 30_000;
-        const max_total_ms: u64 = 5 * 60 * 1_000;
         var delay_ms: u64 = 1_000;
         var total_ms: u64 = 0;
 
-        while (total_ms < max_total_ms) {
+        while (total_ms < max_total_ms and @atomicLoad(bool, running, .monotonic)) {
             self.connect() catch {
+                const wait_ms = @min(delay_ms, max_total_ms - total_ms);
                 if (self.debug) {
-                    std.log.info("[flo] Reconnect failed, retrying in {d}ms...", .{delay_ms});
+                    std.log.info("[flo] Reconnect failed, retrying in {d}ms...", .{wait_ms});
                 }
-                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
-                total_ms += delay_ms;
+                types.pauseWhileRunning(running, wait_ms);
+                total_ms += wait_ms;
                 delay_ms = @min(delay_ms * 2, max_delay_ms);
                 continue;
             };

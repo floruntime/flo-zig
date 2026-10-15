@@ -164,6 +164,13 @@ pub fn pauseWhileRunning(running: *const bool, ms: u64) void {
     }
 }
 
+/// Log a worker result that was given up on. It is an error, but logged as a
+/// warning under test: the test runner fails any test that logs an error,
+/// and the worker tests drop results on purpose.
+pub fn logDropped(comptime format: []const u8, args: anytype) void {
+    if (@import("builtin").is_test) std.log.warn(format, args) else std.log.err(format, args);
+}
+
 /// Operation codes
 ///
 /// Three-layer layout: Infra(0x000-0x0FF), Data(0x100-0x2FF), Compute(0x300-0x3FF)
@@ -894,7 +901,7 @@ pub const StreamGroupReadOptions = struct {
 pub const StreamGroupAckOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Consumer ID (required for correct ack matching)
+    /// Consumer ID. Sent, but the server doesn't check it: any consumer can ack an entry.
     consumer: []const u8 = "",
 };
 
@@ -902,7 +909,7 @@ pub const StreamGroupAckOptions = struct {
 pub const StreamGroupNackOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Consumer ID (required for correct nack matching)
+    /// Consumer ID. Sent, but the server doesn't check it: any consumer can nack an entry.
     consumer: []const u8 = "",
 };
 

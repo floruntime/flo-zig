@@ -517,6 +517,11 @@ ends a wait within about 10 ms. A stream worker retries a group join refused
 this way instead of stopping. `WorkerConfig` and `StreamWorkerConfig` take a `retry` field
 for the connection each worker opens.
 
+A worker whose complete, fail, ack or nack is lost with its connection (or
+times out) reconnects and sends the same result again, up to three sends in
+all; a refusal is not resent. Delivery is at-least-once: a handler may see a
+task or record again, so make handlers safe to repeat.
+
 ```zig
 // Up to 8 tries, waiting at most 2 s between them
 var client = flo.Client.init(allocator, "localhost:9000", .{
