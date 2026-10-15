@@ -143,6 +143,9 @@ pub const ScriptServer = struct {
         drop,
         /// Never answer; wait for the client to hang up.
         stall,
+        /// Hang up without answering and stop listening, so reconnects are
+        /// refused.
+        close,
     };
 
     pub const Rule = struct {
@@ -165,6 +168,7 @@ pub const ScriptServer = struct {
     endpoint_buf: [32]u8 = undefined,
     endpoint: []const u8 = "",
     stopping: std.atomic.Value(bool) = .init(false),
+    closed: bool = false,
     connections: std.atomic.Value(u32) = .init(0),
     mutex: std.Thread.Mutex = .{},
     log: [64]Request = undefined,
@@ -185,7 +189,7 @@ pub const ScriptServer = struct {
         self.stopping.store(true, .release);
         if (std.net.tcpConnectToAddress(self.server.listen_address)) |s| s.close() else |_| {}
         self.thread.join();
-        self.server.deinit();
+        if (!self.closed) self.server.deinit();
     }
 
     /// How many requests with `op` arrived.
@@ -246,6 +250,11 @@ pub const ScriptServer = struct {
                 }
                 switch (action) {
                     .drop => break,
+                    .close => {
+                        self.server.deinit();
+                        self.closed = true;
+                        return;
+                    },
                     .stall => {
                         var buf: [256]u8 = undefined;
                         while ((conn.stream.read(&buf) catch 0) > 0) {}

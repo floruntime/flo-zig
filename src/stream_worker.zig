@@ -319,6 +319,20 @@ pub const StreamWorker = struct {
         try self.joinGroups();
     }
 
+    /// Reconnect to resend a lost result. A stopping worker still tries,
+    /// for about stopping_reconnect_ms, so a result produced as it stops
+    /// isn't lost to a brief drop, yet stop isn't held up for long.
+    fn reconnectForResult(self: *Self) !void {
+        if (@atomicLoad(bool, &self.running, .monotonic)) {
+            if (self.reconnect()) return else |err| {
+                if (@atomicLoad(bool, &self.running, .monotonic)) return err;
+            }
+        }
+        try self.client.reconnectFor(stopping_reconnect_ms);
+        errdefer self.client.disconnect();
+        try self.joinGroups();
+    }
+
     /// Join the group on every stream. A join the server refused without
     /// running it (overloaded or unavailable, past the client's own retries)
     /// is tried again with the worker backoff until it succeeds or the
@@ -349,7 +363,7 @@ pub const StreamWorker = struct {
     /// Stop the worker immediately.
     pub fn stop(self: *Self) void {
         std.log.info("[flo-stream-worker] Stopping...", .{});
-        self.running = false;
+        @atomicStore(bool, &self.running, false, .monotonic);
     }
 
     /// Initiate graceful drain.
@@ -417,16 +431,16 @@ pub const StreamWorker = struct {
         for (result.records) |record| {
             self.active_tasks += 1;
             defer self.active_tasks -= 1;
-            // Once a result has gone astray with its connection, the rest of
-            // the batch is not run: it was read on the lost connection, and
-            // stays pending for this consumer until the server hands it out
-            // again (claim or the pending sweeper).
-            if (self.processRecord(stream_name, record) == .connection_lost) break;
+            // A result resent on a new connection doesn't end the batch: the
+            // pending list is keyed by consumer name, not connection, so the
+            // rest is still this consumer's to ack, and group reads never
+            // serve pending records again.
+            self.processRecord(stream_name, record);
         }
     }
 
     /// Process a single record with auto-ack/nack.
-    fn processRecord(self: *Self, stream_name: []const u8, record: StreamRecord) Delivery {
+    fn processRecord(self: *Self, stream_name: []const u8, record: StreamRecord) void {
         var ctx = StreamContext{
             .record = record,
             .namespace = self.config.namespace,
@@ -440,55 +454,54 @@ pub const StreamWorker = struct {
         // be delivered is never turned into a nack.
         if (self.handler(&ctx)) {
             self.messages_processed += 1;
-            return self.report(stream_name, record.id, .ack);
+            self.report(stream_name, record.id, .ack);
         } else |err| {
             self.messages_failed += 1;
             std.log.err("[flo-stream-worker] Record {} failed: {}", .{ record.id, err });
-            return self.report(stream_name, record.id, .nack);
+            self.report(stream_name, record.id, .nack);
         }
     }
-
-    const Delivery = enum { delivered, refused, connection_lost };
 
     /// Deliver a record's ack or nack. A send lost to a dropped connection or
     /// a timeout is sent again, unchanged, on a fresh connection that has
     /// rejoined the groups, up to max_result_sends in all. A refusal is not
-    /// sent again: the server answered. An undelivered result is logged and
-    /// the record stays pending, so it may be handled again.
-    fn report(self: *Self, stream_name: []const u8, id: StreamID, kind: enum { ack, nack }) Delivery {
+    /// sent again: the server answered. An undelivered result is logged; the
+    /// record stays in this consumer's pending list.
+    fn report(self: *Self, stream_name: []const u8, id: StreamID, kind: enum { ack, nack }) void {
         var stream = self.streamApi();
         const ids = [_]StreamID{id};
         var sends: u32 = 0;
-        var lost = false;
         while (true) {
             sends += 1;
             const result = switch (kind) {
                 .ack => stream.groupAck(stream_name, self.config.group, &ids, .{ .namespace = self.config.namespace }),
                 .nack => stream.groupNack(stream_name, self.config.group, &ids, .{ .namespace = self.config.namespace }),
             };
-            const err = if (result) return if (lost) .connection_lost else .delivered else |e| e;
+            const err = if (result) return else |e| e;
             if (!client_mod.isConnectionError(err)) {
                 types.logDropped("[flo-stream-worker] {s} of record {} refused: {}; dropped", .{ @tagName(kind), id, err });
-                return if (lost) .connection_lost else .refused;
+                return;
             }
-            lost = true;
             if (sends >= max_result_sends) {
                 types.logDropped("[flo-stream-worker] {s} of record {} not delivered after {d} sends: {}; dropped", .{ @tagName(kind), id, sends, err });
-                return .connection_lost;
+                return;
             }
             self.client.disconnect();
-            self.reconnect() catch |rerr| {
+            self.reconnectForResult() catch |rerr| {
                 if (!@atomicLoad(bool, &self.running, .monotonic)) {
-                    types.logDropped("[flo-stream-worker] {s} of record {} not delivered: worker stopping; dropped", .{ @tagName(kind), id });
+                    types.logDropped("[flo-stream-worker] {s} of record {} not delivered: worker stopping and reconnect failed: {}; dropped", .{ @tagName(kind), id, rerr });
                 } else {
                     types.logDropped("[flo-stream-worker] {s} of record {} not delivered: reconnect failed: {}; dropped", .{ @tagName(kind), id, rerr });
                 }
-                return .connection_lost;
+                return;
             };
             std.log.warn("[flo-stream-worker] {s} of record {} lost: {}; resending", .{ @tagName(kind), id, err });
         }
     }
 };
+
+/// How long a stopping worker keeps trying to reconnect to resend a result.
+const stopping_reconnect_ms = 2_000;
 
 /// Sends of one ack or nack, the first included, before it is dropped.
 const max_result_sends = 3;
@@ -699,7 +712,7 @@ test "StreamWorker paces group reads that come back empty at once" {
     try std.testing.expect(timer.read() >= 340 * std.time.ns_per_ms);
 }
 
-test "StreamWorker resends an ack lost with its connection, never nacks it, and runs no more of the batch" {
+test "StreamWorker resends an ack lost with its connection, never nacks it, and acks the rest of the batch on the new one" {
     const counting = struct {
         var handled: u32 = 0;
         fn handle(_: *StreamContext) anyerror!void {
@@ -724,12 +737,16 @@ test "StreamWorker resends an ack lost with its connection, never nacks it, and 
     w.running = true;
     try w.pollAndProcess("events");
 
-    try std.testing.expectEqual(@as(u32, 1), counting.handled);
-    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.stream_group_ack));
+    try std.testing.expectEqual(@as(u32, 2), counting.handled);
+    try std.testing.expectEqual(@as(u32, 3), srv.countOf(.stream_group_ack));
     try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_nack));
+    try std.testing.expectEqual(@as(u32, 2), srv.connections.load(.monotonic));
     // The group is joined again on the new connection before the resend.
     try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_join));
-    try std.testing.expect(@import("test_server.zig").sameApartFromId(srv.requestOf(.stream_group_ack, 0), srv.requestOf(.stream_group_ack, 1)));
+    const sameApartFromId = @import("test_server.zig").sameApartFromId;
+    try std.testing.expect(sameApartFromId(srv.requestOf(.stream_group_ack, 0), srv.requestOf(.stream_group_ack, 1)));
+    // The third ack is the second record's.
+    try std.testing.expect(!sameApartFromId(srv.requestOf(.stream_group_ack, 1), srv.requestOf(.stream_group_ack, 2)));
 }
 
 test "StreamWorker does not resend an ack the server refused, and runs the rest of the batch" {

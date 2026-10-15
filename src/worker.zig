@@ -322,6 +322,20 @@ pub const ActionWorker = struct {
         try self.registerWorker();
     }
 
+    /// Reconnect to resend a lost result. A stopping worker still tries,
+    /// for about stopping_reconnect_ms, so a result produced as it stops
+    /// isn't lost to a brief drop, yet stop isn't held up for long.
+    fn reconnectForResult(self: *Self) !void {
+        if (@atomicLoad(bool, &self.running, .monotonic)) {
+            if (self.reconnect()) return else |err| {
+                if (@atomicLoad(bool, &self.running, .monotonic)) return err;
+            }
+        }
+        try self.client.reconnectFor(stopping_reconnect_ms);
+        errdefer self.client.disconnect();
+        try self.registerWorker();
+    }
+
     fn registerWorker(self: *Self) !void {
         // Build process list for registration
         var processes: [64]types.ProcessEntry = undefined;
@@ -349,7 +363,7 @@ pub const ActionWorker = struct {
     /// Stop the worker immediately.
     pub fn stop(self: *Self) void {
         std.log.info("[flo-worker] Stopping worker...", .{});
-        self.running = false;
+        @atomicStore(bool, &self.running, false, .monotonic);
     }
 
     /// Initiate graceful drain — finish current tasks but accept no new ones.
@@ -514,9 +528,9 @@ pub const ActionWorker = struct {
                 return false;
             }
             self.client.disconnect();
-            self.reconnect() catch |rerr| {
+            self.reconnectForResult() catch |rerr| {
                 if (!@atomicLoad(bool, &self.running, .monotonic)) {
-                    types.logDropped("[flo-worker] {s} for task {s} not delivered: worker stopping; dropped", .{ kind, task.task_id });
+                    types.logDropped("[flo-worker] {s} for task {s} not delivered: worker stopping and reconnect failed: {}; dropped", .{ kind, task.task_id, rerr });
                 } else {
                     types.logDropped("[flo-worker] {s} for task {s} not delivered: reconnect failed: {}; dropped", .{ kind, task.task_id, rerr });
                 }
@@ -526,6 +540,9 @@ pub const ActionWorker = struct {
         }
     }
 };
+
+/// How long a stopping worker keeps trying to reconnect to resend a result.
+const stopping_reconnect_ms = 2_000;
 
 /// Sends of one result, the first included, before it is dropped.
 const max_result_sends = 3;
@@ -776,17 +793,10 @@ test "ActionWorker sends a result at most three times, then drops it" {
     try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_fail));
 }
 
-test "ActionWorker drops a lost result instead of reconnecting once stopped" {
-    var srv = try ScriptServer.listen();
-    srv.rules = &.{
-        .{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } },
-        .{ .op = .action_complete, .action = .drop },
-    };
-    try srv.start();
-    defer srv.deinit();
-
-    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
-    defer w.deinit();
+/// Init a worker on `srv`, take `test_task`, stop the worker, then run the
+/// task, so its result is reported while stopping.
+fn executeWhileStopping(srv: *ScriptServer, w: *ActionWorker) !void {
+    w.* = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
     try w.registerAction("job", test_handlers.ok);
     w.running = true;
     var actions = w.api();
@@ -794,7 +804,41 @@ test "ActionWorker drops a lost result instead of reconnecting once stopped" {
     defer task.deinit();
     w.stop();
     w.executeTask(&task);
+}
+
+test "ActionWorker still resends a lost result while stopping" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } },
+        .{ .op = .action_complete, .nth = 0, .action = .drop },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w: ActionWorker = undefined;
+    try executeWhileStopping(&srv, &w);
+    defer w.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.action_complete));
+    try std.testing.expectEqual(@as(u32, 2), srv.connections.load(.monotonic));
+}
+
+test "ActionWorker drops a lost result after about 2 s of reconnecting while stopping" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } },
+        .{ .op = .action_complete, .nth = 0, .action = .close },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var timer = try std.time.Timer.start();
+    var w: ActionWorker = undefined;
+    try executeWhileStopping(&srv, &w);
+    defer w.deinit();
+    const elapsed_ms = timer.read() / std.time.ns_per_ms;
 
     try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_complete));
-    try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
+    try std.testing.expect(!w.client.isConnected());
+    try std.testing.expect(elapsed_ms >= 1_900 and elapsed_ms < 4_000);
 }
