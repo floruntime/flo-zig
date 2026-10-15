@@ -778,11 +778,11 @@ pub const StreamID = struct {
 };
 
 /// Storage tier for stream records
+/// The tier a stream record was served from: the in-memory log, or the warm
+/// store after it left the log. These are the only two the server sends.
 pub const StorageTier = enum(u8) {
     hot = 0,
-    pending = 1,
-    warm = 2,
-    cold = 3,
+    warm = 1,
 };
 
 /// A single stream record
