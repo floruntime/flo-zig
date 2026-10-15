@@ -310,7 +310,7 @@ pub const Actions = struct {
 
         // Server responds with [status:u8]
         if (response.data.len >= 1) {
-            return @enumFromInt(response.data[0]);
+            return std.meta.intToEnum(types.WorkerStatus, response.data[0]) catch FloError.IncompleteResponse;
         }
         return .active;
     }
@@ -633,7 +633,9 @@ fn parseTaskAssignment(allocator: std.mem.Allocator, data: []const u8) FloError!
 
     // caller block: [has_caller:u8][run_id_len:u16][run_id][wf_name_len:u16][wf_name]
     var caller_run_id: ?[]const u8 = null;
+    errdefer if (caller_run_id) |c| allocator.free(c);
     var caller_workflow_name: ?[]const u8 = null;
+    errdefer if (caller_workflow_name) |c| allocator.free(c);
 
     if (pos + 1 <= data.len) {
         const has_caller = data[pos];
@@ -702,7 +704,7 @@ fn parseActionRunStatus(allocator: std.mem.Allocator, data: []const u8) FloError
 
     // Status
     if (pos + 1 > data.len) return FloError.IncompleteResponse;
-    const status: types.RunStatus = @enumFromInt(data[pos]);
+    const status = std.meta.intToEnum(types.RunStatus, data[pos]) catch return FloError.IncompleteResponse;
     pos += 1;
 
     // Created at
@@ -812,4 +814,46 @@ test "encodeInvokeValue refuses a value that does not fit the buffer" {
     var buf: [8]u8 = undefined;
     try std.testing.expectError(FloError.ValueTooLarge, encodeInvokeValue(&buf, null, "12345678"));
     try std.testing.expectError(FloError.ValueTooLarge, encodeInvokeValue(&buf, "{}", "1234"));
+}
+
+/// A task assignment with a caller block and a payload.
+fn testTaskAssignment(a: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
+    for ([_][]const u8{ "task-1", "charge" }) |s| {
+        try list.appendSlice(a, &std.mem.toBytes(@as(u16, @intCast(s.len))));
+        try list.appendSlice(a, s);
+    }
+    try list.appendSlice(a, &std.mem.toBytes(@as(i64, 1000)));
+    try list.appendSlice(a, &std.mem.toBytes(@as(u32, 1)));
+    try list.append(a, 1);
+    for ([_][]const u8{ "run-1", "checkout" }) |s| {
+        try list.appendSlice(a, &std.mem.toBytes(@as(u16, @intCast(s.len))));
+        try list.appendSlice(a, s);
+    }
+    try list.appendSlice(a, "payload");
+}
+
+fn parseTaskAndFree(a: std.mem.Allocator, data: []const u8) !void {
+    if (try parseTaskAssignment(a, data)) |t| {
+        var task = t;
+        task.deinit();
+    }
+}
+
+test "a task assignment cut anywhere or short of memory leaks nothing" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(a);
+    try testTaskAssignment(a, &list);
+    // The caller block and payload are optional, so some cuts still parse.
+    for (0..list.items.len + 1) |n| parseTaskAndFree(a, list.items[0..n]) catch |err| try std.testing.expectEqual(FloError.IncompleteResponse, err);
+    try std.testing.checkAllAllocationFailures(a, parseTaskAndFree, .{list.items});
+}
+
+test "a run status byte this client doesn't know refuses the answer" {
+    // [run_id_len][run_id][status][created_at][has_started][has_completed][has_output][has_error][retry_count]
+    var buf = [_]u8{0} ** (2 + 1 + 1 + 8 + 4 + 4);
+    std.mem.writeInt(u16, buf[0..2], 1, .little);
+    buf[2] = 'r';
+    buf[3] = 200;
+    try std.testing.expectError(FloError.IncompleteResponse, parseActionRunStatus(std.testing.allocator, &buf));
 }

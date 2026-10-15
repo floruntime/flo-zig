@@ -465,6 +465,12 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
     const count = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
 
+    // Each record: [seq:u64][ts:i64][tier:u8][partition:u32][key_present:u8]
+    //              [payload_len:u32][payload][header_count:u32]
+    // A count the data can't hold is refused before it sizes an allocation.
+    const min_record = 8 + 8 + 1 + 4 + 1 + 4 + 4;
+    if (count > (data.len - pos) / min_record) return FloError.IncompleteResponse;
+
     const records = allocator.alloc(types.StreamRecord, count) catch return FloError.OutOfMemory;
     // Only records[0..i] are filled; an answer cut short frees those alone.
     var i: u32 = 0;
@@ -634,4 +640,10 @@ test "a read answer that runs out of memory partway frees what it filled" {
     defer list.deinit(a);
     try testReadAnswer(a, &list, 3);
     try std.testing.checkAllAllocationFailures(a, parseAndFree, .{list.items});
+}
+
+test "a read answer whose count the data can't hold is refused before allocating" {
+    var buf = [_]u8{0} ** (4 + 30);
+    std.mem.writeInt(u32, buf[0..4], 0xffff_ffff, .little);
+    try std.testing.expectError(FloError.IncompleteResponse, parseStreamReadResponse(std.testing.allocator, &buf));
 }

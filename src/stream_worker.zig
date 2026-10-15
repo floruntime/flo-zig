@@ -221,8 +221,10 @@ pub const StreamWorker = struct {
 
         // Register in worker registry with all streams as processes
         var process_names = try self.allocator.alloc([]u8, stream_list.len);
+        // Only the names allocated so far: allocPrint can fail partway.
+        var named: usize = 0;
         defer {
-            for (process_names) |name| self.allocator.free(name);
+            for (process_names[0..named]) |name| self.allocator.free(name);
             self.allocator.free(process_names);
         }
 
@@ -235,6 +237,7 @@ pub const StreamWorker = struct {
                 "{s}/{s}",
                 .{ stream_name, self.config.group },
             );
+            named += 1;
             process_entries[i] = .{
                 .name = process_names[i],
                 .kind = .stream_consumer,
