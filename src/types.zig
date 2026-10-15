@@ -13,7 +13,7 @@ pub const VERSION: u8 = 0x02;
 /// The hash of the op table this SDK was built for, written into every
 /// request header. A server built from another table refuses the request,
 /// and its answers carry its own hash, which this SDK refuses.
-pub const TABLE_HASH: u64 = 0xc93e40aa0f2795fe;
+pub const TABLE_HASH: u64 = 0x5194dd26f737dba9;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -58,6 +58,9 @@ pub const Reason = enum(u16) {
     wrong_type = 24,
     /// The shard holds as many open transactions as it may.
     too_many_transactions = 25,
+    /// An action complete or fail for a run that has moved on (another worker
+    /// holds it, or it finished). It was dropped; resending it is refused too.
+    stale_report = 26,
 };
 
 /// Whether a refused request took effect: retry logic reads this, not the
@@ -299,9 +302,6 @@ pub const OpCode = enum(u16) {
     processing_cancel = 0x362,
     processing_status = 0x363,
     processing_list = 0x364,
-    processing_savepoint = 0x365,
-    processing_restore = 0x366,
-    processing_rescale = 0x367,
 
     _,
 };
@@ -1236,18 +1236,6 @@ pub const ProcessingCancelOptions = struct {
     namespace: ?[]const u8 = null,
 };
 
-pub const ProcessingSavepointOptions = struct {
-    namespace: ?[]const u8 = null,
-};
-
-pub const ProcessingRestoreOptions = struct {
-    namespace: ?[]const u8 = null,
-};
-
-pub const ProcessingRescaleOptions = struct {
-    namespace: ?[]const u8 = null,
-};
-
 pub const ProcessingSyncOptions = struct {
     namespace: ?[]const u8 = null,
 };
@@ -1257,7 +1245,6 @@ pub const ProcessingStatusResult = struct {
     job_id: []const u8,
     name: []const u8,
     status: []const u8,
-    parallelism: u32,
     batch_size: u32,
     records_processed: u64,
     created_at: i64,
@@ -1275,7 +1262,6 @@ pub const ProcessingListEntry = struct {
     name: []const u8,
     job_id: []const u8,
     status: []const u8,
-    parallelism: u32,
     created_at: i64,
 
     pub fn deinit(self: *ProcessingListEntry, allocator: std.mem.Allocator) void {

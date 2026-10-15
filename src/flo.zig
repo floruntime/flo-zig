@@ -163,9 +163,6 @@ pub const ProcessingStatusOptions = types.ProcessingStatusOptions;
 pub const ProcessingListOptions = types.ProcessingListOptions;
 pub const ProcessingStopOptions = types.ProcessingStopOptions;
 pub const ProcessingCancelOptions = types.ProcessingCancelOptions;
-pub const ProcessingSavepointOptions = types.ProcessingSavepointOptions;
-pub const ProcessingRestoreOptions = types.ProcessingRestoreOptions;
-pub const ProcessingRescaleOptions = types.ProcessingRescaleOptions;
 pub const ProcessingSyncOptions = types.ProcessingSyncOptions;
 
 // Protocol constants
