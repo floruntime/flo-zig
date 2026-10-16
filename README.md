@@ -347,6 +347,12 @@ allocator must then be thread-safe. It's off by default; without it, call `ctx.t
 from long handlers. An action's `owner` may be up to 1024 bytes here (the wire allows a
 u16 length).
 
+`WorkerConfig.concurrency` is how many tasks an `ActionWorker` runs at once. The default,
+1, runs them one after another on the polling loop. Above 1, each runs on a thread and a
+connection of its own, so handlers must be safe to run concurrently and the worker's
+allocator must be thread-safe (a GPA, `c_allocator` or `page_allocator`, not an arena).
+`start` and `deinit` wait for running handlers to return, however long they take.
+
 ```zig
 var actions = flo.Actions.init(&client);
 
