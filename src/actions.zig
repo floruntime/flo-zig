@@ -743,12 +743,17 @@ test "a task assignment cut anywhere or short of memory leaks nothing" {
 }
 
 /// A completed run's status answer: started, completed, attempt 2, output "ok", no error.
-const completed_status_answer = [_]u8{2} ++ std.mem.toBytes(@as(i64, 100)) ++
-    [_]u8{1} ++ std.mem.toBytes(@as(i64, 110)) ++ [_]u8{1} ++ std.mem.toBytes(@as(i64, 120)) ++
-    std.mem.toBytes(@as(u32, 2)) ++ [_]u8{ 1, 2, 0, 'o', 'k' } ++ [_]u8{0};
+/// Little-endian, as on the wire.
+const completed_status_answer = "\x02" ++ // completed
+    "\x64\x00\x00\x00\x00\x00\x00\x00" ++ // created_at 100
+    "\x01\x6e\x00\x00\x00\x00\x00\x00\x00" ++ // started_at 110
+    "\x01\x78\x00\x00\x00\x00\x00\x00\x00" ++ // completed_at 120
+    "\x02\x00\x00\x00" ++ // attempt 2
+    "\x01\x02\x00ok" ++ // output "ok"
+    "\x00"; // no error
 
 test "a completed run's status carries its times, attempt and output" {
-    var st = try parseActionRunStatus(std.testing.allocator, "run-1", &completed_status_answer);
+    var st = try parseActionRunStatus(std.testing.allocator, "run-1", completed_status_answer);
     defer st.deinit();
     try std.testing.expectEqualStrings("run-1", st.run_id);
     try std.testing.expectEqual(types.RunStatus.completed, st.status);
@@ -761,9 +766,13 @@ test "a completed run's status carries its times, attempt and output" {
 }
 
 test "a failed run's status carries its error and no output" {
-    const answer = [_]u8{3} ++ std.mem.toBytes(@as(i64, 100)) ++ [_]u8{ 0, 0 } ++
-        std.mem.toBytes(@as(u32, 3)) ++ [_]u8{ 0, 1, 4, 0, 'b', 'o', 'o', 'm' };
-    var st = try parseActionRunStatus(std.testing.allocator, "run-1", &answer);
+    const answer = "\x03" ++ // failed
+        "\x64\x00\x00\x00\x00\x00\x00\x00" ++ // created_at 100
+        "\x00\x00" ++ // not started, not completed
+        "\x03\x00\x00\x00" ++ // attempt 3
+        "\x00" ++ // no output
+        "\x01\x04\x00boom"; // error "boom"
+    var st = try parseActionRunStatus(std.testing.allocator, "run-1", answer);
     defer st.deinit();
     try std.testing.expectEqual(types.RunStatus.failed, st.status);
     try std.testing.expectEqual(@as(?i64, null), st.started_at);
@@ -779,12 +788,12 @@ fn parseStatusAndFree(a: std.mem.Allocator, data: []const u8) !void {
 test "a status answer cut anywhere, overlong, or short of memory leaks nothing" {
     const a = std.testing.allocator;
     for (0..completed_status_answer.len) |n| try std.testing.expectError(FloError.IncompleteResponse, parseStatusAndFree(a, completed_status_answer[0..n]));
-    try std.testing.expectError(FloError.IncompleteResponse, parseStatusAndFree(a, &(completed_status_answer ++ [_]u8{0})));
-    try std.testing.checkAllAllocationFailures(a, parseStatusAndFree, .{@as([]const u8, &completed_status_answer)});
+    try std.testing.expectError(FloError.IncompleteResponse, parseStatusAndFree(a, completed_status_answer ++ "\x00"));
+    try std.testing.checkAllAllocationFailures(a, parseStatusAndFree, .{@as([]const u8, completed_status_answer)});
 }
 
 test "a run status byte this client doesn't know refuses the answer" {
-    var answer = completed_status_answer;
+    var answer = completed_status_answer.*;
     answer[0] = 200;
     try std.testing.expectError(FloError.IncompleteResponse, parseActionRunStatus(std.testing.allocator, "run-1", &answer));
 }
