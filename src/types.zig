@@ -160,9 +160,21 @@ pub const EmptyPollBackoff = struct {
 
 /// Sleep for `ms`, in short slices, returning early once `running` is false.
 pub fn pauseWhileRunning(running: *const bool, ms: u64) void {
+    pauseUnlessHalted(running, null, ms);
+}
+
+/// Whether a worker loop goes on: `running` is set and `halt`, if given, isn't.
+/// A drain halts a worker's reconnects and backoffs without stopping it.
+pub fn goingOn(running: *const bool, halt: ?*const bool) bool {
+    if (!@atomicLoad(bool, running, .monotonic)) return false;
+    return if (halt) |h| !@atomicLoad(bool, h, .monotonic) else true;
+}
+
+/// `pauseWhileRunning`, also returning early once `halt`, if given, is set.
+pub fn pauseUnlessHalted(running: *const bool, halt: ?*const bool, ms: u64) void {
     const slice_ms: u64 = 10;
     var left = ms;
-    while (left > 0 and @atomicLoad(bool, running, .monotonic)) {
+    while (left > 0 and goingOn(running, halt)) {
         const step: u64 = @min(left, slice_ms);
         std.Thread.sleep(step * std.time.ns_per_ms);
         left -= step;

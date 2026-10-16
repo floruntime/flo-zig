@@ -21,8 +21,8 @@ pub const ClientOptions = struct {
     /// delivering any bytes, in milliseconds, plus its block_ms / wait_ms for
     /// blocking requests (an action await without block_ms counts as 30 s).
     /// It bounds silence, not the whole request. On expiry the call returns
-    /// error.Timeout and the client disconnects. 0 = no timeout. Not applied
-    /// on Windows.
+    /// error.Timeout and the client disconnects. It bounds a connect too.
+    /// 0 = no timeout. Not applied on Windows.
     timeout_ms: u32 = 5_000,
     /// Enable debug logging
     debug: bool = false,
@@ -123,8 +123,7 @@ pub const Client = struct {
         // Resolve address
         const address = resolveAddress(host, port) catch return FloError.ConnectionFailed;
 
-        // Connect
-        self.stream = std.net.tcpConnectToAddress(address) catch return FloError.ConnectionFailed;
+        self.stream = connectTo(address, self.timeout_ms) catch return FloError.ConnectionFailed;
     }
 
     /// Disconnect from the server
@@ -144,36 +143,37 @@ pub const Client = struct {
     /// Retries up to ~5 minutes with delays: 1s, 2s, 4s, 8s, 16s, 30s (cap).
     pub fn reconnect(self: *Self) FloError!void {
         const always = true;
-        return self.reconnectLoop(&always, 5 * 60 * 1_000);
+        return self.reconnectLoop(&always, null, 5 * 60 * 1_000);
     }
 
     /// `reconnect`, giving up with `FloError.ConnectionFailed` once
-    /// `running` turns false; a wait between tries ends within about 10 ms.
-    pub fn reconnectWhile(self: *Self, running: *const bool) FloError!void {
-        return self.reconnectLoop(running, 5 * 60 * 1_000);
+    /// `running` turns false or `halt`, if given, turns true; a wait between
+    /// tries ends within about 10 ms.
+    pub fn reconnectWhile(self: *Self, running: *const bool, halt: ?*const bool) FloError!void {
+        return self.reconnectLoop(running, halt, 5 * 60 * 1_000);
     }
 
     /// `reconnect`, giving up with `FloError.ConnectionFailed` after about
     /// `max_total_ms`.
     pub fn reconnectFor(self: *Self, max_total_ms: u64) FloError!void {
         const always = true;
-        return self.reconnectLoop(&always, max_total_ms);
+        return self.reconnectLoop(&always, null, max_total_ms);
     }
 
-    fn reconnectLoop(self: *Self, running: *const bool, max_total_ms: u64) FloError!void {
+    fn reconnectLoop(self: *Self, running: *const bool, halt: ?*const bool, max_total_ms: u64) FloError!void {
         self.disconnect();
 
         const max_delay_ms: u64 = 30_000;
         var delay_ms: u64 = 1_000;
         var total_ms: u64 = 0;
 
-        while (total_ms < max_total_ms and @atomicLoad(bool, running, .monotonic)) {
+        while (total_ms < max_total_ms and types.goingOn(running, halt)) {
             self.connect() catch {
                 const wait_ms = @min(delay_ms, max_total_ms - total_ms);
                 if (self.debug) {
                     std.log.info("[flo] Reconnect failed, retrying in {d}ms...", .{wait_ms});
                 }
-                types.pauseWhileRunning(running, wait_ms);
+                types.pauseUnlessHalted(running, halt, wait_ms);
                 total_ms += wait_ms;
                 delay_ms = @min(delay_ms * 2, max_delay_ms);
                 continue;
@@ -387,6 +387,27 @@ fn blockingWaitMs(op_code: OpCode, value: []const u8, options: []const u8) u64 {
     }
     if (op_code == .action_await and !has_block_ms) return types.DEFAULT_WORKER_BLOCK_MS;
     return longest;
+}
+
+/// Connect to `address`, giving up after `ms` (0: the OS's own timeout, also
+/// on Windows). A host that drops packets would otherwise hold the caller
+/// for the OS connect timeout, a minute or more.
+fn connectTo(address: std.net.Address, ms: u32) !std.net.Stream {
+    if (ms == 0 or builtin.os.tag == .windows) return std.net.tcpConnectToAddress(address);
+    const posix = std.posix;
+    const fd = try posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    errdefer posix.close(fd);
+    posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+        error.WouldBlock => {
+            var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+            if (try posix.poll(&fds, @intCast(@min(ms, std.math.maxInt(i32)))) == 0) return error.ConnectionTimedOut;
+            try posix.getsockoptError(fd);
+        },
+        else => return err,
+    };
+    const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+    _ = try posix.fcntl(fd, posix.F.SETFL, flags & ~@as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")));
+    return .{ .handle = fd };
 }
 
 /// Set the socket's send and receive timeouts; 0 means none.
