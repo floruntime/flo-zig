@@ -228,10 +228,10 @@ pub const OptionsIterator = struct {
 // =============================================================================
 
 /// Whether `op`'s request carries a schema-coded body rather than a value
-/// and options: every KV op.
+/// and options: every KV op, and action.status.
 pub fn isTableOp(op: OpCode) bool {
     return switch (op) {
-        .kv_put, .kv_get, .kv_mget, .kv_delete, .kv_scan, .kv_history, .kv_incr, .kv_json_get, .kv_json_set, .kv_json_del, .kv_txn_begin, .kv_txn_commit, .kv_txn_rollback, .kv_expire, .kv_exists => true,
+        .kv_put, .kv_get, .kv_mget, .kv_delete, .kv_scan, .kv_history, .kv_incr, .kv_json_get, .kv_json_set, .kv_json_del, .kv_txn_begin, .kv_txn_commit, .kv_txn_rollback, .kv_expire, .kv_exists, .action_status => true,
         else => false,
     };
 }
@@ -508,7 +508,7 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
-    try std.testing.expectEqual(@as(u64, 0xc8a2c3c65e95d11d), header.table_hash);
+    try std.testing.expectEqual(@as(u64, 0x0594d65e5909af22), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
 }
 

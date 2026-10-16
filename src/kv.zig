@@ -701,36 +701,36 @@ fn kvExists(client: *Client, namespace: []const u8, key: []const u8, routing_key
 
 /// Reads an answer field by field. A length that runs past the end is an
 /// incomplete answer, and so are bytes left over (see `end`).
-const Reader = struct {
+pub const Reader = struct {
     data: []const u8,
     pos: usize = 0,
 
-    fn take(r: *Reader, n: usize) FloError![]const u8 {
+    pub fn take(r: *Reader, n: usize) FloError![]const u8 {
         if (r.data.len - r.pos < n) return FloError.IncompleteResponse;
         defer r.pos += n;
         return r.data[r.pos..][0..n];
     }
-    fn int(r: *Reader, comptime T: type) FloError!T {
+    pub fn int(r: *Reader, comptime T: type) FloError!T {
         return std.mem.readInt(T, (try r.take(@sizeOf(T)))[0..@sizeOf(T)], .little);
     }
     /// A bool, or an optional field's presence byte: 0 or 1, nothing else.
-    fn boolean(r: *Reader) FloError!bool {
+    pub fn boolean(r: *Reader) FloError!bool {
         return switch ((try r.take(1))[0]) {
             0 => false,
             1 => true,
             else => FloError.IncompleteResponse,
         };
     }
-    fn opt(r: *Reader, comptime T: type) FloError!?T {
+    pub fn opt(r: *Reader, comptime T: type) FloError!?T {
         return if (try r.boolean()) try r.int(T) else null;
     }
-    fn lenBytes(r: *Reader, comptime Len: type) FloError![]const u8 {
+    pub fn lenBytes(r: *Reader, comptime Len: type) FloError![]const u8 {
         return r.take(try r.int(Len));
     }
-    fn remaining(r: *const Reader) usize {
+    pub fn remaining(r: *const Reader) usize {
         return r.data.len - r.pos;
     }
-    fn end(r: *const Reader) FloError!void {
+    pub fn end(r: *const Reader) FloError!void {
         if (r.pos != r.data.len) return FloError.IncompleteResponse;
     }
 };
