@@ -38,51 +38,15 @@ pub const Actions = struct {
     ) FloError!void {
         const ns = self.client.getNamespace(options.namespace);
 
-        var value_buf: [4096]u8 = undefined;
-        var offset: usize = 0;
-
-        // Action type
-        value_buf[offset] = @intFromEnum(action_type);
-        offset += 1;
-
-        // Timeout (default 30000)
-        const timeout_ms: u32 = if (options.timeout_ms) |t| @intCast(@min(t, std.math.maxInt(u32))) else 30000;
-        std.mem.writeInt(u32, value_buf[offset..][0..4], timeout_ms, .little);
-        offset += 4;
-
-        // Max retries (default 3)
-        const max_retries: u32 = if (options.max_retries) |r| @as(u32, r) else 3;
-        std.mem.writeInt(u32, value_buf[offset..][0..4], max_retries, .little);
-        offset += 4;
-
-        // Description (optional)
-        if (options.description) |desc| {
-            value_buf[offset] = 1; // has_desc
-            offset += 1;
-            std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(desc.len), .little);
-            offset += 2;
-            if (desc.len > 0) {
-                @memcpy(value_buf[offset..][0..desc.len], desc);
-                offset += desc.len;
-            }
-        } else {
-            value_buf[offset] = 0; // no desc
-            offset += 1;
-        }
-
-        // WASM fields (reserved, always zero for wire compat)
-        value_buf[offset] = 0; // no wasm_module
-        offset += 1;
-        value_buf[offset] = 0; // no wasm_entrypoint
-        offset += 1;
-        value_buf[offset] = 0; // no wasm_memory_limit
-        offset += 1;
-
-        // Trigger stream / group (not yet supported)
-        value_buf[offset] = 0; // has_trigger_stream
-        offset += 1;
-        value_buf[offset] = 0; // has_trigger_group
-        offset += 1;
+        // [action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]
+        var value_buf: [11 + 1024]u8 = undefined;
+        if (options.owner.len > value_buf.len - 11) return FloError.ValueTooLarge;
+        value_buf[0] = @intFromEnum(action_type);
+        std.mem.writeInt(u32, value_buf[1..5], options.timeout_ms, .little);
+        std.mem.writeInt(u32, value_buf[5..9], options.max_retries, .little);
+        std.mem.writeInt(u16, value_buf[9..11], @intCast(options.owner.len), .little);
+        @memcpy(value_buf[11..][0..options.owner.len], options.owner);
+        const offset = 11 + options.owner.len;
 
         var response = try self.client.sendRequest(
             .action_register,

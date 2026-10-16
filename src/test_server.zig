@@ -8,6 +8,8 @@ const types = @import("types.zig");
 pub const Reply = struct {
     status: u8,
     body: []const u8 = "",
+    /// How long ScriptServer waits before answering.
+    delay_ms: u32 = 0,
 };
 
 pub const OkServer = struct {
@@ -144,7 +146,8 @@ pub const ScriptServer = struct {
         /// Never answer; wait for the client to hang up.
         stall,
         /// Hang up without answering and stop listening, so reconnects are
-        /// refused.
+        /// refused. Not for `concurrent` servers: it would deinit the
+        /// listener from a connection thread while serve may be accepting.
         close,
     };
 
@@ -173,6 +176,13 @@ pub const ScriptServer = struct {
     mutex: std.Thread.Mutex = .{},
     log: [64]Request = undefined,
     count: usize = 0,
+    /// Serve each connection on a thread of its own, so a client may hold
+    /// several at once; by default they're served one after another.
+    concurrent: bool = false,
+    conn_threads: [8]std.Thread = undefined,
+    conn_thread_count: usize = 0,
+    /// Requests seen per op, across connections, under `mutex`.
+    seen: std.EnumArray(types.OpCode, u32) = .initFill(0),
 
     pub fn listen() !ScriptServer {
         const addr = try std.net.Address.parseIp("127.0.0.1", 0);
@@ -189,6 +199,7 @@ pub const ScriptServer = struct {
         self.stopping.store(true, .release);
         if (std.net.tcpConnectToAddress(self.server.listen_address)) |s| s.close() else |_| {}
         self.thread.join();
+        for (self.conn_threads[0..self.conn_thread_count]) |t| t.join();
         if (!self.closed) self.server.deinit();
     }
 
@@ -215,12 +226,29 @@ pub const ScriptServer = struct {
     }
 
     fn serve(self: *ScriptServer) void {
-        var seen = std.EnumArray(types.OpCode, u32).initFill(0);
         while (true) {
             const conn = self.server.accept() catch return;
-            defer conn.stream.close();
-            if (self.stopping.load(.acquire)) return;
+            if (self.stopping.load(.acquire)) {
+                conn.stream.close();
+                return;
+            }
             _ = self.connections.fetchAdd(1, .monotonic);
+            if (self.concurrent and self.conn_thread_count < self.conn_threads.len) {
+                if (std.Thread.spawn(.{}, handle, .{ self, conn })) |t| {
+                    self.conn_threads[self.conn_thread_count] = t;
+                    self.conn_thread_count += 1;
+                    continue;
+                } else |_| {}
+            }
+            self.handle(conn);
+            if (self.closed) return;
+        }
+    }
+
+    /// Serve one connection until it ends.
+    fn handle(self: *ScriptServer, conn: std.net.Server.Connection) void {
+        defer conn.stream.close();
+        {
             while (true) {
                 var req: Request = undefined;
                 OkServer.readAll(conn.stream, req.bytes[0..32]) catch break;
@@ -231,8 +259,13 @@ pub const ScriptServer = struct {
                 OkServer.readAll(conn.stream, req.bytes[32..][0..payload_length]) catch break;
                 req.len = 32 + payload_length;
 
-                const nth = seen.get(req.op);
-                seen.set(req.op, nth + 1);
+                const nth = blk: {
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+                    const n = self.seen.get(req.op);
+                    self.seen.set(req.op, n + 1);
+                    break :blk n;
+                };
                 var action: Action = .{ .reply = .{ .status = 0 } };
                 for (self.rules) |rule| {
                     if (rule.op == req.op and (rule.nth == null or rule.nth.? == nth)) {
@@ -260,7 +293,10 @@ pub const ScriptServer = struct {
                         while ((conn.stream.read(&buf) catch 0) > 0) {}
                         break;
                     },
-                    .reply => |r| reply(conn.stream, request_id, r) catch break,
+                    .reply => |r| {
+                        if (r.delay_ms > 0) std.Thread.sleep(@as(u64, r.delay_ms) * std.time.ns_per_ms);
+                        reply(conn.stream, request_id, r) catch break;
+                    },
                 }
             }
         }

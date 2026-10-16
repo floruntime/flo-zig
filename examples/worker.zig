@@ -182,10 +182,10 @@ pub fn main() !void {
     defer worker.deinit();
 
     // Register action handlers
-    try worker.registerAction("process-order", processOrder);
-    try worker.registerAction("send-notification", sendNotification);
-    try worker.registerAction("generate-report", generateReport);
-    try worker.registerAction("health-check", healthCheck);
+    try worker.registerAction("process-order", processOrder, .{});
+    try worker.registerAction("send-notification", sendNotification, .{});
+    try worker.registerAction("generate-report", generateReport, .{});
+    try worker.registerAction("health-check", healthCheck, .{});
 
     std.log.info("Starting worker...", .{});
 

@@ -985,15 +985,18 @@ pub const ActionInvokeResult = struct {
 };
 
 /// Options for action registration
+/// Registering an action replaces its settings: the last registration wins.
 pub const ActionRegisterOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Action description
-    description: ?[]const u8 = null,
-    /// Timeout for action execution (ms)
-    timeout_ms: ?u64 = null,
-    /// Maximum retries on failure
-    max_retries: ?u8 = null,
+    /// How long a run may go without its worker completing, failing or
+    /// touching it before it's taken back; 0 means never.
+    timeout_ms: u32 = 30_000,
+    /// Attempts in all, counting the first.
+    max_retries: u32 = 3,
+    /// Who owns the action. The wire allows 65535 bytes; this SDK sends at
+    /// most 1024 (its encode buffer) and refuses more with ValueTooLarge.
+    owner: []const u8 = "",
 };
 
 /// Options for action invocation

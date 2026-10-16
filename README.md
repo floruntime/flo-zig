@@ -333,12 +333,23 @@ try stream.groupAck("events", "my-group", seqs[0..records.records.len], .{});
 Actions are task types that workers process. `Actions` is the low-level API; for a
 handler-based worker that registers, awaits, and heartbeats for you, see `ActionWorker`.
 
+`ActionWorker.registerAction(name, handler, options)` registers the action with exactly
+`options` (`.{}`: the server's defaults, a 30 s timeout and 3 attempts). Registering
+replaces an action's settings, so workers that register one action with different options
+leave it with whichever registered last. A run whose handler goes past the action's
+`timeout_ms` without touching it is taken back and run again; `.auto_touch = true` in
+`WorkerConfig` touches each run every third of its timeout (at most an hour) from a thread
+on its own connection while the handler runs; that thread allocates, so the worker's
+allocator must then be thread-safe. It's off by default; without it, call `ctx.touch`
+from long handlers. An action's `owner` may be up to 1024 bytes here (the wire allows a
+u16 length).
+
 ```zig
 var actions = flo.Actions.init(&client);
 
 // Register an action (task type)
 try actions.registerAction("send-email", .user, .{
-    .description = "Send email notifications",
+    .owner = "notifications",
     .timeout_ms = 30000,
     .max_retries = 3,
 });
