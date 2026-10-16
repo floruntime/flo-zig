@@ -252,9 +252,15 @@ pub const StreamWorker = struct {
             self.consumer_name,
         });
 
-        // Set before the join, so stop() ends a join that is backing off.
+        // Set before the join, so stop() ends a join that is backing off. A
+        // drain is cleared when the run ends, not here, so a drain() before
+        // or during startup still ends it; a later start begins a fresh one.
         @atomicStore(bool, &self.running, true, .monotonic);
         errdefer @atomicStore(bool, &self.running, false, .monotonic);
+        defer {
+            @atomicStore(bool, &self.draining, false, .monotonic);
+            self.drain_sent = false;
+        }
         try self.joinGroups();
         if (!@atomicLoad(bool, &self.running, .monotonic)) return;
 
@@ -306,35 +312,32 @@ pub const StreamWorker = struct {
 
         // Main polling loop
         while (@atomicLoad(bool, &self.running, .monotonic)) {
+            // A batch is finished before the loop comes back here, so a
+            // drain is done at once. It's checked before the connection: it
+            // never needs the server, so a worker that can't reach it still
+            // stops. The server gets one try at hearing of it.
+            if (@atomicLoad(bool, &self.draining, .monotonic)) {
+                if (!self.drain_sent and self.client.isConnected()) {
+                    var actions_api = self.actionsApi();
+                    if (actions_api.drain(self.worker_id, .{ .namespace = self.config.namespace })) {
+                        self.drain_sent = true;
+                    } else |err| std.log.warn("[flo-stream-worker] Failed to notify server of drain: {}", .{err});
+                }
+                std.log.info("[flo-stream-worker] Drain complete, shutting down", .{});
+                @atomicStore(bool, &self.running, false, .monotonic);
+                break;
+            }
+
             if (!self.client.isConnected()) {
                 self.reconnect() catch |err| {
-                    std.log.err("[flo-stream-worker] Reconnect failed: {}, retrying...", .{err});
-                    types.pauseWhileRunning(&self.running, 1_000);
+                    std.log.warn("[flo-stream-worker] Reconnect failed: {}, retrying...", .{err});
+                    types.pauseUnlessHalted(&self.running, &self.draining, 1_000);
                     continue;
                 };
             }
 
             // Send heartbeat if interval has elapsed
             self.maybeHeartbeat();
-
-            const draining = @atomicLoad(bool, &self.draining, .monotonic);
-            // drain() only sets the flag: the poll connection is this
-            // thread's, so the server hears of the drain from here.
-            if (draining and !self.drain_sent) {
-                self.drain_sent = true;
-                var actions_api = self.actionsApi();
-                actions_api.drain(self.worker_id, .{ .namespace = self.config.namespace }) catch |err| {
-                    std.log.err("[flo-stream-worker] Failed to notify server of drain: {}", .{err});
-                };
-            }
-
-            // A batch is finished before the next read, so draining is done
-            // once the loop is back here.
-            if (draining) {
-                std.log.info("[flo-stream-worker] Drain complete, shutting down", .{});
-                @atomicStore(bool, &self.running, false, .monotonic);
-                break;
-            }
 
             if (self.pollAndProcess(stream_list[stream_idx])) {
                 failed.reset();
@@ -345,7 +348,7 @@ pub const StreamWorker = struct {
                 } else {
                     const ms = failed.next(self.client.prng.random());
                     std.log.err("[flo-stream-worker] GroupRead error: {}, retrying in {d}ms...", .{ err, ms });
-                    types.pauseWhileRunning(&self.running, ms);
+                    types.pauseUnlessHalted(&self.running, &self.draining, ms);
                 }
             }
 
@@ -360,9 +363,10 @@ pub const StreamWorker = struct {
     }
 
     /// Open a fresh connection and join the groups on it again. Gives up
-    /// once the worker is stopped.
+    /// once the worker is stopped or draining: a drain finishes without the
+    /// server.
     fn reconnect(self: *Self) !void {
-        try self.client.reconnectWhile(&self.running);
+        try self.client.reconnectWhile(&self.running, &self.draining);
         errdefer self.client.disconnect();
         try self.joinGroups();
     }
@@ -374,7 +378,7 @@ pub const StreamWorker = struct {
     /// again on the fresh one; a slot's connection only carries results.
     fn reconnectForResult(self: *Self, conn: *Client, rejoin: bool) !void {
         if (@atomicLoad(bool, &self.running, .monotonic)) {
-            if (conn.reconnectWhile(&self.running)) {
+            if (conn.reconnectWhile(&self.running, null)) {
                 errdefer conn.disconnect();
                 if (rejoin) try self.joinGroups();
                 return;
@@ -390,7 +394,7 @@ pub const StreamWorker = struct {
     /// Join the group on every stream. A join the server refused without
     /// running it (overloaded or unavailable, past the client's own retries)
     /// is tried again with the worker backoff until it succeeds or the
-    /// worker stops; any other error is returned.
+    /// worker stops or drains; any other error is returned.
     fn joinGroups(self: *Self) !void {
         var stream = self.streamApi();
         for (self.config.getStreams()) |stream_name| {
@@ -405,8 +409,8 @@ pub const StreamWorker = struct {
                     if (!self.client.refusedUnrun(err)) return err;
                     const ms = failed.next(self.client.prng.random());
                     std.log.warn("[flo-stream-worker] [{s}] Group join refused: {}, retrying in {d}ms...", .{ stream_name, err, ms });
-                    types.pauseWhileRunning(&self.running, ms);
-                    if (!@atomicLoad(bool, &self.running, .monotonic)) return;
+                    types.pauseUnlessHalted(&self.running, &self.draining, ms);
+                    if (!types.goingOn(&self.running, &self.draining)) return;
                     continue;
                 };
                 break;
@@ -424,7 +428,8 @@ pub const StreamWorker = struct {
     /// and the poll loop tells the server on its own connection, then stops
     /// once the batch in hand is handled. The loop sees the flag between
     /// polls, so that can take up to block_ms plus the time to finish the
-    /// current batch, and a batch read meanwhile is still handled.
+    /// current batch, and a batch read meanwhile is still handled. It
+    /// finishes whether or not the server can be reached.
     pub fn drain(self: *Self) void {
         std.log.info("[flo-stream-worker] Draining...", .{});
         @atomicStore(bool, &self.draining, true, .monotonic);
@@ -1045,4 +1050,127 @@ test "StreamWorker reads no next batch until every record of this one is handled
     w.stop();
     thread.join();
     try std.testing.expect(batch_test.seen.load(.acquire));
+}
+
+const drain_gap_test = struct {
+    var returned = std.atomic.Value(bool).init(false);
+
+    fn run(w: *StreamWorker) void {
+        w.start() catch {};
+        returned.store(true, .release);
+    }
+
+    fn returnedWithin(w: *StreamWorker, ms: u32) bool {
+        var waited: u32 = 0;
+        while (!returned.load(.acquire) and waited < ms) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
+        const ok = returned.load(.acquire);
+        if (!ok) w.stop();
+        return ok;
+    }
+
+    fn handle(_: *StreamContext) anyerror!void {}
+};
+
+test "StreamWorker finishes a drain while it can't reach the server" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        // The first read loses the connection, and every reconnect's join is
+        // cut off too.
+        .{ .op = .stream_group_read, .action = .drop },
+        .{ .op = .stream_group_join, .nth = 1, .action = .drop },
+        .{ .op = .stream_group_join, .nth = 2, .action = .drop },
+        .{ .op = .stream_group_join, .nth = 3, .action = .drop },
+        .{ .op = .stream_group_join, .nth = 4, .action = .drop },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100, .retry = .{ .max_attempts = 1 } }, drain_gap_test.handle);
+    defer w.deinit();
+    drain_gap_test.returned.store(false, .release);
+    const thread = try std.Thread.spawn(.{}, drain_gap_test.run, .{&w});
+    defer thread.join();
+    std.Thread.sleep(300 * std.time.ns_per_ms);
+    w.drain();
+    try std.testing.expect(drain_gap_test.returnedWithin(&w, 3_000));
+}
+
+test "StreamWorker finishes a drain while the server refuses connections" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    // The first read hangs up and stops the listener: every reconnect is
+    // refused, and the worker backs off between them.
+    srv.rules = &.{.{ .op = .stream_group_read, .action = .close }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100, .retry = .{ .max_attempts = 1 } }, drain_gap_test.handle);
+    defer w.deinit();
+    drain_gap_test.returned.store(false, .release);
+    const thread = try std.Thread.spawn(.{}, drain_gap_test.run, .{&w});
+    defer thread.join();
+    // Inside the reconnect's first 1 s wait by now.
+    std.Thread.sleep(300 * std.time.ns_per_ms);
+    w.drain();
+    try std.testing.expect(drain_gap_test.returnedWithin(&w, 500));
+}
+
+test "StreamWorker finishes a drain while its group join is backing off" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    // [reason:u16][ran:u8][message]: refused, not run, so it is retried.
+    srv.rules = &.{.{ .op = .stream_group_join, .action = .{ .reply = .{ .status = @intFromEnum(types.StatusCode.overloaded), .body = "\x0c\x00\x00busy" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100, .retry = .{ .max_attempts = 1 } }, drain_gap_test.handle);
+    defer w.deinit();
+    drain_gap_test.returned.store(false, .release);
+    const thread = try std.Thread.spawn(.{}, drain_gap_test.run, .{&w});
+    defer thread.join();
+    var waited: u32 = 0;
+    while (srv.countOf(.stream_group_join) < 2 and waited < 5000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
+    w.drain();
+    try std.testing.expect(drain_gap_test.returnedWithin(&w, 500));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_read));
+}
+
+test "StreamWorker drained before start returns without reading" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, drain_gap_test.handle);
+    defer w.deinit();
+    w.drain();
+    drain_gap_test.returned.store(false, .release);
+    const thread = try std.Thread.spawn(.{}, drain_gap_test.run, .{&w});
+    defer thread.join();
+    try std.testing.expect(drain_gap_test.returnedWithin(&w, 2_000));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_read));
+}
+
+test "StreamWorker started again after a drain reads again" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, drain_gap_test.handle);
+    defer w.deinit();
+    const first = try std.Thread.spawn(.{}, runWorker, .{&w});
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+    w.drain();
+    first.join();
+
+    drain_gap_test.returned.store(false, .release);
+    const reads = srv.countOf(.stream_group_read);
+    const second = try std.Thread.spawn(.{}, drain_gap_test.run, .{&w});
+    std.Thread.sleep(300 * std.time.ns_per_ms);
+    try std.testing.expect(!drain_gap_test.returned.load(.acquire));
+    try std.testing.expect(srv.countOf(.stream_group_read) > reads);
+    w.stop();
+    second.join();
 }
