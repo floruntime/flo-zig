@@ -547,6 +547,12 @@ var client = flo.Client.init(allocator, "localhost:9000", .{
 var client = flo.Client.init(allocator, "localhost:9000", .{ .retry = .{ .max_attempts = 1 } });
 ```
 
+`StreamWorkerConfig.concurrency` (default 1) is how many records of a batch a stream
+worker handles at once (at most `batch_size`). Above 1, each runs on a thread with a
+connection of its own for its ack or nack, so a batch's records are handled out of order,
+and handlers and the worker's allocator must be thread-safe. The next read waits for the
+whole batch. `drain()` and `stop()` are safe to call from any thread.
+
 ## Building
 
 ```bash
