@@ -13,7 +13,7 @@ pub const VERSION: u8 = 0x02;
 /// The hash of the op table this SDK was built for, written into every
 /// request header. A server built from another table refuses the request,
 /// and its answers carry its own hash, which this SDK refuses.
-pub const TABLE_HASH: u64 = 0xc8a2c3c65e95d11d;
+pub const TABLE_HASH: u64 = 0x0594d65e5909af22;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -955,16 +955,18 @@ pub const TaskAssignment = struct {
     }
 };
 
-/// Action run status result
+/// An action run's status. Times are ms since the epoch; `attempt` counts
+/// from 1 once a worker has taken the run. `output` is a completed run's
+/// result, and `error_message` the last failure's message.
 pub const ActionRunStatus = struct {
     run_id: []const u8,
     status: RunStatus,
     created_at: i64,
     started_at: ?i64,
     completed_at: ?i64,
+    attempt: u32,
     output: ?[]const u8,
     error_message: ?[]const u8,
-    retry_count: u32,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ActionRunStatus) void {

@@ -11,6 +11,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
 const Client = @import("client.zig").Client;
+const Reader = @import("kv.zig").Reader;
 
 const FloError = types.FloError;
 
@@ -118,7 +119,7 @@ pub const Actions = struct {
             return response.status.toError();
         }
 
-        return parseActionRunStatus(self.client.allocator, response.data);
+        return parseActionRunStatus(self.client.allocator, run_id, response.data);
     }
 
     /// Delete an action.
@@ -645,106 +646,34 @@ fn parseTaskAssignment(allocator: std.mem.Allocator, data: []const u8) FloError!
     };
 }
 
-/// Parse action run status from wire format
-/// Wire format: [run_id_len:u16][run_id][status:u8][created_at:i64]
-///              [has_started_at:u8][started_at:i64]?[has_completed_at:u8][completed_at:i64]?
-///              [has_output:u8][output_len:u32]?[output]?
-///              [has_error:u8][error_len:u32]?[error]?[retry_count:u32]
-fn parseActionRunStatus(allocator: std.mem.Allocator, data: []const u8) FloError!types.ActionRunStatus {
-    if (data.len < 14) {
-        return FloError.IncompleteResponse;
-    }
+/// action.status's answer: [status:u8][created_at:i64][started_at:?i64]
+/// [completed_at:?i64][attempt:u32][output:?(u16 len, bytes)]
+/// [error_message:?(u16 len, bytes)], each optional behind a presence byte.
+fn parseActionRunStatus(allocator: std.mem.Allocator, run_id: []const u8, data: []const u8) FloError!types.ActionRunStatus {
+    var r: Reader = .{ .data = data };
+    const status = std.meta.intToEnum(types.RunStatus, try r.int(u8)) catch return FloError.IncompleteResponse;
+    const created_at = try r.int(i64);
+    const started_at = try r.opt(i64);
+    const completed_at = try r.opt(i64);
+    const attempt = try r.int(u32);
+    const output = if (try r.boolean()) try r.lenBytes(u16) else null;
+    const error_message = if (try r.boolean()) try r.lenBytes(u16) else null;
+    try r.end();
 
-    var pos: usize = 0;
-
-    // Read run_id
-    if (pos + 2 > data.len) return FloError.IncompleteResponse;
-    const run_id_len = std.mem.readInt(u16, data[pos..][0..2], .little);
-    pos += 2;
-    if (pos + run_id_len > data.len) return FloError.IncompleteResponse;
-    const run_id = allocator.dupe(u8, data[pos..][0..run_id_len]) catch return FloError.OutOfMemory;
-    errdefer allocator.free(run_id);
-    pos += run_id_len;
-
-    // Status
-    if (pos + 1 > data.len) return FloError.IncompleteResponse;
-    const status = std.meta.intToEnum(types.RunStatus, data[pos]) catch return FloError.IncompleteResponse;
-    pos += 1;
-
-    // Created at
-    if (pos + 8 > data.len) return FloError.IncompleteResponse;
-    const created_at = std.mem.readInt(i64, data[pos..][0..8], .little);
-    pos += 8;
-
-    // Started at (optional)
-    var started_at: ?i64 = null;
-    if (pos + 1 > data.len) return FloError.IncompleteResponse;
-    if (data[pos] == 1) {
-        pos += 1;
-        if (pos + 8 > data.len) return FloError.IncompleteResponse;
-        started_at = std.mem.readInt(i64, data[pos..][0..8], .little);
-        pos += 8;
-    } else {
-        pos += 1;
-    }
-
-    // Completed at (optional)
-    var completed_at: ?i64 = null;
-    if (pos + 1 > data.len) return FloError.IncompleteResponse;
-    if (data[pos] == 1) {
-        pos += 1;
-        if (pos + 8 > data.len) return FloError.IncompleteResponse;
-        completed_at = std.mem.readInt(i64, data[pos..][0..8], .little);
-        pos += 8;
-    } else {
-        pos += 1;
-    }
-
-    // Output (optional)
-    var output: ?[]const u8 = null;
-    if (pos + 1 > data.len) return FloError.IncompleteResponse;
-    if (data[pos] == 1) {
-        pos += 1;
-        if (pos + 4 > data.len) return FloError.IncompleteResponse;
-        const output_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-        pos += 4;
-        if (pos + output_len > data.len) return FloError.IncompleteResponse;
-        output = allocator.dupe(u8, data[pos..][0..output_len]) catch return FloError.OutOfMemory;
-        pos += output_len;
-    } else {
-        pos += 1;
-    }
-    errdefer if (output) |o| allocator.free(o);
-
-    // Error message (optional)
-    var error_message: ?[]const u8 = null;
-    if (pos + 1 > data.len) return FloError.IncompleteResponse;
-    if (data[pos] == 1) {
-        pos += 1;
-        if (pos + 4 > data.len) return FloError.IncompleteResponse;
-        const error_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-        pos += 4;
-        if (pos + error_len > data.len) return FloError.IncompleteResponse;
-        error_message = allocator.dupe(u8, data[pos..][0..error_len]) catch return FloError.OutOfMemory;
-        pos += error_len;
-    } else {
-        pos += 1;
-    }
-    errdefer if (error_message) |e| allocator.free(e);
-
-    // Retry count
-    if (pos + 4 > data.len) return FloError.IncompleteResponse;
-    const retry_count = std.mem.readInt(u32, data[pos..][0..4], .little);
-
-    return types.ActionRunStatus{
-        .run_id = run_id,
+    const run_id_copy = allocator.dupe(u8, run_id) catch return FloError.OutOfMemory;
+    errdefer allocator.free(run_id_copy);
+    const output_copy = if (output) |o| allocator.dupe(u8, o) catch return FloError.OutOfMemory else null;
+    errdefer if (output_copy) |o| allocator.free(o);
+    const error_copy = if (error_message) |e| allocator.dupe(u8, e) catch return FloError.OutOfMemory else null;
+    return .{
+        .run_id = run_id_copy,
         .status = status,
         .created_at = created_at,
         .started_at = started_at,
         .completed_at = completed_at,
-        .output = output,
-        .error_message = error_message,
-        .retry_count = retry_count,
+        .attempt = attempt,
+        .output = output_copy,
+        .error_message = error_copy,
         .allocator = allocator,
     };
 }
@@ -813,11 +742,49 @@ test "a task assignment cut anywhere or short of memory leaks nothing" {
     try std.testing.checkAllAllocationFailures(a, parseTaskAndFree, .{list.items});
 }
 
+/// A completed run's status answer: started, completed, attempt 2, output "ok", no error.
+const completed_status_answer = [_]u8{2} ++ std.mem.toBytes(@as(i64, 100)) ++
+    [_]u8{1} ++ std.mem.toBytes(@as(i64, 110)) ++ [_]u8{1} ++ std.mem.toBytes(@as(i64, 120)) ++
+    std.mem.toBytes(@as(u32, 2)) ++ [_]u8{ 1, 2, 0, 'o', 'k' } ++ [_]u8{0};
+
+test "a completed run's status carries its times, attempt and output" {
+    var st = try parseActionRunStatus(std.testing.allocator, "run-1", &completed_status_answer);
+    defer st.deinit();
+    try std.testing.expectEqualStrings("run-1", st.run_id);
+    try std.testing.expectEqual(types.RunStatus.completed, st.status);
+    try std.testing.expectEqual(@as(i64, 100), st.created_at);
+    try std.testing.expectEqual(@as(?i64, 110), st.started_at);
+    try std.testing.expectEqual(@as(?i64, 120), st.completed_at);
+    try std.testing.expectEqual(@as(u32, 2), st.attempt);
+    try std.testing.expectEqualStrings("ok", st.output.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), st.error_message);
+}
+
+test "a failed run's status carries its error and no output" {
+    const answer = [_]u8{3} ++ std.mem.toBytes(@as(i64, 100)) ++ [_]u8{ 0, 0 } ++
+        std.mem.toBytes(@as(u32, 3)) ++ [_]u8{ 0, 1, 4, 0, 'b', 'o', 'o', 'm' };
+    var st = try parseActionRunStatus(std.testing.allocator, "run-1", &answer);
+    defer st.deinit();
+    try std.testing.expectEqual(types.RunStatus.failed, st.status);
+    try std.testing.expectEqual(@as(?i64, null), st.started_at);
+    try std.testing.expectEqual(@as(?[]const u8, null), st.output);
+    try std.testing.expectEqualStrings("boom", st.error_message.?);
+}
+
+fn parseStatusAndFree(a: std.mem.Allocator, data: []const u8) !void {
+    var st = try parseActionRunStatus(a, "run-1", data);
+    st.deinit();
+}
+
+test "a status answer cut anywhere, overlong, or short of memory leaks nothing" {
+    const a = std.testing.allocator;
+    for (0..completed_status_answer.len) |n| try std.testing.expectError(FloError.IncompleteResponse, parseStatusAndFree(a, completed_status_answer[0..n]));
+    try std.testing.expectError(FloError.IncompleteResponse, parseStatusAndFree(a, &(completed_status_answer ++ [_]u8{0})));
+    try std.testing.checkAllAllocationFailures(a, parseStatusAndFree, .{@as([]const u8, &completed_status_answer)});
+}
+
 test "a run status byte this client doesn't know refuses the answer" {
-    // [run_id_len][run_id][status][created_at][has_started][has_completed][has_output][has_error][retry_count]
-    var buf = [_]u8{0} ** (2 + 1 + 1 + 8 + 4 + 4);
-    std.mem.writeInt(u16, buf[0..2], 1, .little);
-    buf[2] = 'r';
-    buf[3] = 200;
-    try std.testing.expectError(FloError.IncompleteResponse, parseActionRunStatus(std.testing.allocator, &buf));
+    var answer = completed_status_answer;
+    answer[0] = 200;
+    try std.testing.expectError(FloError.IncompleteResponse, parseActionRunStatus(std.testing.allocator, "run-1", &answer));
 }

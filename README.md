@@ -365,7 +365,8 @@ defer gpu_run.deinit();
 // Check task status
 var status = try actions.getStatus(invoked.run_id, .{});
 defer status.deinit();
-std.debug.print("Status: {s}\n", .{@tagName(status.status)});
+std.debug.print("Status: {s}, attempt {d}\n", .{ @tagName(status.status), status.attempt });
+if (status.output) |out| std.debug.print("Output: {s}\n", .{out});
 ```
 
 Invoke has no priority, delay or idempotency key; see
