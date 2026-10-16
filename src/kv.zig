@@ -65,6 +65,7 @@ pub const KV = struct {
     ) FloError!types.MGetResult {
         if (keys.len == 0 or keys.len > types.MAX_MGET) return FloError.BadRequest;
         for (keys) |k| if (k.len > types.MAX_MGET_KEY) return FloError.KeyTooLarge;
+        try checkRoutingKey(options.routing_key);
         const ns = self.client.getNamespace(options.namespace);
         const allocator = self.client.allocator;
 
@@ -83,7 +84,8 @@ pub const KV = struct {
             const chunk = keys[filled..end];
             const buf = try allocator.alloc(u8, mgetBodySize(chunk));
             defer allocator.free(buf);
-            var response = try call(self.client, .kv_mget, ns, "", encodeMgetBody(buf, chunk));
+            const body = encodeMgetBody(buf, chunk, options.routing_key);
+            var response = try call(self.client, .kv_mget, ns, "", body);
             defer response.deinit();
 
             const page = entries[filled..end];
@@ -524,31 +526,37 @@ fn encodeHistoryBody(buf: *[MAX_HISTORY_BODY]u8, limit: u32, routing_key: ?[]con
     return w.written();
 }
 
+/// The size of kv.mget's body for `keys`, at most.
 fn mgetBodySize(keys: []const []const u8) usize {
-    var n: usize = 2;
+    var n: usize = 2 + ROUTING_KEY_FIELD;
     for (keys) |k| n += 2 + k.len;
     return n;
 }
 
-/// kv.mget's request: keys. The caller has checked their count and lengths.
-fn encodeMgetBody(buf: []u8, keys: []const []const u8) []const u8 {
+/// kv.mget's request: keys, routing_key. The caller has checked their
+/// count and lengths.
+fn encodeMgetBody(buf: []u8, keys: []const []const u8, routing_key: ?[]const u8) []const u8 {
     var w: BodyWriter = .{ .buf = buf };
     w.int(u16, @intCast(keys.len));
     for (keys) |k| w.lenBytes(u16, k);
+    w.routingKey(routing_key);
     return w.written();
 }
 
 /// The longest kv.mget body the server takes.
 const MAX_MGET_BODY = 257_949;
+/// The most one kv.mget's key elements (each length and bytes) may total:
+/// the body less the key count and the longest routing key.
+const MAX_MGET_KEYS = MAX_MGET_BODY - 2 - ROUTING_KEY_FIELD;
 
 /// Where the mget request that starts at `keys[start]` ends: as many keys as
 /// fit one body. Keys are at most 4096 bytes, so at least one always does.
 fn mgetChunkEnd(keys: []const []const u8, start: usize) usize {
-    var size: usize = 2;
+    var size: usize = 0;
     var end = start;
     while (end < keys.len) : (end += 1) {
         size += 2 + keys[end].len;
-        if (size > MAX_MGET_BODY) break;
+        if (size > MAX_MGET_KEYS) break;
     }
     return end;
 }
@@ -940,7 +948,8 @@ test "the other KV ops' requests match the server's schemas byte for byte" {
     try expectHex("0102000000010200726b", try encodeHistoryBody(&hist, 2, "rk"));
     const keys = [_][]const u8{ "a", "b" };
     var mget: [mgetBodySize(&keys)]u8 = undefined;
-    try expectHex("0200010061010062", encodeMgetBody(&mget, &keys));
+    try expectHex("020001006101006200", encodeMgetBody(&mget, &keys, null));
+    try expectHex("0200010061010062010200726b", encodeMgetBody(&mget, &keys, "rk"));
     var incr: [MAX_INCR_BODY]u8 = undefined;
     try expectHex("01fbffffffffffffff00010900000000000000", try encodeIncrBody(&incr, -5, null, 9));
     var expire: [MAX_EXPIRE_BODY]u8 = undefined;
@@ -1109,13 +1118,13 @@ test "mget asks again from next until every key is answered" {
     try client.connect();
     var kv = KV.init(&client);
 
-    var result = try kv.mget(&.{ "a", "b" }, .{});
+    var result = try kv.mget(&.{ "a", "b" }, .{ .routing_key = "rk" });
     defer result.deinit();
     try testing.expectEqual(@as(u32, 2), srv.requests.load(.acquire));
     try testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.kv_mget)), srv.last_op);
     try testing.expectEqualStrings("", srv.lastKey());
-    // The second request asks for the keys from next on.
-    try expectHex("0100010062", srv.lastBody());
+    // The second request asks for the keys from next on, by the same routing key.
+    try expectHex("0100010062010200726b", srv.lastBody());
 
     try testing.expectEqual(@as(usize, 2), result.entries.len);
     try testing.expectEqualStrings("a", result.entries[0].key);
@@ -1132,8 +1141,19 @@ test "an mget too big for one body is split across bodies that each fit" {
     for (&keys) |*k| k.* = key;
     const end = mgetChunkEnd(&keys, 0);
     try testing.expect(end > 0 and end < keys.len);
-    try testing.expect(mgetBodySize(keys[0..end]) <= MAX_MGET_BODY);
+    // The keys total at most 253848 bytes, leaving room for the count and the
+    // longest routing key; one key more would overrun.
+    try testing.expectEqual(253_848, MAX_MGET_KEYS);
+    try testing.expectEqual(@as(usize, MAX_MGET_KEYS / (2 + types.MAX_MGET_KEY)), end);
+    var body_buf: [MAX_MGET_BODY]u8 = undefined;
+    const rk = "r" ** MAX_ROUTING_KEY;
+    try testing.expect(encodeMgetBody(&body_buf, keys[0..end], rk).len <= MAX_MGET_BODY);
     try testing.expect(mgetBodySize(keys[0 .. end + 1]) > MAX_MGET_BODY);
+    // Small keys split exactly at the bound.
+    var small: [256][]const u8 = undefined;
+    const small_key = "s" ** 1000;
+    for (&small) |*k| k.* = small_key;
+    try testing.expectEqual(@as(usize, MAX_MGET_KEYS / 1002), mgetChunkEnd(&small, 0));
     // A full body still fits the request frame.
     try testing.expect(wire.requestSize(.kv_mget, "default", "", &[_]u8{0} ** MAX_MGET_BODY, "") <= Client.max_request_size);
     // The next chunk starts where this one ended.
@@ -1261,6 +1281,7 @@ test "requests out of bounds are refused before a round trip" {
     try testing.expectError(FloError.ValueTooLarge, kv.jsonSet("k", "$", doc, .{}));
     const long_key = "k" ** (types.MAX_MGET_KEY + 1);
     try testing.expectError(FloError.KeyTooLarge, kv.mget(&.{long_key}, .{}));
+    try testing.expectError(FloError.KeyTooLarge, kv.mget(&.{"k"}, .{ .routing_key = rk }));
     try testing.expectError(FloError.KeyTooLarge, kv.history("k", .{ .routing_key = rk }));
     try testing.expectEqual(@as(u32, 0), srv.requests.load(.acquire));
     try testing.expect(client.isConnected());

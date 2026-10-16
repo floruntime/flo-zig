@@ -163,6 +163,10 @@ defer {
 // order, with `found`
 var many = try kv.mget(&.{ "a", "b", "c" }, .{});
 defer many.deinit();
+// Keys all written with one routing key: give it, and all are looked up on
+// its shard (without it, each key is looked up on its own shard)
+var routed = try kv.mget(&.{ "order:1", "order:2" }, .{ .routing_key = "customer:42" });
+defer routed.deinit();
 
 // Counters: returns the new value and version
 const counter = try kv.incr("hits", .{ .delta = 5 });

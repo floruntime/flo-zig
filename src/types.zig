@@ -13,7 +13,7 @@ pub const VERSION: u8 = 0x02;
 /// The hash of the op table this SDK was built for, written into every
 /// request header. A server built from another table refuses the request,
 /// and its answers carry its own hash, which this SDK refuses.
-pub const TABLE_HASH: u64 = 0x5194dd26f737dba9;
+pub const TABLE_HASH: u64 = 0xc8a2c3c65e95d11d;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -683,6 +683,9 @@ pub const KVJsonOptions = struct {
 pub const KVMGetOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+    /// The routing key every key was written with: all are looked up on its
+    /// shard. Without it, each key is looked up on its own shard.
+    routing_key: ?[]const u8 = null,
 };
 
 /// Options for a delete or expire inside a KV transaction
