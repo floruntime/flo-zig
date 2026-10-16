@@ -121,6 +121,7 @@ pub const DlqListOptions = types.DlqListOptions;
 // Option types - Stream
 pub const StreamID = types.StreamID;
 pub const StreamAppendOptions = types.StreamAppendOptions;
+pub const Header = types.Header;
 pub const StreamReadOptions = types.StreamReadOptions;
 pub const StreamTrimOptions = types.StreamTrimOptions;
 pub const StreamInfoOptions = types.StreamInfoOptions;

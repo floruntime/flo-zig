@@ -28,15 +28,14 @@ pub const Stream = struct {
         options: types.StreamAppendOptions,
     ) FloError!types.StreamAppendResult {
         const ns = self.client.getNamespace(options.namespace);
-
-        // Headers are sent in the value field, not as TLV option
-        // (no TLV options needed for append)
+        const value = try encodeAppendValue(self.client.allocator, payload, options.headers);
+        defer self.client.allocator.free(value);
 
         var response = try self.client.sendRequest(
             .stream_append,
             ns,
             stream_name,
-            payload,
+            value,
             "", // options
         );
         defer response.deinit();
@@ -56,6 +55,39 @@ pub const Stream = struct {
                 .timestamp_ms = std.mem.readInt(u64, response.data[8..16], .little),
             },
         };
+    }
+
+    /// An append's value: the record as a batch of one, the form the server
+    /// reads: [count:u32][len:u32][payload][hdr_count:u16]
+    /// ([key_len:u16][key][val_len:u16][val])*.
+    pub fn encodeAppendValue(allocator: std.mem.Allocator, payload: []const u8, headers: []const types.Header) FloError![]u8 {
+        if (headers.len > std.math.maxInt(u16)) return FloError.ValueTooLarge;
+        if (payload.len > std.math.maxInt(u32)) return FloError.ValueTooLarge;
+        var size: usize = 4 + 4 + payload.len + 2;
+        for (headers) |h| {
+            if (h.key.len > std.math.maxInt(u16) or h.value.len > std.math.maxInt(u16)) return FloError.ValueTooLarge;
+            size += 2 + h.key.len + 2 + h.value.len;
+        }
+        const buf = allocator.alloc(u8, size) catch return FloError.OutOfMemory;
+        var pos: usize = 0;
+        std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+        pos += 4;
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(payload.len), .little);
+        pos += 4;
+        @memcpy(buf[pos..][0..payload.len], payload);
+        pos += payload.len;
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(headers.len), .little);
+        pos += 2;
+        for (headers) |h| {
+            for ([_][]const u8{ h.key, h.value }) |part| {
+                std.mem.writeInt(u16, buf[pos..][0..2], @intCast(part.len), .little);
+                pos += 2;
+                @memcpy(buf[pos..][0..part.len], part);
+                pos += part.len;
+            }
+        }
+        std.debug.assert(pos == size);
+        return buf;
     }
 
     /// Read records from a stream.
@@ -532,24 +564,34 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
         const header_count = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
 
-        var headers: ?[]const u8 = null;
-        if (header_count > 0) {
-            // Capture raw header bytes for zero-copy access
-            const headers_start = pos;
-            var h: u32 = 0;
-            while (h < header_count) : (h += 1) {
-                if (pos + 4 > data.len) return FloError.IncompleteResponse;
-                const hkey_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-                pos += 4;
-                if (pos + hkey_len > data.len) return FloError.IncompleteResponse;
-                pos += hkey_len;
-                if (pos + 4 > data.len) return FloError.IncompleteResponse;
-                const hval_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-                pos += 4;
-                if (pos + hval_len > data.len) return FloError.IncompleteResponse;
-                pos += hval_len;
+        // Each header takes at least its two lengths, so a count the answer
+        // can't hold is refused before it sizes an allocation.
+        if (header_count > (data.len - pos) / 8) return FloError.IncompleteResponse;
+        const headers = allocator.alloc(types.Header, header_count) catch return FloError.OutOfMemory;
+        var filled: usize = 0;
+        errdefer {
+            for (headers[0..filled]) |h| {
+                allocator.free(h.key);
+                allocator.free(h.value);
             }
-            headers = allocator.dupe(u8, data[headers_start..pos]) catch return FloError.OutOfMemory;
+            allocator.free(headers);
+        }
+        while (filled < header_count) : (filled += 1) {
+            var parts: [2][]const u8 = undefined;
+            for (&parts) |*part| {
+                if (pos + 4 > data.len) return FloError.IncompleteResponse;
+                const len = std.mem.readInt(u32, data[pos..][0..4], .little);
+                pos += 4;
+                if (len > data.len - pos) return FloError.IncompleteResponse;
+                part.* = data[pos..][0..len];
+                pos += len;
+            }
+            const key = allocator.dupe(u8, parts[0]) catch return FloError.OutOfMemory;
+            const value = allocator.dupe(u8, parts[1]) catch {
+                allocator.free(key);
+                return FloError.OutOfMemory;
+            };
+            headers[filled] = .{ .key = key, .value = value };
         }
 
         records[i] = .{
@@ -646,4 +688,50 @@ test "a read answer whose count the data can't hold is refused before allocating
     var buf = [_]u8{0} ** (4 + 30);
     std.mem.writeInt(u32, buf[0..4], 0xffff_ffff, .little);
     try std.testing.expectError(FloError.IncompleteResponse, parseStreamReadResponse(std.testing.allocator, &buf));
+}
+
+test "an append sends its record as a batch of one, headers included" {
+    const value = try Stream.encodeAppendValue(std.testing.allocator, "hi", &.{.{ .key = "k", .value = "vv" }});
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 0, 0, 2, 0, 0, 0, 'h', 'i', 1, 0, 1, 0, 'k', 2, 0, 'v', 'v' }, value);
+    const bare = try Stream.encodeAppendValue(std.testing.allocator, "x", &.{});
+    defer std.testing.allocator.free(bare);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 0, 0, 1, 0, 0, 0, 'x', 0, 0 }, bare);
+}
+
+/// A read answer of one record, payload "p", headers source=web and a="".
+fn testHeaderAnswer(a: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
+    try list.appendSlice(a, &std.mem.toBytes(@as(u32, 1)));
+    try list.appendSlice(a, &std.mem.toBytes(@as(u64, 5)));
+    try list.appendSlice(a, &std.mem.toBytes(@as(i64, 1000)));
+    try list.append(a, 0); // tier
+    try list.appendSlice(a, &std.mem.toBytes(@as(u32, 0))); // partition
+    try list.append(a, 0); // no key
+    try list.appendSlice(a, &std.mem.toBytes(@as(u32, 1)));
+    try list.append(a, 'p');
+    try list.appendSlice(a, &std.mem.toBytes(@as(u32, 2)));
+    for ([_][]const u8{ "source", "web", "a", "" }) |part| {
+        try list.appendSlice(a, &std.mem.toBytes(@as(u32, @intCast(part.len))));
+        try list.appendSlice(a, part);
+    }
+}
+
+fn parseHeadersAndFree(a: std.mem.Allocator, data: []const u8) !void {
+    var res = try parseStreamReadResponse(a, data);
+    res.deinit();
+}
+
+test "a read's headers decode into pairs, and a cut answer or no memory leaks nothing" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(a);
+    try testHeaderAnswer(a, &list);
+    var res = try parseStreamReadResponse(a, list.items);
+    defer res.deinit();
+    try std.testing.expectEqual(@as(usize, 2), res.records[0].headers.len);
+    try std.testing.expectEqualStrings("source", res.records[0].headers[0].key);
+    try std.testing.expectEqualStrings("web", res.records[0].headers[0].value);
+    try std.testing.expectEqualStrings("", res.records[0].headers[1].value);
+    for (4..list.items.len) |n| try std.testing.expectError(FloError.IncompleteResponse, parseHeadersAndFree(a, list.items[0..n]));
+    try std.testing.checkAllAllocationFailures(a, parseHeadersAndFree, .{@as([]const u8, list.items)});
 }
