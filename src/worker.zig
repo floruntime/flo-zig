@@ -181,9 +181,13 @@ pub const ActionWorker = struct {
     worker_id: []const u8,
     handlers: std.StringHashMap(ActionHandler),
     action_names: std.ArrayListUnmanaged([]const u8),
+    /// Both written from other threads (stop, drain); always accessed
+    /// atomically.
     running: bool = false,
     backoff: types.EmptyPollBackoff = .{},
     draining: bool = false,
+    /// Whether the server has been told of the drain; the poll loop's alone.
+    drain_sent: bool = false,
     active_tasks: u32 = 0,
     last_heartbeat_ns: i128 = 0,
     /// Each action's registered timeout_ms, keyed by its owned name.
@@ -333,12 +337,12 @@ pub const ActionWorker = struct {
 
         try self.registerWorker();
 
-        self.running = true;
+        @atomicStore(bool, &self.running, true, .monotonic);
         self.last_heartbeat_ns = std.time.nanoTimestamp();
         var failed = retry_mod.workerBackoff();
 
         // Main polling loop
-        while (self.running) {
+        while (@atomicLoad(bool, &self.running, .monotonic)) {
             if (!self.client.isConnected()) {
                 self.reconnect() catch |err| {
                     std.log.err("[flo-worker] Reconnect failed: {}, retrying...", .{err});
@@ -350,15 +354,26 @@ pub const ActionWorker = struct {
             // Send heartbeat if interval has elapsed
             self.maybeHeartbeat();
 
+            const draining = @atomicLoad(bool, &self.draining, .monotonic);
+            // drain() only sets the flag: the poll connection is this
+            // thread's, so the server hears of the drain from here.
+            if (draining and !self.drain_sent) {
+                self.drain_sent = true;
+                var actions = self.api();
+                actions.drain(self.worker_id, .{ .namespace = self.config.namespace }) catch |err| {
+                    std.log.err("[flo-worker] Failed to notify server of drain: {}", .{err});
+                };
+            }
+
             // If draining and no active tasks, we're done
-            if (self.draining and self.activeTasks() == 0) {
+            if (draining and self.activeTasks() == 0) {
                 std.log.info("[flo-worker] Drain complete, shutting down", .{});
-                self.running = false;
+                @atomicStore(bool, &self.running, false, .monotonic);
                 break;
             }
 
             // Don't accept new tasks while draining
-            if (self.draining) {
+            if (draining) {
                 std.Thread.sleep(100 * std.time.ns_per_ms);
                 continue;
             }
@@ -440,18 +455,14 @@ pub const ActionWorker = struct {
         @atomicStore(bool, &self.running, false, .monotonic);
     }
 
-    /// Initiate graceful drain — finish current tasks but accept no new ones.
+    /// Initiate graceful drain: finish current tasks but accept no new ones.
+    /// Safe from any thread: it only sets a flag, and the poll loop tells
+    /// the server on its own connection, then stops once the running tasks
+    /// have reported. The loop sees the flag between polls, so that can take
+    /// up to block_ms, and a task handed out meanwhile is still run.
     pub fn drain(self: *Self) void {
         std.log.info("[flo-worker] Draining worker...", .{});
-        self.draining = true;
-
-        // Notify server
-        var actions = self.api();
-        actions.drain(self.worker_id, .{
-            .namespace = self.config.namespace,
-        }) catch |err| {
-            std.log.err("[flo-worker] Failed to notify server of drain: {}", .{err});
-        };
+        @atomicStore(bool, &self.draining, true, .monotonic);
     }
 
     /// Send heartbeat if the interval has elapsed.
@@ -474,10 +485,11 @@ pub const ActionWorker = struct {
             return;
         };
 
-        // Server may tell us to drain
-        if (status == .draining and !self.draining) {
+        // Server may tell us to drain; it knows already, so nothing is sent.
+        if (status == .draining and !@atomicLoad(bool, &self.draining, .monotonic)) {
             std.log.info("[flo-worker] Server requested drain", .{});
-            self.draining = true;
+            self.drain_sent = true;
+            @atomicStore(bool, &self.draining, true, .monotonic);
         }
     }
 
@@ -1378,4 +1390,47 @@ test "ActionWorker gives each concurrent task's auto_touch a connection of its o
     // The poll connection, and per task one for its result and one for its
     // touches: a stalled touch holds up only its own task.
     try std.testing.expectEqual(@as(u32, 5), srv.connections.load(.monotonic));
+}
+
+test "ActionWorker drain from another thread only sets the flag, and the poll loop tells the server, then start returns" {
+    var srv = try ScriptServer.listen();
+    // The await is answered after 500 ms, so the poll loop is inside it when
+    // drain is called.
+    srv.rules = &.{.{ .op = .action_await, .action = .{ .reply = .{ .status = 0, .delay_ms = 500 } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 1000 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    std.Thread.sleep(150 * std.time.ns_per_ms);
+    w.drain();
+    // drain() sent nothing itself: sending from this thread would share
+    // the poll connection with the await in flight.
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.worker_drain));
+    thread.join();
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_drain));
+    try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
+}
+
+test "ActionWorker tells the server of a drain once, though tasks still run while it waits for them" {
+    var srv = try ScriptServer.listen();
+    srv.concurrent = true;
+    srv.rules = &.{.{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100, .concurrency = 2 });
+    defer w.deinit();
+    // The loop goes round many times while this runs, still draining.
+    try w.registerAction("job", touch_test.sleeps(400), .{});
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    var waited: u32 = 0;
+    while (srv.countOf(.action_await) < 1 and waited < 5000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    w.drain();
+    thread.join();
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_drain));
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_complete));
 }
