@@ -793,12 +793,16 @@ pub const StreamRecord = struct {
     tier: StorageTier = .hot,
     stream: []const u8 = "",
     payload: []const u8,
-    headers: ?[]const u8 = null,
+    headers: []const Header = &.{},
 
     pub fn deinit(self: *StreamRecord, allocator: std.mem.Allocator) void {
         allocator.free(self.payload);
         if (self.stream.len > 0) allocator.free(self.stream);
-        if (self.headers) |h| allocator.free(h);
+        for (self.headers) |h| {
+            allocator.free(h.key);
+            allocator.free(h.value);
+        }
+        allocator.free(self.headers);
     }
 };
 
@@ -830,11 +834,18 @@ pub const StreamInfo = struct {
 };
 
 /// Options for stream append operations
+/// A header stored with a stream record.
+pub const Header = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 pub const StreamAppendOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Headers to attach to the record (key=value pairs separated by newlines)
-    headers: ?[]const u8 = null,
+    /// Headers stored with the record, at most 65,535, each key and value
+    /// at most 65,535 bytes.
+    headers: []const Header = &.{},
 };
 
 /// Options for stream read operations

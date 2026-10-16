@@ -259,6 +259,9 @@ var stream = flo.Stream.init(&client);
 
 // Append record to stream
 const result = try stream.append("events", "payload data", .{});
+
+// With headers, stored with the record and read back as key/value pairs
+_ = try stream.append("events", "payload data", .{ .headers = &.{.{ .key = "source", .value = "web" }} });
 std.debug.print("Appended at seq={d}\n", .{result.first_offset});
 
 // Read from beginning

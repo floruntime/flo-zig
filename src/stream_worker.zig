@@ -100,7 +100,7 @@ pub const StreamContext = struct {
     }
 
     /// Get the record's headers.
-    pub fn headers(self: *const StreamContext) ?std.StringHashMap([]const u8) {
+    pub fn headers(self: *const StreamContext) []const types.Header {
         return self.record.headers;
     }
 
@@ -779,4 +779,11 @@ test "StreamWorker does not resend an ack the server refused, and runs the rest 
     try std.testing.expectEqual(@as(u32, 2), srv.countOf(.stream_group_ack));
     try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_nack));
     try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
+}
+
+test "a stream context hands its record's headers back as pairs" {
+    const headers = [_]types.Header{.{ .key = "source", .value = "web" }};
+    var ctx: StreamContext = undefined;
+    ctx.record = .{ .payload = "", .headers = &headers };
+    try std.testing.expectEqualStrings("web", ctx.headers()[0].value);
 }
