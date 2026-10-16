@@ -24,6 +24,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // Live tests against a running server: FLO_ENDPOINT (and FLO_BINARY for
+    // the version check). They skip without it, except under CI=1.
+    const live_module = b.createModule(.{
+        .root_source_file = b.path("tests/live.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    live_module.addImport("flo", flo_module);
+    const live_tests = b.addTest(.{ .root_module = live_module });
+    const run_live_tests = b.addRunArtifact(live_tests);
+    // The server's state, not the test binary, decides the result.
+    run_live_tests.has_side_effects = true;
+    const live_step = b.step("test-live", "Run the live tests against FLO_ENDPOINT");
+    live_step.dependOn(&run_live_tests.step);
+
     // Basic example executable
     const basic_example_module = b.createModule(.{
         .root_source_file = b.path("examples/basic.zig"),
