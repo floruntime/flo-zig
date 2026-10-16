@@ -14,8 +14,42 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  # The flo the live tests run against: the commit pinned in
+  # .github/flo-ref.env, built and handed to the test job.
+  flo:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the pinned flo commit
+        run: |
+          . ./.github/flo-ref.env
+          # A branch or tag would be checked out as readily, and move.
+          [[ $FLO_REF =~ ^[0-9a-f]{40}$ ]] || { echo "FLO_REF must be a full commit SHA"; exit 1; }
+          echo "FLO_REF=$FLO_REF" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: floruntime/flo
+          ref: ${{ env.FLO_REF }}
+          path: flo-src
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      # For x86-64-v2, not this runner's CPU: the test job runs on another
+      # machine, where a native build can die on an illegal instruction.
+      - name: Build flo
+        working-directory: flo-src
+        run: zig build --release=safe -Dcpu=x86_64_v2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flo
+          path: flo-src/zig-out/bin/flo
+          retention-days: 1
+
+  test:
+    needs: flo
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -23,10 +57,36 @@ jobs:
           version: 0.15.2
 
       - name: Format
-        run: zig fmt --check src examples build.zig build.zig.zon
+        run: zig fmt --check src examples tests build.zig build.zig.zon
 
       - name: Build
         run: zig build --summary all
 
       - name: Test
         run: zig build test --summary all
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: flo
+          path: ${{ runner.temp }}/flo-bin
+      - name: Start the pinned flo
+        run: |
+          cd "$RUNNER_TEMP"
+          chmod +x flo-bin/flo
+          echo "FLO_BINARY=$RUNNER_TEMP/flo-bin/flo" >> "$GITHUB_ENV"
+          mkdir -p flo-data
+          ./flo-bin/flo server start --port 4453 --data-dir "$RUNNER_TEMP/flo-data" > flo-server.log 2>&1 &
+          for _ in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/4453) 2>/dev/null; then exit 0; fi
+            sleep 0.2
+          done
+          echo "flo server did not start"; cat flo-server.log; exit 1
+      - name: Live tests
+        # CI=1 turns a missing server into a failure, not a skip.
+        env:
+          CI: "1"
+          FLO_ENDPOINT: localhost:4453
+        run: zig build test-live --summary all
+      - name: Server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/flo-server.log"

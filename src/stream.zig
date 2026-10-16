@@ -735,3 +735,16 @@ test "a read's headers decode into pairs, and a cut answer or no memory leaks no
     for (4..list.items.len) |n| try std.testing.expectError(FloError.IncompleteResponse, parseHeadersAndFree(a, list.items[0..n]));
     try std.testing.checkAllAllocationFailures(a, parseHeadersAndFree, .{@as([]const u8, list.items)});
 }
+
+test "an append refuses a header past what its u16 lengths hold" {
+    const a = std.testing.allocator;
+    const long = try a.alloc(u8, std.math.maxInt(u16) + 1);
+    defer a.free(long);
+    @memset(long, 'x');
+    try std.testing.expectError(FloError.ValueTooLarge, Stream.encodeAppendValue(a, "p", &.{.{ .key = "k", .value = long }}));
+    try std.testing.expectError(FloError.ValueTooLarge, Stream.encodeAppendValue(a, "p", &.{.{ .key = long, .value = "v" }}));
+    // The longest that fit are sent.
+    const value = try Stream.encodeAppendValue(a, "p", &.{.{ .key = "k", .value = long[0..std.math.maxInt(u16)] }});
+    defer a.free(value);
+    try std.testing.expectEqual(@as(usize, 4 + 4 + 1 + 2 + 2 + 1 + 2 + std.math.maxInt(u16)), value.len);
+}

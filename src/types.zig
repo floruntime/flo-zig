@@ -12,7 +12,9 @@ pub const VERSION: u8 = 0x02;
 
 /// The hash of the op table this SDK was built for, written into every
 /// request header. A server built from another table refuses the request,
-/// and its answers carry its own hash, which this SDK refuses.
+/// and its answers carry its own hash, which this SDK refuses. Bump it in
+/// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
+/// against a server built with it.
 pub const TABLE_HASH: u64 = 0x3ac05a0a877bda48;
 
 /// Why the server refused a request. Mirrors the server's list; the table
@@ -833,13 +835,13 @@ pub const StreamInfo = struct {
     partition_count: u32 = 1,
 };
 
-/// Options for stream append operations
 /// A header stored with a stream record.
 pub const Header = struct {
     key: []const u8,
     value: []const u8,
 };
 
+/// Options for stream append operations
 pub const StreamAppendOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
