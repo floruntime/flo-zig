@@ -122,6 +122,19 @@ pub const Actions = struct {
         return parseActionRunStatus(self.client.allocator, run_id, response.data);
     }
 
+    /// A page of the namespace's workers, in id order: those after
+    /// `options.cursor`, at most `options.limit`. Pass the page's cursor to
+    /// get the next; it is null on the last page.
+    /// **Caller owns the returned page and must call `page.deinit()`.**
+    pub fn listWorkers(self: *Self, options: types.WorkerListOptions) FloError!types.WorkerListPage {
+        var buf: [MAX_WORKER_LIST_BODY]u8 = undefined;
+        const body = try encodeWorkerListBody(&buf, options.limit, options.cursor orelse "");
+        var response = try self.client.sendRequest(.worker_list, self.client.getNamespace(options.namespace), "", body, "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeWorkerListAnswer(self.client.allocator, response.data);
+    }
+
     /// Delete an action.
     pub fn deleteAction(
         self: *Self,
@@ -649,6 +662,77 @@ fn parseTaskAssignment(allocator: std.mem.Allocator, data: []const u8) FloError!
 /// The longest worker id an answer carries: the server's key bound.
 const max_worker_id = 4096;
 
+/// The longest machine id a worker.list row carries.
+const max_machine_id = 255;
+
+const MAX_WORKER_LIST_BODY = 1 + 4 + 2 + max_worker_id;
+
+/// worker.list's request: limit (present), cursor ("" for the first page).
+fn encodeWorkerListBody(buf: *[MAX_WORKER_LIST_BODY]u8, limit: u32, cursor: []const u8) FloError![]const u8 {
+    if (limit < 1 or limit > types.MAX_WORKER_LIST) return FloError.BadRequest;
+    if (cursor.len > max_worker_id) return FloError.BadRequest;
+    buf[0] = 1;
+    std.mem.writeInt(u32, buf[1..5], limit, .little);
+    std.mem.writeInt(u16, buf[5..7], @intCast(cursor.len), .little);
+    @memcpy(buf[7..][0..cursor.len], cursor);
+    return buf[0 .. 7 + cursor.len];
+}
+
+/// worker.list's answer: rows (u16 count), each {id, worker_type, status,
+/// current_load, max_concurrency, tasks_completed, tasks_failed,
+/// registered_at_ms, last_heartbeat_ms, machine_id?}, then cursor?.
+fn decodeWorkerListAnswer(allocator: std.mem.Allocator, data: []const u8) FloError!types.WorkerListPage {
+    const min_row = 2 + 1 + 1 + 4 + 4 + 8 + 8 + 8 + 8 + 1;
+    var r: Reader = .{ .data = data };
+    const n = try r.int(u16);
+    // A count the data can't hold is refused before it sizes an allocation.
+    if (n > types.MAX_WORKER_LIST or n > r.remaining() / min_row) return FloError.IncompleteResponse;
+    const workers = allocator.alloc(types.WorkerInfo, n) catch return FloError.OutOfMemory;
+    var got: usize = 0;
+    errdefer {
+        for (workers[0..got]) |w| {
+            allocator.free(w.id);
+            if (w.machine_id) |m| allocator.free(m);
+        }
+        allocator.free(workers);
+    }
+    while (got < n) : (got += 1) {
+        const id = try r.lenBytes(u16);
+        if (id.len > max_worker_id) return FloError.IncompleteResponse;
+        const worker_type = std.meta.intToEnum(types.WorkerType, try r.int(u8)) catch return FloError.IncompleteResponse;
+        const status = std.meta.intToEnum(types.WorkerStatus, try r.int(u8)) catch return FloError.IncompleteResponse;
+        const current_load = try r.int(u32);
+        const max_concurrency = try r.int(u32);
+        const tasks_completed = try r.int(u64);
+        const tasks_failed = try r.int(u64);
+        const registered_at_ms = try r.int(i64);
+        const last_heartbeat_ms = try r.int(i64);
+        const machine_id = if (try r.boolean()) try r.lenBytes(u8) else null;
+        const id_copy = allocator.dupe(u8, id) catch return FloError.OutOfMemory;
+        errdefer allocator.free(id_copy);
+        workers[got] = .{
+            .id = id_copy,
+            .worker_type = worker_type,
+            .status = status,
+            .current_load = current_load,
+            .max_concurrency = max_concurrency,
+            .tasks_completed = tasks_completed,
+            .tasks_failed = tasks_failed,
+            .registered_at_ms = registered_at_ms,
+            .last_heartbeat_ms = last_heartbeat_ms,
+            .machine_id = if (machine_id) |m| allocator.dupe(u8, m) catch return FloError.OutOfMemory else null,
+        };
+    }
+    const cursor = if (try r.boolean()) try r.lenBytes(u16) else null;
+    if (cursor) |c| if (c.len > max_worker_id) return FloError.IncompleteResponse;
+    try r.end();
+    return .{
+        .workers = workers,
+        .cursor = if (cursor) |c| allocator.dupe(u8, c) catch return FloError.OutOfMemory else null,
+        .allocator = allocator,
+    };
+}
+
 /// action.status's answer: [status:u8][created_at:i64][started_at:?i64]
 /// [completed_at:?i64][attempt:u32][output:?(u16 len, bytes)]
 /// [error_message:?(u16 len, bytes)][worker_id:?(u16 len, bytes)], each
@@ -829,4 +913,119 @@ test "a run status byte this client doesn't know refuses the answer" {
     var answer = completed_status_answer.*;
     answer[0] = 200;
     try std.testing.expectError(FloError.IncompleteResponse, parseActionRunStatus(std.testing.allocator, "run-1", &answer));
+}
+
+const test_server = @import("test_server.zig");
+
+/// A worker.list row as the server encodes it.
+fn testWorkerRow(out: *std.ArrayList(u8), a: std.mem.Allocator, id: []const u8, status: u8, machine_id: ?[]const u8) !void {
+    var n: [8]u8 = undefined;
+    std.mem.writeInt(u16, n[0..2], @intCast(id.len), .little);
+    try out.appendSlice(a, n[0..2]);
+    try out.appendSlice(a, id);
+    try out.appendSlice(a, &.{ 1, status }); // stream, status
+    std.mem.writeInt(u32, n[0..4], 2, .little); // current_load
+    try out.appendSlice(a, n[0..4]);
+    std.mem.writeInt(u32, n[0..4], 8, .little); // max_concurrency
+    try out.appendSlice(a, n[0..4]);
+    for ([_]u64{ 5, 1, 1000, 2000 }) |v| { // completed, failed, registered, heartbeat
+        std.mem.writeInt(u64, &n, v, .little);
+        try out.appendSlice(a, &n);
+    }
+    if (machine_id) |m| {
+        try out.appendSlice(a, &.{ 1, @intCast(m.len) });
+        try out.appendSlice(a, m);
+    } else try out.append(a, 0);
+}
+
+test "listWorkers sends its limit and cursor and returns the rows and the next cursor" {
+    const a = std.testing.allocator;
+    var answer: std.ArrayList(u8) = .empty;
+    defer answer.deinit(a);
+    try answer.appendSlice(a, &.{ 2, 0 });
+    try testWorkerRow(&answer, a, "w1", 0, "host-a");
+    try testWorkerRow(&answer, a, "w2", 2, null);
+    try answer.appendSlice(a, &.{ 1, 2, 0, 'w', '2' }); // cursor "w2"
+
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{ .{ .status = 0, .body = answer.items }, .{ .status = 0, .body = &.{ 0, 0, 0 } } };
+    try srv.start();
+    defer srv.deinit();
+    var client = @import("client.zig").Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var actions = Actions.init(&client);
+
+    var page = try actions.listWorkers(.{ .limit = 2, .cursor = "w0" });
+    defer page.deinit();
+    // [present][limit:u32][cursor_len:u16][cursor]
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 0, 0, 0, 2, 0, 'w', '0' }, srv.lastBody());
+    try std.testing.expectEqual(@as(usize, 2), page.workers.len);
+    const w1 = page.workers[0];
+    try std.testing.expectEqualStrings("w1", w1.id);
+    try std.testing.expectEqual(types.WorkerType.stream, w1.worker_type);
+    try std.testing.expectEqual(types.WorkerStatus.active, w1.status);
+    try std.testing.expectEqual(@as(u32, 2), w1.current_load);
+    try std.testing.expectEqual(@as(u32, 8), w1.max_concurrency);
+    try std.testing.expectEqual(@as(u64, 5), w1.tasks_completed);
+    try std.testing.expectEqual(@as(u64, 1), w1.tasks_failed);
+    try std.testing.expectEqual(@as(i64, 1000), w1.registered_at_ms);
+    try std.testing.expectEqual(@as(i64, 2000), w1.last_heartbeat_ms);
+    try std.testing.expectEqualStrings("host-a", w1.machine_id.?);
+    try std.testing.expectEqual(types.WorkerStatus.draining, page.workers[1].status);
+    try std.testing.expect(page.workers[1].machine_id == null);
+    try std.testing.expectEqualStrings("w2", page.cursor.?);
+
+    // The first page: an empty cursor and the default limit, the server's.
+    var last = try actions.listWorkers(.{});
+    defer last.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 4, 0, 0, 0, 0 }, srv.lastBody());
+    try std.testing.expectEqual(@as(usize, 0), last.workers.len);
+    try std.testing.expect(last.cursor == null);
+}
+
+test "listWorkers refuses a limit out of range before sending, and an answer it can't read whole" {
+    const a = std.testing.allocator;
+    var client = @import("client.zig").Client.init(a, "localhost:1", .{});
+    defer client.deinit();
+    var actions = Actions.init(&client);
+    try std.testing.expectError(FloError.BadRequest, actions.listWorkers(.{ .limit = 0 }));
+    try std.testing.expectError(FloError.BadRequest, actions.listWorkers(.{ .limit = types.MAX_WORKER_LIST + 1 }));
+
+    // One row, then no cursor: read whole as it stands.
+    var ok: std.ArrayList(u8) = .empty;
+    defer ok.deinit(a);
+    try ok.appendSlice(a, &.{ 1, 0 });
+    try testWorkerRow(&ok, a, "w", 0, null);
+    try ok.append(a, 0);
+    var page = try decodeWorkerListAnswer(a, ok.items);
+    page.deinit();
+
+    const status_at = 2 + 2 + 1 + 1; // count, id length, id, worker_type
+    const unknown_status = try a.dupe(u8, ok.items);
+    defer a.free(unknown_status);
+    unknown_status[status_at] = 9;
+    const trailing = try std.mem.concat(a, u8, &.{ ok.items, &.{7} });
+    defer a.free(trailing);
+    const cut = ok.items[0 .. ok.items.len - 3];
+    const too_many = [_]u8{ 0xff, 0xff, 0 };
+    for ([_][]const u8{ unknown_status, trailing, cut, &too_many }) |data| {
+        try std.testing.expectError(FloError.IncompleteResponse, decodeWorkerListAnswer(a, data));
+    }
+}
+
+fn decodeWorkerListAndFree(allocator: std.mem.Allocator, data: []const u8) !void {
+    var page = try decodeWorkerListAnswer(allocator, data);
+    page.deinit();
+}
+
+test "a worker.list answer frees what it allocated when an allocation fails" {
+    const a = std.testing.allocator;
+    var answer: std.ArrayList(u8) = .empty;
+    defer answer.deinit(a);
+    try answer.appendSlice(a, &.{ 2, 0 });
+    try testWorkerRow(&answer, a, "w1", 0, "host-a");
+    try testWorkerRow(&answer, a, "w2", 1, null);
+    try answer.appendSlice(a, &.{ 1, 2, 0, 'w', '2' }); // cursor "w2"
+    try std.testing.checkAllAllocationFailures(a, decodeWorkerListAndFree, .{@as([]const u8, answer.items)});
 }
