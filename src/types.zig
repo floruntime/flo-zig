@@ -1088,6 +1088,50 @@ pub const ProcessEntry = struct {
 };
 
 /// Options for worker registration
+/// The most workers one worker.list page holds.
+pub const MAX_WORKER_LIST: u32 = 1024;
+
+/// One worker as worker.list shows it.
+pub const WorkerInfo = struct {
+    id: []const u8,
+    worker_type: WorkerType,
+    status: WorkerStatus,
+    current_load: u32,
+    max_concurrency: u32,
+    tasks_completed: u64,
+    tasks_failed: u64,
+    registered_at_ms: i64,
+    last_heartbeat_ms: i64,
+    machine_id: ?[]const u8,
+};
+
+/// A page of a namespace's workers, in id order.
+pub const WorkerListPage = struct {
+    workers: []WorkerInfo,
+    /// The last id on the page, to ask for the next one with; null on the
+    /// last page.
+    cursor: ?[]const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *WorkerListPage) void {
+        for (self.workers) |w| {
+            self.allocator.free(w.id);
+            if (w.machine_id) |m| self.allocator.free(m);
+        }
+        self.allocator.free(self.workers);
+        if (self.cursor) |c| self.allocator.free(c);
+    }
+};
+
+pub const WorkerListOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// The cursor the previous page returned; null for the first page.
+    cursor: ?[]const u8 = null,
+    /// Workers per page, 1 to 1024.
+    limit: u32 = MAX_WORKER_LIST,
+};
+
 pub const WorkerRegisterOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,

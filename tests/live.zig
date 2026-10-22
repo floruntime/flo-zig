@@ -266,39 +266,67 @@ const ListedWorker = struct {
     }
 };
 
-/// Worker `id` as worker.list's first page shows it, or null. Encoded by
-/// hand: request {limit: Defaulted(u32), cursor: Bytes}, answer {workers:
-/// list (u16 count) of rows, cursor: Optional(Bytes)}.
+/// Worker `id` as worker.list shows it, or null, paging to the last page.
 fn listedWorker(client: *flo.Client, id: []const u8) !?ListedWorker {
-    const body = "\x01" ++ "\x00\x04\x00\x00" ++ "\x00\x00"; // limit 1024, no cursor
-    var resp = try client.sendRequest(.worker_list, client.getNamespace(null), "", body, "");
-    defer resp.deinit();
-    if (resp.status != .ok) return resp.status.toError();
-    const d = resp.data;
-    var pos: usize = 0;
-    const count = std.mem.readInt(u16, d[pos..][0..2], .little);
-    pos += 2;
-    var found: ?ListedWorker = null;
-    for (0..count) |_| {
-        const id_len = std.mem.readInt(u16, d[pos..][0..2], .little);
-        const row_id = d[pos + 2 ..][0..id_len];
-        pos += 2 + id_len;
-        var row: ListedWorker = .{
-            .worker_type = d[pos],
-            .max_concurrency = std.mem.readInt(u32, d[pos + 6 ..][0..4], .little),
-            .registered_at_ms = std.mem.readInt(i64, d[pos + 26 ..][0..8], .little),
-        };
-        // type, status, load, max_concurrency, completed, failed, registered, heartbeat
-        pos += 1 + 1 + 4 + 4 + 8 + 8 + 8 + 8;
-        if (d[pos] == 1) {
-            const n = d[pos + 1];
-            @memcpy(row.machine_id_buf[0..n], d[pos + 2 ..][0..n]);
-            row.machine_id_len = n;
-            pos += 2 + n;
-        } else pos += 1;
-        if (std.mem.eql(u8, row_id, id)) found = row;
+    var actions = flo.Actions.init(client);
+    var cursor_buf: [4096]u8 = undefined;
+    var cursor: ?[]const u8 = null;
+    while (true) {
+        var page = try actions.listWorkers(.{ .cursor = cursor });
+        defer page.deinit();
+        for (page.workers) |w| {
+            if (!std.mem.eql(u8, w.id, id)) continue;
+            var row: ListedWorker = .{
+                .worker_type = @intFromEnum(w.worker_type),
+                .max_concurrency = w.max_concurrency,
+                .registered_at_ms = w.registered_at_ms,
+            };
+            if (w.machine_id) |m| {
+                @memcpy(row.machine_id_buf[0..m.len], m);
+                row.machine_id_len = m.len;
+            }
+            return row;
+        }
+        const next = page.cursor orelse return null;
+        @memcpy(cursor_buf[0..next.len], next);
+        cursor = cursor_buf[0..next.len];
     }
-    return found;
+}
+
+test "live: worker.list pages a namespace's workers in id order" {
+    const ep = try endpoint();
+    var ns_buf: [32]u8 = undefined;
+    const namespace = freshNamespace(&ns_buf);
+    var client = flo.Client.init(testing.allocator, ep, .{ .namespace = namespace, .timeout_ms = 10_000 });
+    defer client.deinit();
+    try client.connect();
+    var actions = flo.Actions.init(&client);
+    const ids = [_][]const u8{ "lw-1", "lw-2", "lw-3", "lw-4", "lw-5" };
+    for (ids) |id| try actions.register(id, &.{"job"}, .{ .max_concurrency = 3, .machine_id = "page-host" });
+
+    var seen: usize = 0;
+    var pages: usize = 0;
+    var cursor_buf: [4096]u8 = undefined;
+    var cursor: ?[]const u8 = null;
+    while (true) : (pages += 1) {
+        try testing.expect(pages < ids.len); // each page moves the cursor on
+        var page = try actions.listWorkers(.{ .limit = 2, .cursor = cursor });
+        defer page.deinit();
+        try testing.expect(page.workers.len <= 2);
+        for (page.workers) |w| {
+            try testing.expectEqualStrings(ids[seen], w.id);
+            try testing.expectEqual(flo.WorkerType.action, w.worker_type);
+            try testing.expectEqual(@as(u32, 3), w.max_concurrency);
+            try testing.expectEqualStrings("page-host", w.machine_id.?);
+            seen += 1;
+        }
+        const next = page.cursor orelse break;
+        if (cursor) |c| try testing.expect(std.mem.order(u8, next, c) == .gt);
+        @memcpy(cursor_buf[0..next.len], next);
+        cursor = cursor_buf[0..next.len];
+    }
+    try testing.expectEqual(ids.len, seen);
+    try testing.expectEqual(@as(usize, 2), pages); // pages 0, 1 and 2
 }
 
 // The server removes a worker silent past its removal time; the worker's
