@@ -74,19 +74,26 @@ jobs:
           cd "$RUNNER_TEMP"
           chmod +x flo-bin/flo
           echo "FLO_BINARY=$RUNNER_TEMP/flo-bin/flo" >> "$GITHUB_ENV"
-          mkdir -p flo-data
+          mkdir -p flo-data flo-data-fast
           ./flo-bin/flo server start --port 4453 --data-dir "$RUNNER_TEMP/flo-data" > flo-server.log 2>&1 &
-          for _ in $(seq 1 50); do
-            if (exec 3<>/dev/tcp/127.0.0.1/4453) 2>/dev/null; then exit 0; fi
-            sleep 0.2
+          # A second server that removes a worker silent for a second, for
+          # the re-registration test.
+          printf '[workers]\nheartbeat_timeout_ms = 1000\nremove_after_ms = 1000\n' > flo-fast-expiry.toml
+          ./flo-bin/flo server start --port 4463 --data-dir "$RUNNER_TEMP/flo-data-fast" --config "$RUNNER_TEMP/flo-fast-expiry.toml" > flo-server-fast.log 2>&1 &
+          for port in 4453 4463; do
+            for _ in $(seq 1 50); do
+              if (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null; then continue 2; fi
+              sleep 0.2
+            done
+            echo "flo server on $port did not start"; cat flo-server.log flo-server-fast.log; exit 1
           done
-          echo "flo server did not start"; cat flo-server.log; exit 1
       - name: Live tests
         # CI=1 turns a missing server into a failure, not a skip.
         env:
           CI: "1"
           FLO_ENDPOINT: localhost:4453
+          FLO_FAST_EXPIRY_ENDPOINT: localhost:4463
         run: zig build test-live --summary all
       - name: Server log
         if: failure()
-        run: cat "$RUNNER_TEMP/flo-server.log"
+        run: cat "$RUNNER_TEMP/flo-server.log" "$RUNNER_TEMP/flo-server-fast.log"

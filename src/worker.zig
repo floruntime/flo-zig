@@ -389,10 +389,14 @@ pub const ActionWorker = struct {
                 if (client_mod.isConnectionError(err)) {
                     std.log.warn("[flo-worker] Connection lost: {}, reconnecting...", .{err});
                     self.client.disconnect();
-                } else {
-                    const ms = failed.next(self.client.prng.random());
-                    std.log.err("[flo-worker] Await error: {}, retrying in {d}ms...", .{ err, ms });
-                    types.pauseUnlessHalted(&self.running, &self.draining, ms);
+                } else switch (self.awaitRefused(err)) {
+                    .draining => {},
+                    .unhealthy => types.pauseUnlessHalted(&self.running, &self.draining, failed.next(self.client.prng.random())),
+                    .other => {
+                        const ms = failed.next(self.client.prng.random());
+                        std.log.err("[flo-worker] Await error: {}, retrying in {d}ms...", .{ err, ms });
+                        types.pauseUnlessHalted(&self.running, &self.draining, ms);
+                    },
                 }
                 continue;
             };
@@ -514,23 +518,68 @@ pub const ActionWorker = struct {
 
         if (elapsed_ns < interval_ns) return;
 
-        self.last_heartbeat_ns = now;
+        self.heartbeat();
+    }
 
+    /// Heartbeat now. A worker the server removed for its silence is
+    /// answered not found, and registers again: unregistered, it would go on
+    /// taking work the registry doesn't know it holds. The registration marks
+    /// it active, so a drain is told again.
+    fn heartbeat(self: *Self) void {
+        self.last_heartbeat_ns = std.time.nanoTimestamp();
         var actions = self.api();
         const status = actions.heartbeat(
             self.worker_id,
             self.activeTasks(),
             .{ .namespace = self.config.namespace },
         ) catch |err| {
-            std.log.err("[flo-worker] Heartbeat failed: {}", .{err});
+            if (err != FloError.NotFound) {
+                std.log.err("[flo-worker] Heartbeat failed: {}", .{err});
+                return;
+            }
+            std.log.warn("[flo-worker] The server no longer knows this worker; registering again", .{});
+            self.registerWorker() catch |rerr| {
+                std.log.warn("[flo-worker] Failed to register again: {}", .{rerr});
+                if (client_mod.isConnectionError(rerr)) self.client.disconnect();
+                return;
+            };
+            if (@atomicLoad(bool, &self.draining, .monotonic)) {
+                self.drain_sent = false;
+                self.drain_retry_ns = 0;
+            }
             return;
         };
 
         // Server may tell us to drain; it knows already, so nothing is sent.
-        if (status == .draining and !@atomicLoad(bool, &self.draining, .monotonic)) {
-            std.log.info("[flo-worker] Server requested drain", .{});
-            self.drain_sent = true;
-            @atomicStore(bool, &self.draining, true, .monotonic);
+        if (status == .draining) self.serverDrained();
+    }
+
+    /// The server is draining this worker: take no more work, as for drain().
+    fn serverDrained(self: *Self) void {
+        if (@atomicLoad(bool, &self.draining, .monotonic)) return;
+        std.log.info("[flo-worker] Server requested drain", .{});
+        self.drain_sent = true;
+        @atomicStore(bool, &self.draining, true, .monotonic);
+    }
+
+    /// An await refused because the server sees this worker as unhealthy or
+    /// draining. Unhealthy: heartbeat at once (registering again if it was
+    /// removed), and the caller backs off before polling again. Draining:
+    /// stop taking work. Matched on the reason, never the message.
+    fn awaitRefused(self: *Self, err: anyerror) enum { unhealthy, draining, other } {
+        if (err != FloError.BadRequest) return .other;
+        const last = self.client.lastError() orelse return .other;
+        switch (last.reason) {
+            .worker_unhealthy => {
+                std.log.warn("[flo-worker] Await refused: the server missed this worker's heartbeats; heartbeating", .{});
+                self.heartbeat();
+                return .unhealthy;
+            },
+            .worker_draining => {
+                self.serverDrained();
+                return .draining;
+            },
+            else => return .other,
         }
     }
 
@@ -1630,4 +1679,124 @@ test "ActionWorker started again after a drain polls again" {
     try std.testing.expect(srv.countOf(.action_await) > awaits);
     w.stop();
     second.join();
+}
+
+/// A refusal's body: [reason:u16][ran:u8][message].
+const not_found_refusal = "\x0c\x00\x00worker not found";
+const unhealthy_refusal = "\x1b\x00\x00worker missed its heartbeats; send one, or register again";
+const draining_refusal = "\x1c\x00\x00worker is draining";
+
+test "ActionWorker registers again, with the same options, when its heartbeat finds it removed" {
+    const value_of = @import("test_server.zig").valueOf;
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .worker_heartbeat, .nth = 0, .action = .{ .reply = .{ .status = @intFromEnum(types.StatusCode.not_found), .body = not_found_refusal } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .concurrency = 3, .metadata = "{\"gpu\":true}", .machine_id = "host-1" });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    try w.registerWorker();
+    w.heartbeat();
+
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.worker_register));
+    const first = value_of(srv.requestOf(.worker_register, 0));
+    try std.testing.expect(std.mem.indexOf(u8, first, "host-1") != null);
+    try std.testing.expectEqualSlices(u8, first, value_of(srv.requestOf(.worker_register, 1)));
+    // A heartbeat that finds it known registers nothing.
+    w.heartbeat();
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.worker_register));
+}
+
+test "ActionWorker removed while draining tells the server of the drain again after registering" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .worker_heartbeat, .nth = 0, .action = .{ .reply = .{ .status = @intFromEnum(types.StatusCode.not_found), .body = not_found_refusal } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .heartbeat_interval_ms = 0 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    try w.registerWorker();
+    // Draining, and the server told: the step only heartbeats.
+    w.draining = true;
+    w.drain_sent = true;
+    w.drainStep();
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.worker_register));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.worker_drain));
+    w.drainStep();
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_drain));
+}
+
+test "ActionWorker heartbeats at once when an await is refused as unhealthy, and backs off before polling again" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .action_await, .action = .{ .reply = .{ .status = @intFromEnum(types.StatusCode.bad_request), .body = unhealthy_refusal } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    std.Thread.sleep(600 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+
+    const awaits = srv.countOf(.action_await);
+    // Each refusal is answered with a heartbeat, though the interval (30 s)
+    // is far off.
+    try std.testing.expect(awaits >= 1);
+    try std.testing.expectEqual(awaits, srv.countOf(.worker_heartbeat));
+    // Backing off from 100 ms: a handful of polls, not a hot loop.
+    try std.testing.expect(awaits <= 12);
+}
+
+test "ActionWorker stops taking work when an await is refused as draining" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .action_await, .action = .{ .reply = .{ .status = @intFromEnum(types.StatusCode.bad_request), .body = draining_refusal } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    drain_test.returned.store(false, .release);
+    const thread = try std.Thread.spawn(.{}, drain_test.run, .{&w});
+    defer thread.join();
+    try std.testing.expect(drain_test.returnedWithin(&w, 2_000));
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_await));
+    // The server drained it, so it isn't told.
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.worker_drain));
+}
+
+test "ActionWorker heartbeats the handlers running, not a slot waiting on a poll" {
+    const value_of = @import("test_server.zig").valueOf;
+    var srv = try ScriptServer.listen();
+    srv.concurrent = true;
+    srv.rules = &.{
+        .{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } },
+        .{ .op = .action_await, .action = .{ .reply = .{ .status = 0, .delay_ms = 30 } } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100, .concurrency = 2, .heartbeat_interval_ms = 1 });
+    defer w.deinit();
+    try w.registerAction("job", touch_test.sleeps(300), .{});
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+
+    // One handler ran throughout while the other slot polled: every
+    // heartbeat while it ran reports 1, never 2.
+    const heartbeats = srv.countOf(.worker_heartbeat);
+    try std.testing.expect(heartbeats >= 1);
+    var ones: u32 = 0;
+    for (0..heartbeats) |i| {
+        const load = std.mem.readInt(u32, value_of(srv.requestOf(.worker_heartbeat, @intCast(i)))[0..4], .little);
+        try std.testing.expect(load <= 1);
+        ones += @intFromBool(load == 1);
+    }
+    try std.testing.expect(ones >= 1);
 }

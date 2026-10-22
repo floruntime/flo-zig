@@ -231,7 +231,7 @@ pub const OptionsIterator = struct {
 /// and options: every KV op, and action.status.
 pub fn isTableOp(op: OpCode) bool {
     return switch (op) {
-        .kv_put, .kv_get, .kv_mget, .kv_delete, .kv_scan, .kv_history, .kv_incr, .kv_json_get, .kv_json_set, .kv_json_del, .kv_txn_begin, .kv_txn_commit, .kv_txn_rollback, .kv_expire, .kv_exists, .action_status => true,
+        .kv_put, .kv_get, .kv_mget, .kv_delete, .kv_scan, .kv_history, .kv_incr, .kv_json_get, .kv_json_set, .kv_json_del, .kv_txn_begin, .kv_txn_commit, .kv_txn_rollback, .kv_expire, .kv_exists, .action_status, .worker_list => true,
         else => false,
     };
 }
@@ -508,8 +508,17 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
-    try std.testing.expectEqual(@as(u64, 0x3ac05a0a877bda48), header.table_hash);
+    try std.testing.expectEqual(@as(u64, 0x2fba7dd9ae941830), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
+}
+
+test "a table op's frame is the envelope and its body: no value length, no options" {
+    var buffer: [128]u8 = undefined;
+    // worker.list: {limit: 1024, cursor: ""}.
+    const body = "\x01\x00\x04\x00\x00\x00\x00";
+    const frame = try serializeRequest(&buffer, 1, .worker_list, "ns", "", body, "");
+    try std.testing.expectEqualSlices(u8, "\x02\x00ns" ++ "\x00\x00" ++ body, frame[32..]);
+    try std.testing.expectError(FloError.IncompleteRequest, serializeRequest(&buffer, 1, .worker_list, "ns", "", body, "x"));
 }
 
 test "serializeSeqs" {

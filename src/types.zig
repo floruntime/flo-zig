@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x02;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0x3ac05a0a877bda48;
+pub const TABLE_HASH: u64 = 0x2fba7dd9ae941830;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -63,6 +63,12 @@ pub const Reason = enum(u16) {
     /// An action complete or fail for a run that has moved on (another worker
     /// holds it, or it finished). It was dropped; resending it is refused too.
     stale_report = 26,
+    /// An action await from a worker that missed its heartbeats: heartbeat,
+    /// or register again, before taking work.
+    worker_unhealthy = 27,
+    /// An action await from a worker the server is draining: it takes no
+    /// more work.
+    worker_draining = 28,
 };
 
 /// Whether a refused request took effect: retry logic reads this, not the
@@ -982,7 +988,10 @@ pub const TaskAssignment = struct {
 
 /// An action run's status. Times are ms since the epoch; `attempt` counts
 /// from 1 once a worker has taken the run. `output` is a completed run's
-/// result, and `error_message` the last failure's message.
+/// result, and `error_message` the last failure's message. `worker_id` is
+/// the worker holding the run, or last holding it; null until one takes it.
+/// Only the leader knows a take at once: another node may answer null, or
+/// an earlier worker, until the run's next update reaches it.
 pub const ActionRunStatus = struct {
     run_id: []const u8,
     status: RunStatus,
@@ -992,12 +1001,14 @@ pub const ActionRunStatus = struct {
     attempt: u32,
     output: ?[]const u8,
     error_message: ?[]const u8,
+    worker_id: ?[]const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ActionRunStatus) void {
         self.allocator.free(self.run_id);
         if (self.output) |o| self.allocator.free(o);
         if (self.error_message) |e| self.allocator.free(e);
+        if (self.worker_id) |w| self.allocator.free(w);
     }
 };
 

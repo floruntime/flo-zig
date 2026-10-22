@@ -264,44 +264,7 @@ pub const StreamWorker = struct {
         try self.joinGroups();
         if (!@atomicLoad(bool, &self.running, .monotonic)) return;
 
-        // Register in worker registry with all streams as processes
-        var process_names = try self.allocator.alloc([]u8, stream_list.len);
-        // Only the names allocated so far: allocPrint can fail partway.
-        var named: usize = 0;
-        defer {
-            for (process_names[0..named]) |name| self.allocator.free(name);
-            self.allocator.free(process_names);
-        }
-
-        var process_entries = try self.allocator.alloc(types.ProcessEntry, stream_list.len);
-        defer self.allocator.free(process_entries);
-
-        for (stream_list, 0..) |stream_name, i| {
-            process_names[i] = try std.fmt.allocPrint(
-                self.allocator,
-                "{s}/{s}",
-                .{ stream_name, self.config.group },
-            );
-            named += 1;
-            process_entries[i] = .{
-                .name = process_names[i],
-                .kind = .stream_consumer,
-            };
-        }
-
-        var actions = self.actionsApi();
-        actions.register(
-            self.worker_id,
-            null,
-            .{
-                .namespace = self.config.namespace,
-                .worker_type = .stream,
-                .max_concurrency = self.config.concurrency,
-                .processes = process_entries,
-                .metadata = self.config.metadata,
-                .machine_id = self.config.machine_id,
-            },
-        ) catch |err| {
+        self.registerWorker() catch |err| {
             std.log.warn("[flo-stream-worker] Failed to register in worker registry: {}", .{err});
         };
 
@@ -418,6 +381,48 @@ pub const StreamWorker = struct {
         }
     }
 
+    /// Register in the worker registry, each stream's group as a process.
+    fn registerWorker(self: *Self) !void {
+        const stream_list = self.config.getStreams();
+        var process_names = try self.allocator.alloc([]u8, stream_list.len);
+        // Only the names allocated so far: allocPrint can fail partway.
+        var named: usize = 0;
+        defer {
+            for (process_names[0..named]) |name| self.allocator.free(name);
+            self.allocator.free(process_names);
+        }
+
+        var process_entries = try self.allocator.alloc(types.ProcessEntry, stream_list.len);
+        defer self.allocator.free(process_entries);
+
+        for (stream_list, 0..) |stream_name, i| {
+            process_names[i] = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}/{s}",
+                .{ stream_name, self.config.group },
+            );
+            named += 1;
+            process_entries[i] = .{
+                .name = process_names[i],
+                .kind = .stream_consumer,
+            };
+        }
+
+        var actions = self.actionsApi();
+        try actions.register(
+            self.worker_id,
+            null,
+            .{
+                .namespace = self.config.namespace,
+                .worker_type = .stream,
+                .max_concurrency = self.config.concurrency,
+                .processes = process_entries,
+                .metadata = self.config.metadata,
+                .machine_id = self.config.machine_id,
+            },
+        );
+    }
+
     /// Stop the worker immediately.
     pub fn stop(self: *Self) void {
         std.log.info("[flo-stream-worker] Stopping...", .{});
@@ -451,7 +456,19 @@ pub const StreamWorker = struct {
             self.activeTasks(),
             .{ .namespace = self.config.namespace },
         ) catch |err| {
-            std.log.err("[flo-stream-worker] Heartbeat failed: {}", .{err});
+            if (err != FloError.NotFound) {
+                std.log.err("[flo-stream-worker] Heartbeat failed: {}", .{err});
+                return;
+            }
+            // Removed for its silence: register again, so the registry knows
+            // it. The registration marks it active, so a drain is told again.
+            std.log.warn("[flo-stream-worker] The server no longer knows this worker; registering again", .{});
+            self.registerWorker() catch |rerr| {
+                std.log.warn("[flo-stream-worker] Failed to register again: {}", .{rerr});
+                if (client_mod.isConnectionError(rerr)) self.client.disconnect();
+                return;
+            };
+            if (@atomicLoad(bool, &self.draining, .monotonic)) self.drain_sent = false;
             return;
         };
 
@@ -1173,4 +1190,27 @@ test "StreamWorker started again after a drain reads again" {
     try std.testing.expect(srv.countOf(.stream_group_read) > reads);
     w.stop();
     second.join();
+}
+
+test "StreamWorker registers again, with the same options, when its heartbeat finds it removed" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.ScriptServer.listen();
+    // [reason:u16][ran:u8][message]
+    srv.rules = &.{.{ .op = .worker_heartbeat, .nth = 0, .action = .{ .reply = .{ .status = @intFromEnum(types.StatusCode.not_found), .body = "\x0c\x00\x00worker not found" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .concurrency = 2, .heartbeat_interval_ms = 0, .metadata = "{}", .machine_id = "host-1" }, drain_gap_test.handle);
+    defer w.deinit();
+    try w.registerWorker();
+    // Draining, and the server told; registering again marks it active.
+    w.draining = true;
+    w.drain_sent = true;
+    w.maybeHeartbeat();
+
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.worker_register));
+    const first = test_server.valueOf(srv.requestOf(.worker_register, 0));
+    try std.testing.expect(std.mem.indexOf(u8, first, "events/default") != null);
+    try std.testing.expectEqualSlices(u8, first, test_server.valueOf(srv.requestOf(.worker_register, 1)));
+    try std.testing.expect(!w.drain_sent);
 }
