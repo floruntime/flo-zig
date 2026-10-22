@@ -2,6 +2,9 @@
 //! the commit pinned in .github/flo-ref.env), and FLO_BINARY the binary,
 //! for the version check. Without FLO_ENDPOINT they skip, except under
 //! CI=1, where a missing server is a failure, not a skip.
+//! FLO_FAST_EXPIRY_ENDPOINT names a second server, configured to remove a
+//! worker silent for a second, for the re-registration test; it skips (or
+//! fails under CI=1) the same way.
 
 const std = @import("std");
 const flo = @import("flo");
@@ -58,7 +61,7 @@ test "live: the server speaks this SDK's protocol and table" {
     const run = try std.process.Child.run(.{ .allocator = testing.allocator, .argv = &.{ binary, "version", "--verbose" }, .env_map = &env_map });
     defer testing.allocator.free(run.stdout);
     defer testing.allocator.free(run.stderr);
-    // "... (protocol 2, table 0x3ac05a0a877bda48; ..."
+    // "... (protocol 2, table 0x2fba7dd9ae941830; ..."
     const p = std.mem.indexOf(u8, run.stdout, "protocol ") orelse return error.NoProtocol;
     const t = std.mem.indexOf(u8, run.stdout, "table 0x") orelse return error.NoTable;
     const proto_end = std.mem.indexOfScalarPos(u8, run.stdout, p, ',') orelse return error.NoProtocol;
@@ -185,6 +188,7 @@ test "live: a worker runs an invoked action, and the run's status then carries i
         if (st.status == .completed) {
             try testing.expectEqualStrings("ok", st.output.?);
             try testing.expectEqual(@as(u32, 1), st.attempt);
+            try testing.expectEqualStrings(worker.worker_id, st.worker_id.?);
             // On this machine's clock, between the invoke and now.
             const completed = st.completed_at.?;
             try testing.expect(completed >= invoked_at - 1000 and completed <= std.time.milliTimestamp() + 1000);
@@ -241,4 +245,123 @@ test "live: auto_touch keeps a long handler from running twice" {
     // A re-run would have started by now.
     std.Thread.sleep(1500 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u32, 1), Slow.runs.load(.monotonic));
+}
+
+fn fastExpiryEndpoint() ![]const u8 {
+    if (env("FLO_FAST_EXPIRY_ENDPOINT")) |e| return e;
+    if (env("CI") != null) return error.NoFastExpiryServerInCI;
+    return error.SkipZigTest;
+}
+
+/// What the re-registration test checks of a worker.list row.
+const ListedWorker = struct {
+    worker_type: u8,
+    max_concurrency: u32,
+    registered_at_ms: i64,
+    machine_id_buf: [255]u8 = undefined,
+    machine_id_len: ?usize = null,
+
+    fn machineId(self: *const ListedWorker) ?[]const u8 {
+        return if (self.machine_id_len) |n| self.machine_id_buf[0..n] else null;
+    }
+};
+
+/// Worker `id` as worker.list's first page shows it, or null. Encoded by
+/// hand: request {limit: Defaulted(u32), cursor: Bytes}, answer {workers:
+/// list (u16 count) of rows, cursor: Optional(Bytes)}.
+fn listedWorker(client: *flo.Client, id: []const u8) !?ListedWorker {
+    const body = "\x01" ++ "\x00\x04\x00\x00" ++ "\x00\x00"; // limit 1024, no cursor
+    var resp = try client.sendRequest(.worker_list, client.getNamespace(null), "", body, "");
+    defer resp.deinit();
+    if (resp.status != .ok) return resp.status.toError();
+    const d = resp.data;
+    var pos: usize = 0;
+    const count = std.mem.readInt(u16, d[pos..][0..2], .little);
+    pos += 2;
+    var found: ?ListedWorker = null;
+    for (0..count) |_| {
+        const id_len = std.mem.readInt(u16, d[pos..][0..2], .little);
+        const row_id = d[pos + 2 ..][0..id_len];
+        pos += 2 + id_len;
+        var row: ListedWorker = .{
+            .worker_type = d[pos],
+            .max_concurrency = std.mem.readInt(u32, d[pos + 6 ..][0..4], .little),
+            .registered_at_ms = std.mem.readInt(i64, d[pos + 26 ..][0..8], .little),
+        };
+        // type, status, load, max_concurrency, completed, failed, registered, heartbeat
+        pos += 1 + 1 + 4 + 4 + 8 + 8 + 8 + 8;
+        if (d[pos] == 1) {
+            const n = d[pos + 1];
+            @memcpy(row.machine_id_buf[0..n], d[pos + 2 ..][0..n]);
+            row.machine_id_len = n;
+            pos += 2 + n;
+        } else pos += 1;
+        if (std.mem.eql(u8, row_id, id)) found = row;
+    }
+    return found;
+}
+
+// The server removes a worker silent past its removal time; the worker's
+// next heartbeat is answered not found, and it registers again, as it first
+// did, and carries on.
+test "live: a worker the server removed registers again on its next heartbeat, and still runs actions" {
+    const ep = try fastExpiryEndpoint();
+    var ns_buf: [32]u8 = undefined;
+    const namespace = freshNamespace(&ns_buf);
+    var client = flo.Client.init(testing.allocator, ep, .{ .namespace = namespace, .timeout_ms = 10_000 });
+    defer client.deinit();
+    try client.connect();
+
+    // Heartbeats 4 s apart; the server removes it after 1 s of silence.
+    var worker = try flo.ActionWorker.init(std.heap.page_allocator, .{
+        .endpoint = ep,
+        .namespace = namespace,
+        .block_ms = 500,
+        .concurrency = 2,
+        .heartbeat_interval_ms = 4_000,
+        .machine_id = "live-host",
+    });
+    defer worker.deinit();
+    try worker.registerAction("echo", Echo.handle, .{});
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&worker});
+    defer thread.join();
+    defer worker.stop();
+
+    var first: ?ListedWorker = null;
+    var removed = false;
+    var again: ?ListedWorker = null;
+    const deadline = std.time.milliTimestamp() + 15_000;
+    while (again == null) {
+        if (std.time.milliTimestamp() > deadline) return error.NeverRegisteredAgain;
+        const row = try listedWorker(&client, worker.worker_id);
+        if (row) |r| {
+            if (first == null) first = r else if (removed) again = r;
+        } else if (first != null) removed = true;
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    const a = first.?;
+    const b = again.?;
+    try testing.expect(b.registered_at_ms > a.registered_at_ms);
+    try testing.expectEqual(@as(u8, 0), b.worker_type); // action
+    try testing.expectEqual(@as(u32, 2), b.max_concurrency);
+    try testing.expectEqualStrings("live-host", b.machineId().?);
+    try testing.expectEqual(a.worker_type, b.worker_type);
+    try testing.expectEqual(a.max_concurrency, b.max_concurrency);
+    try testing.expectEqualStrings(a.machineId().?, b.machineId().?);
+
+    var actions = flo.Actions.init(&client);
+    var invoked = try actions.invoke("echo", "again", .{});
+    defer invoked.deinit();
+    const run_deadline = std.time.milliTimestamp() + 15_000;
+    while (true) {
+        var st = try actions.getStatus(invoked.run_id, .{});
+        defer st.deinit();
+        if (st.status == .completed) {
+            try testing.expectEqualStrings("ok", st.output.?);
+            try testing.expectEqualStrings(worker.worker_id, st.worker_id.?);
+            break;
+        }
+        if (std.time.milliTimestamp() > run_deadline) return error.RunNeverCompleted;
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
 }

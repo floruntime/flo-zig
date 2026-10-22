@@ -319,6 +319,16 @@ pub const ScriptServer = struct {
     }
 };
 
+/// The value field of a request logged by ScriptServer, header included:
+/// [header:32][ns_len:u16][ns][key_len:u16][key][value_len:u32][value]...
+pub fn valueOf(req: []const u8) []const u8 {
+    var off: usize = 32;
+    off += 2 + std.mem.readInt(u16, req[off..][0..2], .little);
+    off += 2 + std.mem.readInt(u16, req[off..][0..2], .little);
+    const len = std.mem.readInt(u32, req[off..][0..4], .little);
+    return req[off + 4 ..][0..len];
+}
+
 /// Whether two requests are the same apart from their request id and the
 /// header CRC that covers it.
 pub fn sameApartFromId(a: []const u8, b: []const u8) bool {
