@@ -8,14 +8,14 @@ const std = @import("std");
 pub const MAGIC: u32 = 0x004F4C46;
 
 /// Protocol version
-pub const VERSION: u8 = 0x02;
+pub const VERSION: u8 = 0x03;
 
 /// The hash of the op table this SDK was built for, written into every
 /// request header. A server built from another table refuses the request,
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0x2fba7dd9ae941830;
+pub const TABLE_HASH: u64 = 0x74e680eb8727c3fb;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -507,6 +507,8 @@ pub const VersionEntry = struct {
     version: u64,
     /// When the version was written, in Unix milliseconds.
     at_ms: i64,
+    /// Whether this version is a delete; its value is empty.
+    deleted: bool,
     value: []const u8,
 
     pub fn deinit(self: *VersionEntry, allocator: std.mem.Allocator) void {
@@ -544,6 +546,9 @@ pub const KVCommitResult = struct {
 pub const GetResult = struct {
     value: []const u8,
     version: u64,
+    /// When the key's TTL runs out, in Unix milliseconds; null when it has
+    /// none. Always null from `KV.jsonGet`.
+    expires_at_ms: ?i64 = null,
 
     pub fn deinit(self: *GetResult, allocator: std.mem.Allocator) void {
         allocator.free(self.value);

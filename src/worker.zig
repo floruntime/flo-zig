@@ -469,8 +469,11 @@ pub const ActionWorker = struct {
     /// Initiate graceful drain: finish current tasks but accept no new ones.
     /// Safe from any thread: it only sets a flag, and the poll loop tells
     /// the server on its own connection, then stops once the running tasks
-    /// have reported. The loop sees the flag between polls, so that can take
-    /// up to block_ms, and a task handed out meanwhile is still run.
+    /// have reported. That connection carries the held poll, so the loop
+    /// sees the flag only once the poll returns, up to block_ms, and a task
+    /// handed out meanwhile is still run. A drain sent from elsewhere (the
+    /// CLI, another client) answers a held poll at once with reason
+    /// worker_draining, and the worker takes no more work from then.
     pub fn drain(self: *Self) void {
         std.log.info("[flo-worker] Draining worker...", .{});
         @atomicStore(bool, &self.draining, true, .monotonic);

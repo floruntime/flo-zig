@@ -45,6 +45,16 @@ jobs:
           name: flo
           path: flo-src/zig-out/bin/flo
           retention-days: 1
+      # The op table as data: the test job checks the SDK's status codes and
+      # refusal reasons against it.
+      - name: Write ops.json
+        working-directory: flo-src
+        run: zig build gen
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flo-ops
+          path: flo-src/zig-out/gen/ops.json
+          retention-days: 1
 
   test:
     needs: flo
@@ -69,11 +79,16 @@ jobs:
         with:
           name: flo
           path: ${{ runner.temp }}/flo-bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: flo-ops
+          path: ${{ runner.temp }}/flo-ops
       - name: Start the pinned flo
         run: |
           cd "$RUNNER_TEMP"
           chmod +x flo-bin/flo
           echo "FLO_BINARY=$RUNNER_TEMP/flo-bin/flo" >> "$GITHUB_ENV"
+          echo "FLO_OPS_JSON=$RUNNER_TEMP/flo-ops/ops.json" >> "$GITHUB_ENV"
           mkdir -p flo-data flo-data-fast
           ./flo-bin/flo server start --port 4453 --data-dir "$RUNNER_TEMP/flo-data" > flo-server.log 2>&1 &
           # A second server that removes a worker silent for a second, for

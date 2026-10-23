@@ -113,7 +113,8 @@ client.disconnect();
 ```zig
 var kv = flo.KV.init(&client);
 
-// Get value (returns null if not found)
+// Get value (returns null if not found); expires_at_ms is when its TTL
+// runs out, in Unix milliseconds, or null when it has none
 const value = try kv.get("key", .{});
 
 // Wait up to 5 seconds for the key to exist (answers at once if it does)
@@ -152,7 +153,8 @@ if (page.cursor) |cursor| {
 }
 
 // Version history, newest first (limit 1-65, default 10); each entry has
-// version, at_ms (write time) and value. A missing key has no versions.
+// version, at_ms (write time), deleted (a delete wrote it; value is empty)
+// and value. A missing key has no versions.
 const versions = try kv.history("key", .{ .limit = 10 });
 defer {
     for (versions) |*v| v.deinit(allocator);
@@ -553,6 +555,11 @@ worker handles at once (at most `batch_size`). Above 1, each runs on a thread wi
 connection of its own for its ack or nack, so a batch's records are handled out of order,
 and handlers and the worker's allocator must be thread-safe. The next read waits for the
 whole batch. `drain()` and `stop()` are safe to call from any thread.
+
+A worker polls and tells the server of its own `drain()` on one connection, so the
+drain goes out once the held poll returns, up to `block_ms`. A drain sent from
+elsewhere (the CLI, another client) answers an action worker's held poll at once; a
+stream worker's held read isn't woken, and it sees the drain at its next heartbeat.
 
 ## Building
 

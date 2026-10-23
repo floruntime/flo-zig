@@ -581,7 +581,7 @@ test "an answer from another op table is refused unread, naming both tables" {
             resp.table_hash = types.TABLE_HASH +% 1;
             resp.request_id = req.request_id;
             resp.data_len = body.len;
-            resp.crc32 = resp.computeCRC32(body);
+            resp.crc32c = resp.computeCRC32C(body);
             conn.stream.writeAll(std.mem.asBytes(&resp)) catch return;
             conn.stream.writeAll(body) catch return;
             var rest: [64]u8 = undefined;
