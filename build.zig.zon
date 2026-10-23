@@ -1,6 +1,6 @@
 .{
     .name = .flo,
-    .version = "0.1.0",
+    .version = "0.1.0-dev.1",
     .fingerprint = 0xa75e36e29f89071e,
     .minimum_zig_version = "0.15.0",
 
