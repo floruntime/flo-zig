@@ -466,6 +466,7 @@ defer status.deinit();
 std.debug.print("Job {s}: {s} (processed {d} records)\n", .{
     status.name, status.status, status.records_processed,
 });
+if (status.failure_reason) |reason| std.debug.print("failed: {s}\n", .{reason});
 
 // List all processing jobs
 var jobs = try processing.list(allocator, .{ .limit = 50 });
