@@ -1336,12 +1336,15 @@ pub const ProcessingStatusResult = struct {
     batch_size: u32,
     records_processed: u64,
     created_at: i64,
+    /// Why the job failed; null unless `status` is "failed".
+    failure_reason: ?[]const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ProcessingStatusResult) void {
         self.allocator.free(self.job_id);
         self.allocator.free(self.name);
         self.allocator.free(self.status);
+        if (self.failure_reason) |r| self.allocator.free(r);
     }
 };
 

@@ -208,6 +208,7 @@ pub const Processing = struct {
 ///
 /// Wire format: [job_id_len:u16][job_id][name_len:u16][name][status:u8]
 ///              [batch_size:u32][records_processed:u64][created_at:i64]
+///              [reason_len:u16][reason]
 fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.ProcessingStatusResult {
     var pos: usize = 0;
 
@@ -233,11 +234,8 @@ fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.Processi
     if (pos >= data.len) return error.UnexpectedEndOfData;
     const status_byte = data[pos];
     pos += 1;
-    const status_str = if (status_byte < processing_status_names.len)
-        processing_status_names[status_byte]
-    else
-        "unknown";
-    const status_owned = try allocator.dupe(u8, status_str);
+    if (status_byte >= processing_status_names.len) return error.UnknownJobStatus;
+    const status_owned = try allocator.dupe(u8, processing_status_names[status_byte]);
     errdefer allocator.free(status_owned);
 
     // Read batch_size (u32)
@@ -253,6 +251,15 @@ fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.Processi
     // Read created_at (i64)
     if (pos + 8 > data.len) return error.UnexpectedEndOfData;
     const created_at = std.mem.readInt(i64, data[pos..][0..8], .little);
+    pos += 8;
+
+    // Read failure reason (empty unless the job failed)
+    if (pos + 2 > data.len) return error.UnexpectedEndOfData;
+    const reason_len = std.mem.readInt(u16, data[pos..][0..2], .little);
+    pos += 2;
+    if (pos + reason_len > data.len) return error.UnexpectedEndOfData;
+    if (pos + reason_len != data.len) return error.TrailingData;
+    const failure_reason = if (reason_len == 0) null else try allocator.dupe(u8, data[pos .. pos + reason_len]);
 
     return .{
         .job_id = job_id,
@@ -261,6 +268,7 @@ fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.Processi
         .batch_size = batch_size,
         .records_processed = records_processed,
         .created_at = created_at,
+        .failure_reason = failure_reason,
         .allocator = allocator,
     };
 }
@@ -398,7 +406,7 @@ test "status and list answers decode per the server's layouts" {
     const a = std.testing.allocator;
     // job_id "j1", name "p", status 1 (stopped), batch_size 50, records 1234, created_at 99
     const status_body = [_]u8{ 2, 0, 'j', '1', 1, 0, 'p', 1, 50, 0, 0, 0 } ++
-        [_]u8{ 0xd2, 0x04, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 99, 0, 0, 0, 0, 0, 0, 0 };
+        [_]u8{ 0xd2, 0x04, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 99, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 0, 0 };
     var st = try parseProcessingStatus(a, &status_body);
     defer st.deinit();
     try std.testing.expectEqualStrings("j1", st.job_id);
@@ -407,6 +415,7 @@ test "status and list answers decode per the server's layouts" {
     try std.testing.expectEqual(@as(u32, 50), st.batch_size);
     try std.testing.expectEqual(@as(u64, 1234), st.records_processed);
     try std.testing.expectEqual(@as(i64, 99), st.created_at);
+    try std.testing.expectEqual(@as(?[]const u8, null), st.failure_reason);
 
     // One entry: name "p", job_id "j1", status "running", created_at 7; no more pages.
     const list_body = [_]u8{ 1, 0, 0, 0, 1, 0, 'p', 2, 0, 'j', '1', 7, 0 } ++ "running".* ++
@@ -419,4 +428,44 @@ test "status and list answers decode per the server's layouts" {
     try std.testing.expectEqualStrings("running", list.entries[0].status);
     try std.testing.expectEqual(@as(i64, 7), list.entries[0].created_at);
     try std.testing.expect(!list.has_more);
+}
+
+// job_id "j1", name "p", status 3 (failed), batch_size 50, records 1234, created_at 99, reason "boom"
+const failed_status_answer = "\x02\x00j1\x01\x00p\x03" ++ "\x32\x00\x00\x00" ++
+    "\xd2\x04\x00\x00\x00\x00\x00\x00" ++ "\x63\x00\x00\x00\x00\x00\x00\x00" ++ "\x04\x00boom";
+
+test "a failed job's status carries its reason" {
+    var st = try parseProcessingStatus(std.testing.allocator, failed_status_answer);
+    defer st.deinit();
+    try std.testing.expectEqualStrings("failed", st.status);
+    try std.testing.expectEqual(@as(u64, 1234), st.records_processed);
+    try std.testing.expectEqualStrings("boom", st.failure_reason.?);
+}
+
+test "a running job's empty reason decodes as null" {
+    const answer = "\x02\x00j1\x01\x00p\x00" ++ "\x32\x00\x00\x00" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x63\x00\x00\x00\x00\x00\x00\x00" ++ "\x00\x00";
+    var st = try parseProcessingStatus(std.testing.allocator, answer);
+    defer st.deinit();
+    try std.testing.expectEqualStrings("running", st.status);
+    try std.testing.expectEqual(@as(?[]const u8, null), st.failure_reason);
+}
+
+fn parseStatusAndFree(a: Allocator, data: []const u8) !void {
+    var st = try parseProcessingStatus(a, data);
+    st.deinit();
+}
+
+test "a status answer cut anywhere, overlong, or short of memory leaks nothing" {
+    const a = std.testing.allocator;
+    // Every prefix, including one whose reason length runs past the end.
+    for (0..failed_status_answer.len) |n| try std.testing.expectError(error.UnexpectedEndOfData, parseStatusAndFree(a, failed_status_answer[0..n]));
+    try std.testing.expectError(error.TrailingData, parseStatusAndFree(a, failed_status_answer ++ "\x00"));
+    try std.testing.checkAllAllocationFailures(a, parseStatusAndFree, .{@as([]const u8, failed_status_answer)});
+}
+
+test "a job status byte this client doesn't know refuses the answer" {
+    var answer = failed_status_answer.*;
+    answer[7] = 5;
+    try std.testing.expectError(error.UnknownJobStatus, parseStatusAndFree(std.testing.allocator, &answer));
 }
