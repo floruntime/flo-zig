@@ -10,6 +10,9 @@ pub const Reply = struct {
     body: []const u8 = "",
     /// How long ScriptServer waits before answering.
     delay_ms: u32 = 0,
+    /// OkServer sends the body with its first byte flipped, under the
+    /// checksum of the body as given.
+    flip_body_byte: bool = false,
 };
 
 pub const OkServer = struct {
@@ -90,6 +93,12 @@ pub const OkServer = struct {
             resp_crc.update(reply.body);
             std.mem.writeInt(u32, resp[16..20], resp_crc.final(), .little);
             conn.stream.writeAll(&resp) catch return;
+            if (reply.flip_body_byte and reply.body.len > 0) {
+                const first = [1]u8{reply.body[0] ^ 0x01};
+                conn.stream.writeAll(&first) catch return;
+                conn.stream.writeAll(reply.body[1..]) catch return;
+                continue;
+            }
             conn.stream.writeAll(reply.body) catch return;
         }
     }

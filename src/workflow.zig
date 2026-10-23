@@ -306,7 +306,7 @@ pub const Workflow = struct {
             return response.status.toError();
         }
 
-        return parseWorkflowStatus(allocator, response.data) catch return FloError.UnexpectedResponse;
+        return parseWorkflowStatus(allocator, response.data) catch |err| answerError(err);
     }
 
     /// Send a signal to a running workflow.
@@ -621,4 +621,28 @@ fn extractYamlField(data: []const u8, field: []const u8) ?[]const u8 {
         start = if (end < data.len) end + 1 else end;
     }
     return null;
+}
+
+/// A parse failure: out of memory stays itself, anything else is an answer
+/// this client can't read.
+fn answerError(err: anyerror) FloError {
+    return if (err == error.OutOfMemory) FloError.OutOfMemory else FloError.UnexpectedResponse;
+}
+
+test "status short of memory says so, not that the answer is bad" {
+    // run_id "r", workflow "", version "", status pending, step "", input "", created_at 0.
+    const answer = "\x01\x00r" ++ "\x00\x00" ++ "\x00\x00" ++ "\x00" ++ "\x00\x00" ++
+        "\x00\x00\x00\x00" ++ "\x00\x00\x00\x00\x00\x00\x00\x00";
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.body = answer;
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var workflow = Workflow.init(&client);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(FloError.OutOfMemory, workflow.status(failing.allocator(), "r", .{}));
 }

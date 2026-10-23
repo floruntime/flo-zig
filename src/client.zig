@@ -292,6 +292,14 @@ pub const Client = struct {
             break :blk buf;
         } else &[_]u8{};
 
+        if (response_header.computeCRC32C(data) != response_header.crc32c) {
+            // The header's own fields may be the damaged part, data_len
+            // among them, so what follows on the stream can't be trusted.
+            if (data.len > 0) self.allocator.free(data);
+            self.disconnect();
+            return FloError.InvalidChecksum;
+        }
+
         if (response_header.status != 0) {
             // A refusal's body: [reason:u16][ran:u8][message].
             const reason = if (data.len >= 3) std.enums.fromInt(types.Reason, std.mem.readInt(u16, data[0..2], .little)) else null;
@@ -864,4 +872,16 @@ test "a client's retry policy is normalised: max below initial becomes initial" 
     var client = Client.init(std.testing.allocator, "localhost:9000", .{ .retry = .{ .initial_backoff_ms = 200, .max_backoff_ms = 5 } });
     defer client.deinit();
     try std.testing.expectEqual(@as(u64, 200), client.retry.max_backoff_ms);
+}
+
+test "an answer whose checksum doesn't match is refused" {
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.replies = &.{.{ .status = 0, .body = "\x07\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00v\x00", .flip_body_byte = true }};
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{ .retry = .{ .max_attempts = 1 } });
+    defer client.deinit();
+    try client.connect();
+    try std.testing.expectError(FloError.InvalidChecksum, client.sendRequest(.kv_get, "default", "k", "", ""));
+    try std.testing.expect(!client.isConnected());
 }
