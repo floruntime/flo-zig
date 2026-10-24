@@ -434,7 +434,9 @@ pub const StreamWorker = struct {
     /// once the batch in hand is handled. The loop sees the flag between
     /// polls, so that can take up to block_ms plus the time to finish the
     /// current batch, and a batch read meanwhile is still handled. It
-    /// finishes whether or not the server can be reached.
+    /// finishes whether or not the server can be reached. The server
+    /// doesn't wake a held group read on a drain, so a drain sent from
+    /// elsewhere is seen at the next heartbeat, once the read returns.
     pub fn drain(self: *Self) void {
         std.log.info("[flo-stream-worker] Draining...", .{});
         @atomicStore(bool, &self.draining, true, .monotonic);

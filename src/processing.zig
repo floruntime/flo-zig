@@ -97,7 +97,7 @@ pub const Processing = struct {
             return response.status.toError();
         }
 
-        return parseProcessingStatus(allocator, response.data) catch return FloError.UnexpectedResponse;
+        return parseProcessingStatus(allocator, response.data) catch |err| answerError(err);
     }
 
     /// List processing jobs.
@@ -125,7 +125,7 @@ pub const Processing = struct {
             return response.status.toError();
         }
 
-        return parseProcessingList(allocator, response.data) catch return FloError.UnexpectedResponse;
+        return parseProcessingList(allocator, response.data) catch |err| answerError(err);
     }
 
     /// Gracefully stop a processing job.
@@ -369,6 +369,12 @@ fn extractYamlName(data: []const u8) ?[]const u8 {
     return null;
 }
 
+/// A parse failure: out of memory stays itself, anything else is an answer
+/// this client can't read.
+fn answerError(err: anyerror) FloError {
+    return if (err == error.OutOfMemory) FloError.OutOfMemory else FloError.UnexpectedResponse;
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -468,4 +474,25 @@ test "a job status byte this client doesn't know refuses the answer" {
     var answer = failed_status_answer.*;
     answer[7] = 5;
     try std.testing.expectError(error.UnknownJobStatus, parseStatusAndFree(std.testing.allocator, &answer));
+}
+
+test "status and list short of memory say so, not that the answer is bad" {
+    const list_body = [_]u8{ 1, 0, 0, 0, 1, 0, 'p', 2, 0, 'j', '1', 7, 0 } ++ "running".* ++
+        [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 0 };
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 0, .body = failed_status_answer },
+        .{ .status = 0, .body = &list_body },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var processing = Processing.init(&client);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(FloError.OutOfMemory, processing.status(failing.allocator(), "j1", .{}));
+    try std.testing.expectError(FloError.OutOfMemory, processing.list(failing.allocator(), .{}));
 }

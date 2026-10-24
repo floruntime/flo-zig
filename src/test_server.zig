@@ -10,6 +10,9 @@ pub const Reply = struct {
     body: []const u8 = "",
     /// How long ScriptServer waits before answering.
     delay_ms: u32 = 0,
+    /// OkServer sends the body with its first byte flipped, under the
+    /// checksum of the body as given.
+    flip_body_byte: bool = false,
 };
 
 pub const OkServer = struct {
@@ -58,18 +61,18 @@ pub const OkServer = struct {
             const magic = std.mem.readInt(u32, req[0..4], .little);
             const payload_length = std.mem.readInt(u32, req[4..8], .little);
             const request_id = std.mem.readInt(u64, req[8..16], .little);
-            const crc32 = std.mem.readInt(u32, req[16..20], .little);
+            const crc32c = std.mem.readInt(u32, req[16..20], .little);
             const version = req[22];
             if (magic != types.MAGIC or version != types.VERSION) return;
 
-            var crc = std.hash.Crc32.init();
+            var crc = std.hash.crc.Crc32Iscsi.init();
             crc.update(req[0..16]);
             crc.update(req[20..32]);
             if (payload_length > self.last_payload_buf.len) return;
             const payload = self.last_payload_buf[0..payload_length];
             readAll(conn.stream, payload) catch return;
             crc.update(payload);
-            if (crc.final() != crc32) return;
+            if (crc.final() != crc32c) return;
             self.last_payload_len = payload_length;
             self.last_op = std.mem.readInt(u16, req[20..22], .little);
             const n = self.requests.load(.monotonic);
@@ -84,11 +87,18 @@ pub const OkServer = struct {
             resp[20] = types.VERSION;
             std.mem.writeInt(u64, resp[24..32], types.TABLE_HASH, .little);
             resp[21] = reply.status;
-            var resp_crc = std.hash.Crc32.init();
+            var resp_crc = std.hash.crc.Crc32Iscsi.init();
             resp_crc.update(resp[0..16]);
             resp_crc.update(resp[20..32]);
+            resp_crc.update(reply.body);
             std.mem.writeInt(u32, resp[16..20], resp_crc.final(), .little);
             conn.stream.writeAll(&resp) catch return;
+            if (reply.flip_body_byte and reply.body.len > 0) {
+                const first = [1]u8{reply.body[0] ^ 0x01};
+                conn.stream.writeAll(&first) catch return;
+                conn.stream.writeAll(reply.body[1..]) catch return;
+                continue;
+            }
             conn.stream.writeAll(reply.body) catch return;
         }
     }
@@ -310,9 +320,10 @@ pub const ScriptServer = struct {
         h[20] = types.VERSION;
         h[21] = r.status;
         std.mem.writeInt(u64, h[24..32], types.TABLE_HASH, .little);
-        var crc = std.hash.Crc32.init();
+        var crc = std.hash.crc.Crc32Iscsi.init();
         crc.update(h[0..16]);
         crc.update(h[20..32]);
+        crc.update(r.body);
         std.mem.writeInt(u32, h[16..20], crc.final(), .little);
         try stream.writeAll(&h);
         try stream.writeAll(r.body);
@@ -330,7 +341,7 @@ pub fn valueOf(req: []const u8) []const u8 {
 }
 
 /// Whether two requests are the same apart from their request id and the
-/// header CRC that covers it.
+/// header CRC32C that covers it.
 pub fn sameApartFromId(a: []const u8, b: []const u8) bool {
     if (a.len != b.len or a.len < 32) return false;
     return std.mem.eql(u8, a[0..8], b[0..8]) and std.mem.eql(u8, a[20..], b[20..]);
