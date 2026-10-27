@@ -437,14 +437,7 @@ pub const ActionWorker = struct {
     }
 
     fn registerWorker(self: *Self) !void {
-        // Build process list for registration
-        var processes: [64]types.ProcessEntry = undefined;
-        const count = @min(self.action_names.items.len, 64);
-        for (self.action_names.items[0..count], 0..) |name, i| {
-            processes[i] = .{ .name = name, .kind = .action };
-        }
-
-        // Register worker with the server
+        // Each action name registers as an action process.
         var actions = self.api();
         try actions.register(
             self.worker_id,
@@ -453,7 +446,6 @@ pub const ActionWorker = struct {
                 .namespace = self.config.namespace,
                 .worker_type = .action,
                 .max_concurrency = self.config.concurrency,
-                .processes = processes[0..count],
                 .metadata = self.config.metadata,
                 .machine_id = self.config.machine_id,
             },

@@ -421,6 +421,25 @@ while (true) {
 try actions.touch("worker-1", task.task_type, task.task_id, .{ .extend_ms = 30000 });
 ```
 
+#### Inspecting Workers
+
+```zig
+// A page of the namespace's workers, in id order
+var page = try actions.listWorkers(.{});
+defer page.deinit();
+
+// One worker: its row (machine_id included), the metadata it registered
+// with as raw bytes, and its processes, each with a kind and run counts.
+// error.NotFound if the server doesn't know it.
+var info = try actions.workerInfo("worker-1", .{});
+defer info.deinit();
+for (info.processes) |p| std.debug.print("{s} {s} ran {d}\n", .{ p.name, @tagName(p.kind), p.run_count });
+```
+
+The server judges a registration's limits (at most 1024 processes, names up to 4096
+bytes); a refusal comes back as `error.BadRequest`, with `client.lastError()` giving
+its reason and message.
+
 ### Workflow Operations
 
 ```zig

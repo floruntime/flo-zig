@@ -63,7 +63,7 @@ test "live: the server speaks this SDK's protocol and table" {
     const run = try std.process.Child.run(.{ .allocator = testing.allocator, .argv = &.{ binary, "version", "--verbose" }, .env_map = &env_map });
     defer testing.allocator.free(run.stdout);
     defer testing.allocator.free(run.stderr);
-    // "... (protocol 3, table 0x74e680eb8727c3fb; ..."
+    // "... (protocol 3, table 0x505fdaa07e866b96; ..."
     const p = std.mem.indexOf(u8, run.stdout, "protocol ") orelse return error.NoProtocol;
     const t = std.mem.indexOf(u8, run.stdout, "table 0x") orelse return error.NoTable;
     const proto_end = std.mem.indexOfScalarPos(u8, run.stdout, p, ',') orelse return error.NoProtocol;
@@ -141,6 +141,59 @@ test "live: a key's history marks the version a delete wrote" {
     try testing.expect(versions[1].deleted);
     try testing.expect(!versions[2].deleted);
     try testing.expectEqualStrings("one", versions[2].value);
+}
+
+test "live: worker info shows a worker's row, metadata and processes" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var actions = flo.Actions.init(&live.client);
+    try actions.register("info-w", null, .{
+        .max_concurrency = 4,
+        .processes = &.{ .{ .name = "send" }, .{ .name = "events/g", .kind = .stream_consumer } },
+        .metadata = "\x00raw\xff",
+        .machine_id = "info-host",
+    });
+    var info = try actions.workerInfo("info-w", .{});
+    defer info.deinit();
+    try testing.expectEqualStrings("info-w", info.worker.id);
+    try testing.expectEqual(flo.WorkerType.action, info.worker.worker_type);
+    try testing.expectEqual(@as(u32, 4), info.worker.max_concurrency);
+    try testing.expectEqualStrings("info-host", info.worker.machine_id.?);
+    try testing.expectEqualStrings("\x00raw\xff", info.metadata.?);
+    try testing.expectEqual(@as(usize, 2), info.processes.len);
+    try testing.expectEqualStrings("send", info.processes[0].name);
+    try testing.expectEqual(flo.ProcessKind.action, info.processes[0].kind);
+    try testing.expectEqualStrings("events/g", info.processes[1].name);
+    try testing.expectEqual(flo.ProcessKind.stream_consumer, info.processes[1].kind);
+    try testing.expectEqual(@as(u64, 0), info.processes[1].run_count);
+}
+
+test "live: worker info for a worker the server doesn't know is not found" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var actions = flo.Actions.init(&live.client);
+    try testing.expectError(flo.FloError.NotFound, actions.workerInfo("no-such-worker", .{}));
+    const last = live.client.lastError().?;
+    try testing.expectEqual(@as(u8, 2), last.code);
+    try testing.expectEqual(flo.Reason.not_found, last.reason);
+}
+
+test "live: the server refuses a registration of more than 1024 processes" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var actions = flo.Actions.init(&live.client);
+    var processes: [1025]flo.ProcessEntry = undefined;
+    var names: [1025][8]u8 = undefined;
+    for (&processes, &names, 0..) |*p, *n, i| p.* = .{ .name = std.fmt.bufPrint(n, "p{d}", .{i}) catch unreachable };
+    try testing.expectError(flo.FloError.BadRequest, actions.register("many-w", null, .{ .processes = &processes }));
+    const last = live.client.lastError().?;
+    try testing.expectEqual(@as(u8, 3), last.code);
+    try testing.expectEqual(flo.Reason.unclassified, last.reason);
+    try testing.expectEqual(flo.Ran.no, last.ran);
+    try testing.expectEqualStrings("more than 1024 processes", last.message);
 }
 
 /// The `{code, name}` list `field` names in ops.json, as it holds it.

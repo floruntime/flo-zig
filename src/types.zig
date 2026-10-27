@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0x74e680eb8727c3fb;
+pub const TABLE_HASH: u64 = 0x505fdaa07e866b96;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -1126,6 +1126,39 @@ pub const WorkerListPage = struct {
         self.allocator.free(self.workers);
         if (self.cursor) |c| self.allocator.free(c);
     }
+};
+
+/// A process on a worker, as registered, with its counts.
+pub const WorkerProcess = struct {
+    name: []const u8,
+    kind: ProcessKind,
+    run_count: u64,
+    fail_count: u64,
+    /// When it last ran, in Unix milliseconds.
+    last_run_at_ms: i64,
+};
+
+/// One worker's record, from worker.info: its row as worker.list shows it,
+/// the metadata it registered with, as given, and its processes. Free with
+/// `deinit`.
+pub const WorkerDetails = struct {
+    worker: WorkerInfo,
+    metadata: ?[]const u8,
+    processes: []WorkerProcess,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *WorkerDetails) void {
+        self.allocator.free(self.worker.id);
+        if (self.worker.machine_id) |m| self.allocator.free(m);
+        if (self.metadata) |m| self.allocator.free(m);
+        for (self.processes) |p| self.allocator.free(p.name);
+        self.allocator.free(self.processes);
+    }
+};
+
+pub const WorkerInfoOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
 };
 
 pub const WorkerListOptions = struct {

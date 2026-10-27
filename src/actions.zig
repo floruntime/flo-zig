@@ -135,6 +135,17 @@ pub const Actions = struct {
         return decodeWorkerListAnswer(self.client.allocator, response.data);
     }
 
+    /// One worker's record: its row as listWorkers shows it, the metadata it
+    /// registered with, and its processes with their counts. A worker the
+    /// server doesn't know is `FloError.NotFound`.
+    /// **Caller owns the returned record and must call `record.deinit()`.**
+    pub fn workerInfo(self: *Self, worker_id: []const u8, options: types.WorkerInfoOptions) FloError!types.WorkerDetails {
+        var response = try self.client.sendRequest(.worker_info, self.client.getNamespace(options.namespace), worker_id, "", "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeWorkerInfoAnswer(self.client.allocator, response.data);
+    }
+
     /// Delete an action.
     pub fn deleteAction(
         self: *Self,
@@ -174,83 +185,14 @@ pub const Actions = struct {
     ) FloError!void {
         const ns = self.client.getNamespace(options.namespace);
 
-        // Build process list from explicit processes or legacy task_types
-        const processes = options.processes;
-        const has_explicit_processes = processes != null and processes.?.len > 0;
-        const has_legacy_types = task_types != null and task_types.?.len > 0;
-
-        var value_buf: [2048]u8 = undefined;
-        var offset: usize = 0;
-
-        // Worker type
-        value_buf[offset] = @intFromEnum(options.worker_type);
-        offset += 1;
-
-        // Max concurrency
-        std.mem.writeInt(u32, value_buf[offset..][0..4], options.max_concurrency, .little);
-        offset += 4;
-
-        // Process list
-        if (has_explicit_processes) {
-            const procs = processes.?;
-            std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(procs.len), .little);
-            offset += 2;
-            for (procs) |p| {
-                std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(p.name.len), .little);
-                offset += 2;
-                @memcpy(value_buf[offset..][0..p.name.len], p.name);
-                offset += p.name.len;
-                value_buf[offset] = @intFromEnum(p.kind);
-                offset += 1;
-            }
-        } else if (has_legacy_types) {
-            const tt = task_types.?;
-            std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(tt.len), .little);
-            offset += 2;
-            for (tt) |name| {
-                std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(name.len), .little);
-                offset += 2;
-                @memcpy(value_buf[offset..][0..name.len], name);
-                offset += name.len;
-                value_buf[offset] = @intFromEnum(types.ProcessKind.action);
-                offset += 1;
-            }
-        } else {
-            std.mem.writeInt(u16, value_buf[offset..][0..2], 0, .little);
-            offset += 2;
-        }
-
-        // Metadata
-        if (options.metadata) |meta| {
-            value_buf[offset] = 1;
-            offset += 1;
-            std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(meta.len), .little);
-            offset += 2;
-            @memcpy(value_buf[offset..][0..meta.len], meta);
-            offset += meta.len;
-        } else {
-            value_buf[offset] = 0;
-            offset += 1;
-        }
-
-        // Machine ID
-        if (options.machine_id) |mid| {
-            value_buf[offset] = 1;
-            offset += 1;
-            std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(mid.len), .little);
-            offset += 2;
-            @memcpy(value_buf[offset..][0..mid.len], mid);
-            offset += mid.len;
-        } else {
-            value_buf[offset] = 0;
-            offset += 1;
-        }
+        const value = try encodeRegisterValue(self.client.allocator, task_types, options);
+        defer self.client.allocator.free(value);
 
         var response = try self.client.sendRequest(
             .worker_register,
             ns,
             worker_id,
-            value_buf[0..offset],
+            value,
             "",
         );
         defer response.deinit();
@@ -678,16 +620,90 @@ fn encodeWorkerListBody(buf: *[MAX_WORKER_LIST_BODY]u8, limit: u32, cursor: []co
     return buf[0 .. 7 + cursor.len];
 }
 
-/// worker.list's answer: rows (u16 count), each {id, worker_type, status,
-/// current_load, max_concurrency, tasks_completed, tasks_failed,
-/// registered_at_ms, last_heartbeat_ms, machine_id?}, then cursor?.
+/// worker.register's value. The server refuses what it won't keep (too many
+/// processes, a name too long); only a length its u16 prefix can't carry is
+/// refused here.
+fn encodeRegisterValue(allocator: std.mem.Allocator, task_types: ?[]const []const u8, options: types.WorkerRegisterOptions) FloError![]u8 {
+    const explicit = options.processes orelse &.{};
+    const legacy = task_types orelse &.{};
+    const count = if (explicit.len > 0) explicit.len else legacy.len;
+    if (count > std.math.maxInt(u16)) return FloError.ValueTooLarge;
+    var size: usize = 1 + 4 + 2 + 1 + 1;
+    for (0..count) |i| {
+        const name = if (explicit.len > 0) explicit[i].name else legacy[i];
+        if (name.len > std.math.maxInt(u16)) return FloError.ValueTooLarge;
+        size += 2 + name.len + 1;
+    }
+    for ([_]?[]const u8{ options.metadata, options.machine_id }) |field| if (field) |f| {
+        if (f.len > std.math.maxInt(u16)) return FloError.ValueTooLarge;
+        size += 2 + f.len;
+    };
+
+    const buf = try allocator.alloc(u8, size);
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeByte(@intFromEnum(options.worker_type)) catch unreachable;
+    w.writeInt(u32, options.max_concurrency, .little) catch unreachable;
+    w.writeInt(u16, @intCast(count), .little) catch unreachable;
+    for (0..count) |i| {
+        const name = if (explicit.len > 0) explicit[i].name else legacy[i];
+        const kind: types.ProcessKind = if (explicit.len > 0) explicit[i].kind else .action;
+        w.writeInt(u16, @intCast(name.len), .little) catch unreachable;
+        w.writeAll(name) catch unreachable;
+        w.writeByte(@intFromEnum(kind)) catch unreachable;
+    }
+    for ([_]?[]const u8{ options.metadata, options.machine_id }) |field| {
+        if (field) |f| {
+            w.writeByte(1) catch unreachable;
+            w.writeInt(u16, @intCast(f.len), .little) catch unreachable;
+            w.writeAll(f) catch unreachable;
+        } else w.writeByte(0) catch unreachable;
+    }
+    std.debug.assert(w.end == size);
+    return buf;
+}
+
+/// A worker row, as worker.list and worker.info answer it: {id,
+/// worker_type, status, current_load, max_concurrency, tasks_completed,
+/// tasks_failed, registered_at_ms, last_heartbeat_ms, machine_id?}. The
+/// caller frees its id and machine_id.
+fn decodeWorkerRow(allocator: std.mem.Allocator, r: *Reader) FloError!types.WorkerInfo {
+    const id = try r.lenBytes(u16);
+    if (id.len > max_worker_id) return FloError.IncompleteResponse;
+    const worker_type = std.meta.intToEnum(types.WorkerType, try r.int(u8)) catch return FloError.IncompleteResponse;
+    const status = std.meta.intToEnum(types.WorkerStatus, try r.int(u8)) catch return FloError.IncompleteResponse;
+    const current_load = try r.int(u32);
+    const max_concurrency = try r.int(u32);
+    const tasks_completed = try r.int(u64);
+    const tasks_failed = try r.int(u64);
+    const registered_at_ms = try r.int(i64);
+    const last_heartbeat_ms = try r.int(i64);
+    const machine_id = if (try r.boolean()) try r.lenBytes(u8) else null;
+    const id_copy = try allocator.dupe(u8, id);
+    errdefer allocator.free(id_copy);
+    return .{
+        .id = id_copy,
+        .worker_type = worker_type,
+        .status = status,
+        .current_load = current_load,
+        .max_concurrency = max_concurrency,
+        .tasks_completed = tasks_completed,
+        .tasks_failed = tasks_failed,
+        .registered_at_ms = registered_at_ms,
+        .last_heartbeat_ms = last_heartbeat_ms,
+        .machine_id = if (machine_id) |m| try allocator.dupe(u8, m) else null,
+    };
+}
+
+/// A worker row's smallest encoding: an empty id, no machine id.
+const min_worker_row = 2 + 1 + 1 + 4 + 4 + 8 + 8 + 8 + 8 + 1;
+
+/// worker.list's answer: rows (u16 count), then cursor?.
 fn decodeWorkerListAnswer(allocator: std.mem.Allocator, data: []const u8) FloError!types.WorkerListPage {
-    const min_row = 2 + 1 + 1 + 4 + 4 + 8 + 8 + 8 + 8 + 1;
     var r: Reader = .{ .data = data };
     const n = try r.int(u16);
     // A count the data can't hold is refused before it sizes an allocation.
-    if (n > types.MAX_WORKER_LIST or n > r.remaining() / min_row) return FloError.IncompleteResponse;
-    const workers = allocator.alloc(types.WorkerInfo, n) catch return FloError.OutOfMemory;
+    if (n > types.MAX_WORKER_LIST or n > r.remaining() / min_worker_row) return FloError.IncompleteResponse;
+    const workers = try allocator.alloc(types.WorkerInfo, n);
     var got: usize = 0;
     errdefer {
         for (workers[0..got]) |w| {
@@ -696,41 +712,61 @@ fn decodeWorkerListAnswer(allocator: std.mem.Allocator, data: []const u8) FloErr
         }
         allocator.free(workers);
     }
-    while (got < n) : (got += 1) {
-        const id = try r.lenBytes(u16);
-        if (id.len > max_worker_id) return FloError.IncompleteResponse;
-        const worker_type = std.meta.intToEnum(types.WorkerType, try r.int(u8)) catch return FloError.IncompleteResponse;
-        const status = std.meta.intToEnum(types.WorkerStatus, try r.int(u8)) catch return FloError.IncompleteResponse;
-        const current_load = try r.int(u32);
-        const max_concurrency = try r.int(u32);
-        const tasks_completed = try r.int(u64);
-        const tasks_failed = try r.int(u64);
-        const registered_at_ms = try r.int(i64);
-        const last_heartbeat_ms = try r.int(i64);
-        const machine_id = if (try r.boolean()) try r.lenBytes(u8) else null;
-        const id_copy = allocator.dupe(u8, id) catch return FloError.OutOfMemory;
-        errdefer allocator.free(id_copy);
-        workers[got] = .{
-            .id = id_copy,
-            .worker_type = worker_type,
-            .status = status,
-            .current_load = current_load,
-            .max_concurrency = max_concurrency,
-            .tasks_completed = tasks_completed,
-            .tasks_failed = tasks_failed,
-            .registered_at_ms = registered_at_ms,
-            .last_heartbeat_ms = last_heartbeat_ms,
-            .machine_id = if (machine_id) |m| allocator.dupe(u8, m) catch return FloError.OutOfMemory else null,
-        };
-    }
+    while (got < n) : (got += 1) workers[got] = try decodeWorkerRow(allocator, &r);
     const cursor = if (try r.boolean()) try r.lenBytes(u16) else null;
     if (cursor) |c| if (c.len > max_worker_id) return FloError.IncompleteResponse;
     try r.end();
     return .{
         .workers = workers,
-        .cursor = if (cursor) |c| allocator.dupe(u8, c) catch return FloError.OutOfMemory else null,
+        .cursor = if (cursor) |c| try allocator.dupe(u8, c) else null,
         .allocator = allocator,
     };
+}
+
+/// The most processes a worker.info answer lists.
+const max_processes = 1024;
+
+/// A process row's smallest encoding: an empty name.
+const min_process_row = 2 + 1 + 8 + 8 + 8;
+
+/// worker.info's answer: the worker's row, metadata? (u16 length), then
+/// processes (u16 count), each {name, kind, run_count, fail_count,
+/// last_run_at_ms}.
+fn decodeWorkerInfoAnswer(allocator: std.mem.Allocator, data: []const u8) FloError!types.WorkerDetails {
+    var r: Reader = .{ .data = data };
+    const worker = try decodeWorkerRow(allocator, &r);
+    errdefer {
+        allocator.free(worker.id);
+        if (worker.machine_id) |m| allocator.free(m);
+    }
+    const metadata_in = if (try r.boolean()) try r.lenBytes(u16) else null;
+    const n = try r.int(u16);
+    if (n > max_processes or n > r.remaining() / min_process_row) return FloError.IncompleteResponse;
+    const metadata = if (metadata_in) |m| try allocator.dupe(u8, m) else null;
+    errdefer if (metadata) |m| allocator.free(m);
+    const processes = try allocator.alloc(types.WorkerProcess, n);
+    var got: usize = 0;
+    errdefer {
+        for (processes[0..got]) |p| allocator.free(p.name);
+        allocator.free(processes);
+    }
+    while (got < n) : (got += 1) {
+        const name = try r.lenBytes(u16);
+        if (name.len > max_worker_id) return FloError.IncompleteResponse;
+        const kind = std.meta.intToEnum(types.ProcessKind, try r.int(u8)) catch return FloError.IncompleteResponse;
+        const run_count = try r.int(u64);
+        const fail_count = try r.int(u64);
+        const last_run_at_ms = try r.int(i64);
+        processes[got] = .{
+            .name = try allocator.dupe(u8, name),
+            .kind = kind,
+            .run_count = run_count,
+            .fail_count = fail_count,
+            .last_run_at_ms = last_run_at_ms,
+        };
+    }
+    try r.end();
+    return .{ .worker = worker, .metadata = metadata, .processes = processes, .allocator = allocator };
 }
 
 /// action.status's answer: [status:u8][created_at:i64][started_at:?i64]
@@ -1028,4 +1064,118 @@ test "a worker.list answer frees what it allocated when an allocation fails" {
     try testWorkerRow(&answer, a, "w2", 1, null);
     try answer.appendSlice(a, &.{ 1, 2, 0, 'w', '2' }); // cursor "w2"
     try std.testing.checkAllAllocationFailures(a, decodeWorkerListAndFree, .{@as([]const u8, answer.items)});
+}
+
+fn testProcessRow(out: *std.ArrayList(u8), a: std.mem.Allocator, name: []const u8, kind: u8, runs: u64) !void {
+    var n: [8]u8 = undefined;
+    std.mem.writeInt(u16, n[0..2], @intCast(name.len), .little);
+    try out.appendSlice(a, n[0..2]);
+    try out.appendSlice(a, name);
+    try out.append(a, kind);
+    for ([_]u64{ runs, 1, 3000 }) |v| { // run_count, fail_count, last_run_at_ms
+        std.mem.writeInt(u64, &n, v, .little);
+        try out.appendSlice(a, &n);
+    }
+}
+
+/// worker.info's answer for "w1": metadata `{"a":1}`, an action and a
+/// stream consumer.
+fn testWorkerInfoAnswer(a: std.mem.Allocator) !std.ArrayList(u8) {
+    var answer: std.ArrayList(u8) = .empty;
+    errdefer answer.deinit(a);
+    try testWorkerRow(&answer, a, "w1", 0, "host-a");
+    try answer.appendSlice(a, &.{ 1, 7, 0 });
+    try answer.appendSlice(a, "{\"a\":1}");
+    try answer.appendSlice(a, &.{ 2, 0 });
+    try testProcessRow(&answer, a, "send", 0, 9);
+    try testProcessRow(&answer, a, "events/g", 1, 4);
+    return answer;
+}
+
+test "workerInfo sends the worker id and returns its row, metadata and processes" {
+    const a = std.testing.allocator;
+    var answer = try testWorkerInfoAnswer(a);
+    defer answer.deinit(a);
+    var bare: std.ArrayList(u8) = .empty;
+    defer bare.deinit(a);
+    try testWorkerRow(&bare, a, "w2", 1, null);
+    try bare.appendSlice(a, &.{ 0, 0, 0 }); // no metadata, no processes
+
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{ .{ .status = 0, .body = answer.items }, .{ .status = 0, .body = bare.items } };
+    try srv.start();
+    defer srv.deinit();
+    var client = @import("client.zig").Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var actions = Actions.init(&client);
+
+    var info = try actions.workerInfo("w1", .{});
+    defer info.deinit();
+    try std.testing.expectEqualStrings("w1", srv.lastKey());
+    try std.testing.expectEqualStrings("", srv.lastBody());
+    try std.testing.expectEqualStrings("w1", info.worker.id);
+    try std.testing.expectEqual(types.WorkerStatus.active, info.worker.status);
+    try std.testing.expectEqualStrings("host-a", info.worker.machine_id.?);
+    try std.testing.expectEqualStrings("{\"a\":1}", info.metadata.?);
+    try std.testing.expectEqual(@as(usize, 2), info.processes.len);
+    try std.testing.expectEqualStrings("send", info.processes[0].name);
+    try std.testing.expectEqual(types.ProcessKind.action, info.processes[0].kind);
+    try std.testing.expectEqual(@as(u64, 9), info.processes[0].run_count);
+    try std.testing.expectEqual(@as(u64, 1), info.processes[0].fail_count);
+    try std.testing.expectEqual(@as(i64, 3000), info.processes[0].last_run_at_ms);
+    try std.testing.expectEqualStrings("events/g", info.processes[1].name);
+    try std.testing.expectEqual(types.ProcessKind.stream_consumer, info.processes[1].kind);
+
+    var empty = try actions.workerInfo("w2", .{});
+    defer empty.deinit();
+    try std.testing.expectEqualStrings("w2", empty.worker.id);
+    try std.testing.expect(empty.worker.machine_id == null);
+    try std.testing.expect(empty.metadata == null);
+    try std.testing.expectEqual(@as(usize, 0), empty.processes.len);
+}
+
+fn decodeWorkerInfoAndFree(allocator: std.mem.Allocator, data: []const u8) !void {
+    var info = try decodeWorkerInfoAnswer(allocator, data);
+    info.deinit();
+}
+
+test "a worker.info answer cut short, overlong, with an unknown kind or short of memory is refused and leaks nothing" {
+    const a = std.testing.allocator;
+    var answer = try testWorkerInfoAnswer(a);
+    defer answer.deinit(a);
+    for (0..answer.items.len) |n| try std.testing.expectError(FloError.IncompleteResponse, decodeWorkerInfoAndFree(a, answer.items[0..n]));
+    try answer.append(a, 0);
+    try std.testing.expectError(FloError.IncompleteResponse, decodeWorkerInfoAndFree(a, answer.items));
+    _ = answer.pop();
+
+    // The second process's kind byte.
+    const kind_at = answer.items.len - (8 + 8 + 8) - 1;
+    try std.testing.expectEqual(@as(u8, 1), answer.items[kind_at]);
+    answer.items[kind_at] = 2;
+    try std.testing.expectError(FloError.IncompleteResponse, decodeWorkerInfoAndFree(a, answer.items));
+    answer.items[kind_at] = 1;
+
+    try std.testing.checkAllAllocationFailures(a, decodeWorkerInfoAndFree, .{@as([]const u8, answer.items)});
+}
+
+test "a registration carries every process, metadata and machine id; the server judges the limits" {
+    const a = std.testing.allocator;
+    const value = try encodeRegisterValue(a, null, .{
+        .worker_type = .stream,
+        .max_concurrency = 3,
+        .processes = &.{ .{ .name = "s/g", .kind = .stream_consumer }, .{ .name = "x" } },
+        .metadata = "m",
+        .machine_id = "h",
+    });
+    defer a.free(value);
+    try std.testing.expectEqualSlices(u8, "\x01\x03\x00\x00\x00\x02\x00" ++ "\x03\x00s/g\x01" ++ "\x01\x00x\x00" ++ "\x01\x01\x00m" ++ "\x01\x01\x00h", value);
+
+    // More than the server keeps still goes out: 1025 action names.
+    var names: [1025][]const u8 = undefined;
+    for (&names) |*n| n.* = "a";
+    const many = try encodeRegisterValue(a, &names, .{});
+    defer a.free(many);
+    try std.testing.expectEqual(@as(u16, 1025), std.mem.readInt(u16, many[5..7], .little));
+    try std.testing.expectEqual(@as(usize, 7 + 1025 * 4 + 2), many.len);
 }
