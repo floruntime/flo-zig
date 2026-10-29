@@ -32,10 +32,12 @@ pub fn nsFromMs(ms: u64) u64 {
     return ms *| std.time.ns_per_ms;
 }
 
-/// Whether an answer with `status` and the refusal body's `ran` is one the
-/// server says it didn't run, of a kind worth sending again.
-pub fn isRefusedUnrun(status: types.StatusCode, ran: types.Ran) bool {
-    return (status == .overloaded or status == .unavailable) and ran == .no;
+/// Whether an answer with `status` and the refusal body's `ran` and
+/// `reason` is one the server says it didn't run, of a kind worth sending
+/// again. A halted shard's refusal isn't: it takes no writes until an
+/// operator repairs it.
+pub fn isRefusedUnrun(status: types.StatusCode, ran: types.Ran, reason: types.Reason) bool {
+    return (status == .overloaded or status == .unavailable) and ran == .no and reason != .shard_halted;
 }
 
 /// A capped, doubling, fully jittered wait.
@@ -73,6 +75,14 @@ pub fn workerBackoff() Backoff {
     return Backoff.init(worker_initial_backoff_ms, worker_max_backoff_ms);
 }
 
+/// A worker's registration, group join and polls wait out a halted shard
+/// this way, up to 30 s between tries, until an operator repairs it.
+pub const halted_max_backoff_ms: u64 = 30_000;
+
+pub fn haltedBackoff() Backoff {
+    return Backoff.init(worker_initial_backoff_ms, halted_max_backoff_ms);
+}
+
 /// A generator seeded from the OS, so clients started together don't wait
 /// in step.
 pub fn seededPrng() std.Random.DefaultPrng {
@@ -81,13 +91,15 @@ pub fn seededPrng() std.Random.DefaultPrng {
     return std.Random.DefaultPrng.init(seed);
 }
 
-test "isRefusedUnrun: only overloaded or unavailable with ran = no" {
-    try std.testing.expect(isRefusedUnrun(.overloaded, .no));
-    try std.testing.expect(isRefusedUnrun(.unavailable, .no));
-    try std.testing.expect(!isRefusedUnrun(.overloaded, .unknown));
-    try std.testing.expect(!isRefusedUnrun(.unavailable, .yes));
-    try std.testing.expect(!isRefusedUnrun(.conflict, .no));
-    try std.testing.expect(!isRefusedUnrun(.internal_error, .no));
+test "isRefusedUnrun: only overloaded or unavailable with ran = no, and not a halted shard" {
+    try std.testing.expect(isRefusedUnrun(.overloaded, .no, .shard_busy));
+    try std.testing.expect(isRefusedUnrun(.unavailable, .no, .leader_unknown));
+    try std.testing.expect(!isRefusedUnrun(.unavailable, .no, .shard_halted));
+    try std.testing.expect(!isRefusedUnrun(.outcome_pending, .unknown, .shard_halted));
+    try std.testing.expect(!isRefusedUnrun(.overloaded, .unknown, .shard_busy));
+    try std.testing.expect(!isRefusedUnrun(.unavailable, .yes, .unclassified));
+    try std.testing.expect(!isRefusedUnrun(.conflict, .no, .unclassified));
+    try std.testing.expect(!isRefusedUnrun(.internal_error, .no, .internal));
 }
 
 test "Backoff waits stay under their doubling ceiling" {
@@ -122,4 +134,21 @@ test "a policy with max below initial waits at most initial" {
 test "a huge backoff converts to nanoseconds without overflowing" {
     try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), nsFromMs(50));
     try std.testing.expectEqual(std.math.maxInt(u64), nsFromMs(std.math.maxInt(u64)));
+}
+
+test "haltedBackoff's ceilings double from 100 ms to exactly 30 s, and never pass it" {
+    var b = haltedBackoff();
+    var prng = std.Random.DefaultPrng.init(1);
+    var expected: u64 = 100;
+    var reached = false;
+    for (0..40) |_| {
+        const wait = b.next(prng.random());
+        // next() returns a wait in [0, ceiling] and doubles the ceiling after.
+        try std.testing.expect(wait <= expected);
+        expected = @min(expected * 2, 30_000);
+        try std.testing.expectEqual(expected, b.ceiling_ms);
+        reached = reached or b.ceiling_ms == 30_000;
+    }
+    try std.testing.expect(reached);
+    try std.testing.expectEqual(@as(u64, 30_000), halted_max_backoff_ms);
 }

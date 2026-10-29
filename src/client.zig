@@ -197,6 +197,9 @@ pub const Client = struct {
     /// goes out.
     pub const max_request_size = 256 * 1024;
 
+    /// The largest answer frame (header included) a server sends.
+    pub const max_answer_size = 256 * 1024;
+
     /// Send a request and receive response (low-level). A request the server
     /// refuses without running it is sent again, as `retry` allows; after
     /// the last try its refusal is returned like any other.
@@ -214,7 +217,7 @@ pub const Client = struct {
             var resp = try self.sendOnce(op_code, namespace, key, value, options);
             // last_error_ran is set only when the refusal's body decoded.
             if (attempt >= self.retry.max_attempts or self.last_error_code != @intFromEnum(resp.status) or
-                !retry.isRefusedUnrun(resp.status, self.last_error_ran)) return resp;
+                !retry.isRefusedUnrun(resp.status, self.last_error_ran, self.last_error_reason)) return resp;
             resp.deinit();
             const ms = wait.next(self.prng.random());
             if (self.debug) std.log.info("[flo] status {d}, not run: retrying in {d}ms", .{ self.last_error_code, ms });
@@ -227,7 +230,38 @@ pub const Client = struct {
     pub fn refusedUnrun(self: *const Self, err: anyerror) bool {
         if (err != FloError.Overloaded and err != FloError.Unavailable) return false;
         const last = self.lastError() orelse return false;
-        return retry.isRefusedUnrun(@enumFromInt(last.code), last.ran);
+        return retry.isRefusedUnrun(@enumFromInt(last.code), last.ran, last.reason);
+    }
+
+    /// Whether err is a halted shard's refusal of a request it didn't run:
+    /// unavailable, ran no, reason shard_halted. Not outcome_pending: that
+    /// write committed, and resending it after a repair that skips it would
+    /// halt the shard again.
+    pub fn refusedHalted(self: *const Self, err: anyerror) bool {
+        if (err != FloError.Unavailable) return false;
+        const last = self.lastError() orelse return false;
+        return last.code == @intFromEnum(StatusCode.unavailable) and last.ran == .no and last.reason == .shard_halted;
+    }
+
+    /// For a worker's own supervision calls (registration, group join,
+    /// polls), which wait out a halted shard where a caller's request would
+    /// get the refusal back: whether err is a halted shard's refusal, and if
+    /// so, a warning with the server's message and the next wait of
+    /// `backoff`, cut short once `running` turns false or `halt` true.
+    pub fn waitIfHalted(
+        self: *Self,
+        err: anyerror,
+        backoff: *retry.Backoff,
+        running: *const bool,
+        halt: ?*const bool,
+        comptime who: []const u8,
+        what: []const u8,
+    ) bool {
+        if (!self.refusedHalted(err)) return false;
+        const ms = backoff.next(self.prng.random());
+        std.log.warn(who ++ " {s} refused, shard halted: {s}; retrying in {d}ms", .{ what, self.lastError().?.message, ms });
+        types.pauseUnlessHalted(running, halt, ms);
+        return true;
     }
 
     /// Send a request once, under a new request id, and receive its response.
@@ -281,6 +315,13 @@ pub const Client = struct {
             return err;
         };
 
+        // Bounded before allocating: one flipped high bit in data_len would
+        // otherwise ask for gigabytes before the checksum could refuse it.
+        if (response_header.data_len > max_answer_size - @sizeOf(wire.ResponseHeader)) {
+            self.disconnect();
+            return FloError.IncompleteResponse;
+        }
+
         // Read response data
         const data: []u8 = if (response_header.data_len > 0) blk: {
             const buf = self.allocator.alloc(u8, response_header.data_len) catch {
@@ -291,6 +332,19 @@ pub const Client = struct {
             readExact(stream, buf) catch |err| return self.readFailed(err);
             break :blk buf;
         } else &[_]u8{};
+
+        if (response_header.computeCRC32C(data) != response_header.crc32c) {
+            // The header's own fields may be the damaged part, data_len
+            // among them, so what follows on the stream can't be trusted.
+            if (data.len > 0) self.allocator.free(data);
+            self.disconnect();
+            return FloError.InvalidChecksum;
+        }
+        // A flag this SDK doesn't know may change what the answer means.
+        if (response_header.flags & ~wire.RESPONSE_STALE != 0) {
+            if (data.len > 0) self.allocator.free(data);
+            return FloError.IncompleteResponse;
+        }
 
         if (response_header.status != 0) {
             // A refusal's body: [reason:u16][ran:u8][message].
@@ -312,6 +366,7 @@ pub const Client = struct {
 
         return wire.RawResponse{
             .status = response_header.getStatus(),
+            .stale = response_header.flags & wire.RESPONSE_STALE != 0,
             .data = data,
             .allocator = self.allocator,
         };
@@ -581,7 +636,7 @@ test "an answer from another op table is refused unread, naming both tables" {
             resp.table_hash = types.TABLE_HASH +% 1;
             resp.request_id = req.request_id;
             resp.data_len = body.len;
-            resp.crc32 = resp.computeCRC32(body);
+            resp.crc32c = resp.computeCRC32C(body);
             conn.stream.writeAll(std.mem.asBytes(&resp)) catch return;
             conn.stream.writeAll(body) catch return;
             var rest: [64]u8 = undefined;
@@ -864,4 +919,99 @@ test "a client's retry policy is normalised: max below initial becomes initial" 
     var client = Client.init(std.testing.allocator, "localhost:9000", .{ .retry = .{ .initial_backoff_ms = 200, .max_backoff_ms = 5 } });
     defer client.deinit();
     try std.testing.expectEqual(@as(u64, 200), client.retry.max_backoff_ms);
+}
+
+test "an answer whose checksum doesn't match is refused" {
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.replies = &.{.{ .status = 0, .body = "\x07\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00v\x00", .flip_body_byte = true }};
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{ .retry = .{ .max_attempts = 1 } });
+    defer client.deinit();
+    try client.connect();
+    try std.testing.expectError(FloError.InvalidChecksum, client.sendRequest(.kv_get, "default", "k", "", ""));
+    try std.testing.expect(!client.isConnected());
+}
+
+test "a halted shard's refusals are never retried: outcome_pending, and unavailable with shard_halted" {
+    const Reply = @import("test_server.zig").Reply;
+    // [reason:u16][ran:u8][message]
+    const pending: Reply = .{ .status = 13, .body = "\x1d\x00\x02committed at index 9, applies when the shard resumes" };
+    const halted: Reply = .{ .status = 12, .body = "\x1d\x00\x00shard halted at index 8" };
+    const leaderless: Reply = .{ .status = 12, .body = "\x05\x00\x00no leader" };
+    for ([_]Reply{ pending, halted }) |refusal| {
+        var srv = try @import("test_server.zig").OkServer.listen();
+        srv.replies = &.{ refusal, refusal, refusal, refusal };
+        try srv.start();
+        defer srv.deinit();
+        var client = Client.init(std.testing.allocator, srv.endpoint, .{ .retry = fast_retry });
+        defer client.deinit();
+        try client.connect();
+        var resp = try client.sendRequest(.kv_put, "default", "k", "", "");
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
+        const last = client.lastError().?;
+        try std.testing.expectEqual(types.Reason.shard_halted, last.reason);
+        if (refusal.status == 13) {
+            try std.testing.expectEqual(FloError.OutcomePending, resp.status.toError());
+            try std.testing.expectEqual(types.Ran.unknown, last.ran);
+            try std.testing.expectEqualStrings("committed at index 9, applies when the shard resumes", last.message);
+        } else {
+            try std.testing.expectEqual(FloError.Unavailable, resp.status.toError());
+            try std.testing.expectEqual(types.Ran.no, last.ran);
+        }
+        // Only the refusal that didn't run is one a worker waits out.
+        try std.testing.expectEqual(refusal.status == 12, client.refusedHalted(resp.status.toError()));
+        try std.testing.expect(!client.refusedUnrun(resp.status.toError()));
+    }
+    // A leader change is still retried.
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.replies = &.{leaderless};
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{ .retry = fast_retry });
+    defer client.deinit();
+    try client.connect();
+    var resp = try client.sendRequest(.kv_put, "default", "k", "", "");
+    defer resp.deinit();
+    try std.testing.expectEqual(StatusCode.ok, resp.status);
+    try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.acquire));
+}
+
+test "an answer claiming more data than an answer can hold is refused before it is read" {
+    const Oversized = struct {
+        server: std.net.Server,
+
+        fn serve(self: *@This()) void {
+            const conn = self.server.accept() catch return;
+            defer conn.stream.close();
+            var req: wire.RequestHeader = undefined;
+            _ = conn.stream.readAtLeast(std.mem.asBytes(&req), @sizeOf(wire.RequestHeader)) catch return;
+            var resp = std.mem.zeroes(wire.ResponseHeader);
+            resp.magic = types.MAGIC;
+            resp.version = types.VERSION;
+            resp.table_hash = types.TABLE_HASH;
+            resp.request_id = req.request_id;
+            // One byte past the bound; nothing follows.
+            resp.data_len = Client.max_answer_size - @sizeOf(wire.ResponseHeader) + 1;
+            conn.stream.writeAll(std.mem.asBytes(&resp)) catch return;
+            var rest: [64]u8 = undefined;
+            _ = conn.stream.read(&rest) catch {};
+        }
+    };
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var srv: Oversized = .{ .server = try addr.listen(.{}) };
+    defer srv.server.deinit();
+    const thread = try std.Thread.spawn(.{}, Oversized.serve, .{&srv});
+    defer thread.join();
+
+    var endpoint_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "127.0.0.1:{d}", .{srv.server.listen_address.getPort()});
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var client = Client.init(failing.allocator(), endpoint, .{ .timeout_ms = 1000, .retry = .{ .max_attempts = 1 } });
+    defer client.deinit();
+    try client.connect();
+    // The failing allocator shows nothing was allocated for the claim.
+    try std.testing.expectError(FloError.IncompleteResponse, client.sendRequest(.kv_get, "default", "k", "", ""));
+    try std.testing.expect(!client.isConnected());
 }

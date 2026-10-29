@@ -1,7 +1,7 @@
 //! Flo Wire Protocol
 //!
 //! Binary serialization/deserialization for the Flo protocol.
-//! Header: 32 bytes, little-endian, CRC32 validated.
+//! Header: 32 bytes, little-endian, CRC32C validated.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -21,7 +21,7 @@ pub const RequestHeader = extern struct {
     magic: u32,
     payload_length: u32,
     request_id: u64,
-    crc32: u32,
+    crc32c: u32,
     op_code: u16,
     version: u8,
     flags: u8,
@@ -39,9 +39,9 @@ pub const RequestHeader = extern struct {
         }
     }
 
-    /// Compute CRC32 for header (excluding crc32 field) + payload
-    pub fn computeCRC32(self: RequestHeader, payload: []const u8) u32 {
-        var hasher = std.hash.Crc32.init();
+    /// CRC32C (Castagnoli) of the header, without its crc32c field, then the payload.
+    pub fn computeCRC32C(self: RequestHeader, payload: []const u8) u32 {
+        var hasher = std.hash.crc.Crc32Iscsi.init();
         const header_bytes = std.mem.asBytes(&self);
         hasher.update(header_bytes[0..16]);
         hasher.update(header_bytes[20..32]);
@@ -55,7 +55,7 @@ pub const ResponseHeader = extern struct {
     magic: u32,
     data_len: u32,
     request_id: u64,
-    crc32: u32,
+    crc32c: u32,
     version: u8,
     status: u8,
     flags: u8,
@@ -71,8 +71,9 @@ pub const ResponseHeader = extern struct {
         }
     }
 
-    pub fn computeCRC32(self: ResponseHeader, data: []const u8) u32 {
-        var hasher = std.hash.Crc32.init();
+    /// CRC32C of the header, without its crc32c field, then the data.
+    pub fn computeCRC32C(self: ResponseHeader, data: []const u8) u32 {
+        var hasher = std.hash.crc.Crc32Iscsi.init();
         const header_bytes = std.mem.asBytes(&self);
         hasher.update(header_bytes[0..16]);
         hasher.update(header_bytes[20..32]);
@@ -231,7 +232,7 @@ pub const OptionsIterator = struct {
 /// and options: every KV op, and action.status.
 pub fn isTableOp(op: OpCode) bool {
     return switch (op) {
-        .kv_put, .kv_get, .kv_mget, .kv_delete, .kv_scan, .kv_history, .kv_incr, .kv_json_get, .kv_json_set, .kv_json_del, .kv_txn_begin, .kv_txn_commit, .kv_txn_rollback, .kv_expire, .kv_exists, .action_status, .worker_list => true,
+        .kv_put, .kv_get, .kv_mget, .kv_delete, .kv_scan, .kv_history, .kv_incr, .kv_json_get, .kv_json_set, .kv_json_del, .kv_txn_begin, .kv_txn_commit, .kv_txn_rollback, .kv_expire, .kv_exists, .action_status, .worker_list, .worker_info => true,
         else => false,
     };
 }
@@ -315,15 +316,14 @@ pub fn serializeRequest(
         .magic = types.MAGIC,
         .payload_length = @intCast(payload_size),
         .request_id = request_id,
-        .crc32 = 0,
+        .crc32c = 0,
         .op_code = @intFromEnum(op_code),
         .version = types.VERSION,
         .flags = 0,
         .table_hash = types.TABLE_HASH,
     };
 
-    // Compute CRC32
-    header.crc32 = header.computeCRC32(payload_buffer[0..payload_offset]);
+    header.crc32c = header.computeCRC32C(payload_buffer[0..payload_offset]);
 
     // Write header
     @memcpy(buffer[0..header_size], std.mem.asBytes(&header));
@@ -336,8 +336,15 @@ pub fn serializeRequest(
 // =============================================================================
 
 /// Raw response from server
+/// Response flag: the answer reads a halted shard's state from just before
+/// the entry it halted at, and nothing written since.
+pub const RESPONSE_STALE: u8 = 0x01;
+
 pub const RawResponse = struct {
     status: StatusCode,
+    /// The answer carries RESPONSE_STALE: a successful read (or not-found)
+    /// from a halted shard.
+    stale: bool = false,
     data: []const u8,
     allocator: Allocator,
 
@@ -489,6 +496,17 @@ test "OptionsBuilder and Iterator roundtrip" {
     try std.testing.expect(iter.next() == null);
 }
 
+test "a frame's checksum is CRC32C over the header without its crc32c field, then the body" {
+    // The frame flo checks its own checksum against.
+    const frame = "\x46\x4c\x4f\x00\x05\x00\x00\x00\x07\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x00\x00" ++ "\x01\x01\x03\x00\x08\x07\x06\x05\x04\x03\x02\x01";
+    const header = @as(*align(1) const RequestHeader, @ptrCast(frame)).*;
+    try std.testing.expectEqual(@as(u32, 0xa2996e56), header.computeCRC32C("hello"));
+    const answer = @as(*align(1) const ResponseHeader, @ptrCast(frame)).*;
+    try std.testing.expectEqual(@as(u32, 0xa2996e56), answer.computeCRC32C("hello"));
+    try std.testing.expectEqual(@as(u32, 0xe3069283), std.hash.crc.Crc32Iscsi.hash("123456789"));
+}
+
 test "serializeRequest basic" {
     var buffer: [256]u8 = undefined;
 
@@ -508,7 +526,7 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
-    try std.testing.expectEqual(@as(u64, 0x2fba7dd9ae941830), header.table_hash);
+    try std.testing.expectEqual(@as(u64, 0x05fe53f432e943c4), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
 }
 

@@ -347,7 +347,21 @@ pub const ActionWorker = struct {
             self.drain_sent = false;
         }
         self.drain_retry_ns = 0;
-        try self.registerWorker();
+        // A halted shard holds the start until it's repaired, or a stop or
+        // drain ends the wait. A registration that committed but hasn't
+        // applied (outcome_pending) is returned, not resent.
+        var halted = retry_mod.haltedBackoff();
+        while (true) {
+            self.registerWorker() catch |err| {
+                if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-worker]", "worker registration")) return err;
+                if (types.goingOn(&self.running, &self.draining)) continue;
+                std.log.info("[flo-worker] Worker stopped before registering", .{});
+                @atomicStore(bool, &self.running, false, .monotonic);
+                return;
+            };
+            break;
+        }
+        halted.reset();
         self.last_heartbeat_ns = std.time.nanoTimestamp();
         var failed = retry_mod.workerBackoff();
 
@@ -392,7 +406,7 @@ pub const ActionWorker = struct {
                 } else switch (self.awaitRefused(err)) {
                     .draining => {},
                     .unhealthy => types.pauseUnlessHalted(&self.running, &self.draining, failed.next(self.client.prng.random())),
-                    .other => {
+                    .other => if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-worker]", "await")) {
                         const ms = failed.next(self.client.prng.random());
                         std.log.err("[flo-worker] Await error: {}, retrying in {d}ms...", .{ err, ms });
                         types.pauseUnlessHalted(&self.running, &self.draining, ms);
@@ -401,6 +415,7 @@ pub const ActionWorker = struct {
                 continue;
             };
             failed.reset();
+            halted.reset();
         }
 
         // Tasks still running finish and send their results.
@@ -437,14 +452,7 @@ pub const ActionWorker = struct {
     }
 
     fn registerWorker(self: *Self) !void {
-        // Build process list for registration
-        var processes: [64]types.ProcessEntry = undefined;
-        const count = @min(self.action_names.items.len, 64);
-        for (self.action_names.items[0..count], 0..) |name, i| {
-            processes[i] = .{ .name = name, .kind = .action };
-        }
-
-        // Register worker with the server
+        // Each action name registers as an action process.
         var actions = self.api();
         try actions.register(
             self.worker_id,
@@ -453,7 +461,6 @@ pub const ActionWorker = struct {
                 .namespace = self.config.namespace,
                 .worker_type = .action,
                 .max_concurrency = self.config.concurrency,
-                .processes = processes[0..count],
                 .metadata = self.config.metadata,
                 .machine_id = self.config.machine_id,
             },
@@ -469,8 +476,11 @@ pub const ActionWorker = struct {
     /// Initiate graceful drain: finish current tasks but accept no new ones.
     /// Safe from any thread: it only sets a flag, and the poll loop tells
     /// the server on its own connection, then stops once the running tasks
-    /// have reported. The loop sees the flag between polls, so that can take
-    /// up to block_ms, and a task handed out meanwhile is still run.
+    /// have reported. That connection carries the held poll, so the loop
+    /// sees the flag only once the poll returns, up to block_ms, and a task
+    /// handed out meanwhile is still run. A drain sent from elsewhere (the
+    /// CLI, another client) answers a held poll at once with reason
+    /// worker_draining, and the worker takes no more work from then.
     pub fn drain(self: *Self) void {
         std.log.info("[flo-worker] Draining worker...", .{});
         @atomicStore(bool, &self.draining, true, .monotonic);
@@ -1799,4 +1809,159 @@ test "ActionWorker heartbeats the handlers running, not a slot waiting on a poll
         ones += @intFromBool(load == 1);
     }
     try std.testing.expect(ones >= 1);
+}
+
+/// unavailable, reason shard_halted, ran no.
+const halted_refusal: @import("test_server.zig").Reply = .{ .status = 12, .body = "\x1d\x00\x00shard 0 halted at index 8; an operator must repair it" };
+
+test "ActionWorker waits out a halted shard at registration and in its polls, then carries on" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .worker_register, .nth = 0, .action = .{ .reply = halted_refusal } },
+        .{ .op = .worker_register, .nth = 1, .action = .{ .reply = halted_refusal } },
+        .{ .op = .worker_register, .nth = 2, .action = .{ .reply = halted_refusal } },
+        .{ .op = .action_await, .nth = 0, .action = .{ .reply = halted_refusal } },
+        .{ .op = .action_await, .nth = 1, .action = .{ .reply = halted_refusal } },
+        .{ .op = .action_await, .nth = 2, .action = .{ .reply = halted_refusal } },
+        .{ .op = .action_await, .nth = 3, .action = .{ .reply = .{ .status = 0, .body = test_task } } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    var waited: u32 = 0;
+    while (srv.countOf(.action_complete) < 1 and waited < 5000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+
+    // Each halted refusal was one request: the client itself doesn't retry it.
+    try std.testing.expectEqual(@as(u32, 4), srv.countOf(.worker_register));
+    try std.testing.expect(srv.countOf(.action_await) >= 4);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_complete));
+}
+
+/// Runs start on a thread and keeps its error, for tests that bound how long
+/// it takes: one that doesn't return in time is stopped, so it can't hang.
+const start_test = struct {
+    var returned = std.atomic.Value(bool).init(false);
+    var result: anyerror!void = {};
+
+    fn run(w: *ActionWorker) void {
+        result = w.start();
+        returned.store(true, .release);
+    }
+
+    fn begin(w: *ActionWorker) !std.Thread {
+        returned.store(false, .release);
+        result = {};
+        return std.Thread.spawn(.{}, run, .{w});
+    }
+
+    fn returnedWithin(w: *ActionWorker, ms: u32) bool {
+        var waited: u32 = 0;
+        while (!returned.load(.acquire) and waited < ms) : (waited += 5) std.Thread.sleep(5 * std.time.ns_per_ms);
+        const ok = returned.load(.acquire);
+        if (!ok) w.stop();
+        return ok;
+    }
+};
+
+test "ActionWorker stopped or drained while a halted shard holds its registration returns at once, sending nothing more" {
+    for ([_]bool{ false, true }) |drain| {
+        var srv = try ScriptServer.listen();
+        srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = halted_refusal } }};
+        try srv.start();
+        defer srv.deinit();
+
+        var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+        defer w.deinit();
+        // Seeded, so the wait the stop cuts short is a long one.
+        w.client.prng = std.Random.DefaultPrng.init(7);
+        try w.registerAction("job", test_handlers.ok, .{});
+        const thread = try start_test.begin(&w);
+        var waited: u32 = 0;
+        while (srv.countOf(.worker_register) < 5 and waited < 8000) : (waited += 5) std.Thread.sleep(5 * std.time.ns_per_ms);
+        if (drain) w.drain() else w.stop();
+        const prompt = start_test.returnedWithin(&w, 100);
+        thread.join();
+        try std.testing.expect(prompt);
+        try start_test.result;
+        try std.testing.expectEqual(@as(u32, 5), srv.countOf(.worker_register));
+        try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_await));
+    }
+}
+
+test "ActionWorker registers every action it handles as a process, past 64" {
+    const value_of = @import("test_server.zig").valueOf;
+    var srv = try ScriptServer.listen();
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint });
+    defer w.deinit();
+    for (0..70) |i| {
+        var buf: [8]u8 = undefined;
+        try w.registerAction(try std.fmt.bufPrint(&buf, "job-{d:0>2}", .{i}), test_handlers.ok, .{});
+    }
+    try w.registerWorker();
+
+    // [type:u8][max_concurrency:u32][count:u16]([name_len:u16][name][kind:u8])*
+    const value = value_of(srv.requestOf(.worker_register, 0));
+    try std.testing.expectEqual(@as(u16, 70), std.mem.readInt(u16, value[5..7], .little));
+    var off: usize = 7;
+    for (0..70) |i| {
+        var buf: [8]u8 = undefined;
+        const len = std.mem.readInt(u16, value[off..][0..2], .little);
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "job-{d:0>2}", .{i}), value[off + 2 ..][0..len]);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(types.ProcessKind.action)), value[off + 2 + len]);
+        off += 2 + len + 1;
+    }
+}
+
+test "ActionWorker whose registration is outcome_pending returns it after one try, without waiting" {
+    var srv = try ScriptServer.listen();
+    // outcome_pending, reason shard_halted, ran unknown.
+    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 13, .body = "\x1d\x00\x02shard 0 halted at this entry; a repair skips it. Don't resend it unchanged" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try start_test.begin(&w);
+    const prompt = start_test.returnedWithin(&w, 1000);
+    thread.join();
+    try std.testing.expect(prompt);
+    try std.testing.expectError(FloError.OutcomePending, start_test.result);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_await));
+    const last = w.client.lastError().?;
+    try std.testing.expectEqual(types.Reason.shard_halted, last.reason);
+    try std.testing.expectEqual(types.Ran.unknown, last.ran);
+    try std.testing.expectEqualStrings("shard 0 halted at this entry; a repair skips it. Don't resend it unchanged", last.message);
+}
+
+test "ActionWorker never resends a complete or fail a halted shard refused" {
+    const pending: @import("test_server.zig").Reply = .{ .status = 13, .body = "\x1d\x00\x02committed; applies when the shard resumes" };
+    for ([_]@import("test_server.zig").Reply{ halted_refusal, pending }) |refusal| {
+        for ([_]types.OpCode{ .action_complete, .action_fail }) |op| {
+            var srv = try ScriptServer.listen();
+            const rules = [_]ScriptServer.Rule{.{ .op = op, .action = .{ .reply = refusal } }};
+            srv.rules = &rules;
+            try srv.start();
+            defer srv.deinit();
+
+            var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+            defer w.deinit();
+            w.running = true;
+            const task: TaskAssignment = .{ .task_id = "t1", .task_type = "job", .payload = "", .created_at = 0, .attempt = 1, .allocator = std.testing.allocator };
+            const rep: ActionWorker.Report = if (op == .action_complete) .{ .complete = .{ .data = "done" } } else .{ .fail = .{ .message = "boom" } };
+            try std.testing.expect(!w.report(&w.client, true, &task, rep));
+            try std.testing.expectEqual(@as(u32, 1), srv.countOf(op));
+            try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
+        }
+    }
 }

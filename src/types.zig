@@ -8,14 +8,14 @@ const std = @import("std");
 pub const MAGIC: u32 = 0x004F4C46;
 
 /// Protocol version
-pub const VERSION: u8 = 0x02;
+pub const VERSION: u8 = 0x03;
 
 /// The hash of the op table this SDK was built for, written into every
 /// request header. A server built from another table refuses the request,
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0x2fba7dd9ae941830;
+pub const TABLE_HASH: u64 = 0x05fe53f432e943c4;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -69,6 +69,11 @@ pub const Reason = enum(u16) {
     /// An action await from a worker the server is draining: it takes no
     /// more work.
     worker_draining = 28,
+    /// The shard halted at an entry every replica fails the same way: it
+    /// takes no writes until an operator repairs it. With unavailable it
+    /// didn't run; with outcome_pending it committed. Never retried by the
+    /// client.
+    shard_halted = 29,
 };
 
 /// Whether a refused request took effect: retry logic reads this, not the
@@ -341,6 +346,10 @@ pub const StatusCode = enum(u8) {
     overloaded = 10,
     rate_limited = 11, // Request rate limit exceeded (WebSocket)
     unavailable = 12,
+    /// The write committed but hasn't applied: its shard halted at it or
+    /// before it. The message says whether it applies when the shard
+    /// resumes. Never retried: resending would write it twice.
+    outcome_pending = 13,
 
     // The server may send codes this SDK predates; `_` keeps them a value
     // rather than illegal behaviour, and toError maps them to ServerError.
@@ -362,6 +371,7 @@ pub const StatusCode = enum(u8) {
             .overloaded => "Server overloaded",
             .rate_limited => "Request rate limit exceeded",
             .unavailable => "Unavailable: no leader or the shard isn't taking writes; retry",
+            .outcome_pending => "Committed, not applied: its shard halted; don't resend it unchanged",
             // No buffer to format the code into; Client.lastError has it.
             _ => "Unknown status",
         };
@@ -380,6 +390,7 @@ pub const StatusCode = enum(u8) {
             .rate_limited => FloError.RateLimited,
             .internal_error => FloError.InternalError,
             .unavailable => FloError.Unavailable,
+            .outcome_pending => FloError.OutcomePending,
             else => FloError.ServerError,
         };
     }
@@ -472,8 +483,16 @@ pub const FloError = error{
     InternalError,
     /// Retryable: the write reached no leader, or the shard stopped taking
     /// writes or is offline. An offline shard stays so until an operator
-    /// acts; Client.lastError has the server's reason.
+    /// acts; Client.lastError has the server's reason. With reason
+    /// shard_halted it isn't retried: the shard waits on a repair.
     Unavailable,
+    /// The write committed but hasn't applied, because its shard halted
+    /// (status outcome_pending). Never retried: resending would write it
+    /// twice. Client.lastError has the reason, ran and message.
+    OutcomePending,
+    /// A halted shard answered that the key doesn't exist as of the entry it
+    /// halted at; it may exist since. Not the same as absent.
+    StaleNotFound,
     UnexpectedResponse,
 
     // Transaction errors
@@ -494,6 +513,8 @@ pub const ScanResult = struct {
     keys: [][]const u8,
     cursor: ?[]const u8,
     allocator: std.mem.Allocator,
+    /// Read from a halted shard (see `GetResult.stale`).
+    stale: bool = false,
 
     pub fn deinit(self: *ScanResult) void {
         for (self.keys) |k| self.allocator.free(k);
@@ -502,11 +523,37 @@ pub const ScanResult = struct {
     }
 };
 
+/// One page of a key's versions, newest first. Free with `deinit`.
+pub const HistoryResult = struct {
+    versions: []VersionEntry,
+    /// Older kept versions follow: ask again with `before_version` set to
+    /// the last version here.
+    more: bool,
+    /// Read from a halted shard (see `GetResult.stale`); a missing key is
+    /// missing as of the halt.
+    stale: bool = false,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *HistoryResult) void {
+        for (self.versions) |*v| v.deinit(self.allocator);
+        self.allocator.free(self.versions);
+    }
+};
+
+/// Whether a key exists, from `KV.exists`.
+pub const ExistsResult = struct {
+    exists: bool,
+    /// Read from a halted shard (see `GetResult.stale`).
+    stale: bool = false,
+};
+
 /// KV version entry from history
 pub const VersionEntry = struct {
     version: u64,
     /// When the version was written, in Unix milliseconds.
     at_ms: i64,
+    /// Whether this version is a delete; its value is empty.
+    deleted: bool,
     value: []const u8,
 
     pub fn deinit(self: *VersionEntry, allocator: std.mem.Allocator) void {
@@ -544,6 +591,13 @@ pub const KVCommitResult = struct {
 pub const GetResult = struct {
     value: []const u8,
     version: u64,
+    /// When the key's TTL runs out, in Unix milliseconds; null when it has
+    /// none. Always null from `KV.jsonGet`.
+    expires_at_ms: ?i64 = null,
+    /// Read from a halted shard: its state just before the entry it halted
+    /// at, without anything written since. The read succeeded; it is not an
+    /// error.
+    stale: bool = false,
 
     pub fn deinit(self: *GetResult, allocator: std.mem.Allocator) void {
         allocator.free(self.value);
@@ -558,6 +612,9 @@ pub const MGetEntry = struct {
     value: []const u8,
     version: u64,
     found: bool,
+    /// Answered by a halted shard (see `GetResult.stale`); a missing key is
+    /// missing as of the halt.
+    stale: bool = false,
 };
 
 /// Result of a `KV.mget` call. Owns the backing memory for all entries; free
@@ -658,6 +715,8 @@ pub const HistoryOptions = struct {
     namespace: ?[]const u8 = null,
     /// Versions to return, newest first, 1 to 65.
     limit: u32 = 10,
+    /// Only versions older than this one; null to start from the newest.
+    before_version: ?u64 = null,
     /// Routes the request in place of the key
     routing_key: ?[]const u8 = null,
 };
@@ -1123,6 +1182,39 @@ pub const WorkerListPage = struct {
     }
 };
 
+/// A process on a worker, as registered, with its counts.
+pub const WorkerProcess = struct {
+    name: []const u8,
+    kind: ProcessKind,
+    run_count: u64,
+    fail_count: u64,
+    /// When it last ran, in Unix milliseconds.
+    last_run_at_ms: i64,
+};
+
+/// One worker's record, from worker.info: its row as worker.list shows it,
+/// the metadata it registered with, as given, and its processes. Free with
+/// `deinit`.
+pub const WorkerDetails = struct {
+    worker: WorkerInfo,
+    metadata: ?[]const u8,
+    processes: []WorkerProcess,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *WorkerDetails) void {
+        self.allocator.free(self.worker.id);
+        if (self.worker.machine_id) |m| self.allocator.free(m);
+        if (self.metadata) |m| self.allocator.free(m);
+        for (self.processes) |p| self.allocator.free(p.name);
+        self.allocator.free(self.processes);
+    }
+};
+
+pub const WorkerInfoOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+};
+
 pub const WorkerListOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
@@ -1130,6 +1222,8 @@ pub const WorkerListOptions = struct {
     cursor: ?[]const u8 = null,
     /// Workers per page, 1 to 1024.
     limit: u32 = MAX_WORKER_LIST,
+    /// Only workers that run this action; null for every worker.
+    action: ?[]const u8 = null,
 };
 
 pub const WorkerRegisterOptions = struct {

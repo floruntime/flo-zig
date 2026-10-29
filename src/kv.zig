@@ -96,6 +96,7 @@ pub const KV = struct {
                 errdefer allocator.free(value);
                 e.key = try allocator.dupe(u8, k);
                 e.value = value;
+                e.stale = response.stale;
                 filled += 1;
             }
         }
@@ -115,25 +116,33 @@ pub const KV = struct {
         const body = try encodeScanBody(&buf, options.limit, options.cursor orelse "");
         var response = try call(self.client, .kv_scan, self.client.getNamespace(options.namespace), prefix, body);
         defer response.deinit();
-        return decodeScanAnswer(self.client.allocator, response.data);
+        var page = try decodeScanAnswer(self.client.allocator, response.data);
+        page.stale = response.stale;
+        return page;
     }
 
-    /// Get a key's versions, newest first; a missing key has none.
-    /// **Caller owns the returned slice and must free each entry with `entry.deinit(allocator)`,
-    /// then free the slice itself with `allocator.free(entries)`.**
+    /// A page of a key's versions, newest first, older than
+    /// `options.before_version` when given; a missing key has none. While
+    /// `more` is set, ask again with `before_version` set to the last
+    /// version on the page.
+    /// **Caller owns the returned `HistoryResult` and must call `result.deinit()`.**
     pub fn history(
         self: *KV,
         key: []const u8,
         options: types.HistoryOptions,
-    ) FloError![]types.VersionEntry {
+    ) FloError!types.HistoryResult {
         var buf: [MAX_HISTORY_BODY]u8 = undefined;
-        const body = try encodeHistoryBody(&buf, options.limit, options.routing_key);
+        const body = try encodeHistoryBody(&buf, options.limit, options.before_version, options.routing_key);
         var response = try self.client.sendRequest(.kv_history, self.client.getNamespace(options.namespace), key, body, "");
         defer response.deinit();
-        // A missing key has no versions.
-        if (response.status == .not_found and self.client.last_error_reason == .not_found) return self.client.allocator.alloc(types.VersionEntry, 0);
+        // A missing key has no versions; a halted shard's answer keeps its mark.
+        if (response.status == .not_found and self.client.last_error_reason == .not_found) {
+            return .{ .versions = try self.client.allocator.alloc(types.VersionEntry, 0), .more = false, .stale = response.stale, .allocator = self.client.allocator };
+        }
         if (response.status != .ok) return response.status.toError();
-        return decodeHistoryAnswer(self.client.allocator, response.data);
+        var page = try decodeHistoryAnswer(self.client.allocator, response.data);
+        page.stale = response.stale;
+        return page;
     }
 
     // ─── Counters, TTLs, exists, JSON paths ─────
@@ -166,10 +175,11 @@ pub const KV = struct {
         return kvExpire(self.client, ns, key, ttl_ms, options.cas_version, options.routing_key, null);
     }
 
-    /// Returns true if `key` is present without transferring its value.
-    pub fn exists(self: *KV, key: []const u8, options: types.KVExistsOptions) FloError!bool {
+    /// Whether `key` is present, without transferring its value.
+    pub fn exists(self: *KV, key: []const u8, options: types.KVExistsOptions) FloError!types.ExistsResult {
         const ns = self.client.getNamespace(options.namespace);
-        return (try kvExists(self.client, ns, key, options.routing_key, null)).exists;
+        const a = try kvExists(self.client, ns, key, options.routing_key, null);
+        return .{ .exists = a.exists, .stale = a.stale };
     }
 
     /// Extract the value at `path` ("" or "$" for the whole document) from
@@ -188,9 +198,10 @@ pub const KV = struct {
         const body = try encodeJsonPathBody(&buf, path, options.routing_key);
         var response = try self.client.sendRequest(.kv_json_get, self.client.getNamespace(options.namespace), key, body, "");
         defer response.deinit();
-        if (response.status == .not_found and self.client.last_error_reason == .not_found) return null;
-        if (response.status != .ok) return response.status.toError();
-        return try decodeGetAnswer(self.client.allocator, response.data);
+        if (try absent(self.client, &response)) return null;
+        var doc = try decodeJsonGetAnswer(self.client.allocator, response.data);
+        doc.stale = response.stale;
+        return doc;
     }
 
     /// Set the JSON value at `path` ("" or "$" for the whole document)
@@ -339,9 +350,10 @@ pub const Transaction = struct {
     }
 
     /// Check key existence inside the transaction (sees buffered writes).
-    pub fn exists(self: *Transaction, key: []const u8) FloError!bool {
+    pub fn exists(self: *Transaction, key: []const u8) FloError!types.ExistsResult {
         try self.checkAlive();
-        return (try kvExists(self.client, self.namespace, key, self.routing_key, self.id)).exists;
+        const a = try kvExists(self.client, self.namespace, key, self.routing_key, self.id);
+        return .{ .exists = a.exists, .stale = a.stale };
     }
 
     // ── Disallowed inside a transaction ───────────────────────────────
@@ -513,15 +525,16 @@ fn encodeScanBody(buf: *[MAX_SCAN_BODY]u8, limit: u32, cursor: []const u8) FloEr
     return w.written();
 }
 
-const MAX_HISTORY_BODY = 5 + ROUTING_KEY_FIELD;
+const MAX_HISTORY_BODY = 5 + 9 + ROUTING_KEY_FIELD;
 
-/// kv.history's request: limit, routing_key.
-fn encodeHistoryBody(buf: *[MAX_HISTORY_BODY]u8, limit: u32, routing_key: ?[]const u8) FloError![]const u8 {
+/// kv.history's request: limit, before_version, routing_key.
+fn encodeHistoryBody(buf: *[MAX_HISTORY_BODY]u8, limit: u32, before_version: ?u64, routing_key: ?[]const u8) FloError![]const u8 {
     if (limit < 1 or limit > types.MAX_HISTORY) return FloError.BadRequest;
     try checkRoutingKey(routing_key);
     var w: BodyWriter = .{ .buf = buf };
     w.put(&.{1});
     w.int(u32, limit);
+    w.optU64(before_version);
     w.routingKey(routing_key);
     return w.written();
 }
@@ -644,16 +657,27 @@ fn txnBody(txn: u64) [8]u8 {
     return buf;
 }
 
+/// Whether a get's answer says the key is absent; an error for any other
+/// refusal (a not-found naming no such transaction, say). A halted shard's
+/// not-found is `StaleNotFound`: absent as of the halt, not absent.
+fn absent(client: *const Client, response: *const wire.RawResponse) FloError!bool {
+    if (response.status == .ok) return false;
+    if (response.status == .not_found and client.last_error_reason == .not_found) {
+        return if (response.stale) FloError.StaleNotFound else true;
+    }
+    return response.status.toError();
+}
+
 /// kv.get, inside transaction `txn` when given.
 fn kvGet(client: *Client, namespace: []const u8, key: []const u8, options: types.GetOptions, txn: ?u64) FloError!?types.GetResult {
     var buf: [MAX_GET_BODY]u8 = undefined;
     const body = try encodeGetBody(&buf, options, txn);
     var response = try client.sendRequest(.kv_get, namespace, key, body, "");
     defer response.deinit();
-    // Absent; any other not-found (no such transaction) is an error.
-    if (response.status == .not_found and client.last_error_reason == .not_found) return null;
-    if (response.status != .ok) return response.status.toError();
-    return try decodeGetAnswer(client.allocator, response.data);
+    if (try absent(client, &response)) return null;
+    var got = try decodeGetAnswer(client.allocator, response.data);
+    got.stale = response.stale;
+    return got;
 }
 
 /// kv.set, inside transaction `txn` when given.
@@ -696,7 +720,9 @@ fn kvExists(client: *Client, namespace: []const u8, key: []const u8, routing_key
     const body = try encodeExistsBody(&buf, routing_key, txn);
     var response = try call(client, .kv_exists, namespace, key, body);
     defer response.deinit();
-    return decodeExistsAnswer(response.data);
+    var answer = try decodeExistsAnswer(response.data);
+    answer.stale = response.stale;
+    return answer;
 }
 
 /// Reads an answer field by field. A length that runs past the end is an
@@ -735,13 +761,23 @@ pub const Reader = struct {
     }
 };
 
-/// kv.get's and kv.json_get's answer: version, value.
+/// kv.get's answer: version, value, expires_at_ms.
 fn decodeGetAnswer(allocator: Allocator, data: []const u8) FloError!types.GetResult {
     var r: Reader = .{ .data = data };
     const version = try r.int(u64);
     const value = try r.lenBytes(u32);
+    const expires_at_ms = try r.opt(i64);
     try r.end();
-    return .{ .version = version, .value = try allocator.dupe(u8, value) };
+    return .{ .version = version, .value = try allocator.dupe(u8, value), .expires_at_ms = expires_at_ms };
+}
+
+/// kv.json_get's answer: version, document.
+fn decodeJsonGetAnswer(allocator: Allocator, data: []const u8) FloError!types.GetResult {
+    var r: Reader = .{ .data = data };
+    const version = try r.int(u64);
+    const document = try r.lenBytes(u32);
+    try r.end();
+    return .{ .version = version, .value = try allocator.dupe(u8, document) };
 }
 
 /// kv.set's answer: its version, absent (0) inside a transaction.
@@ -788,11 +824,12 @@ fn decodeScanAnswer(allocator: Allocator, data: []const u8) FloError!types.ScanR
     };
 }
 
-/// kv.history's answer: versions, each {version, at_ms, value}, newest first.
-fn decodeHistoryAnswer(allocator: Allocator, data: []const u8) FloError![]types.VersionEntry {
+/// kv.history's answer: versions, each {version, at_ms, deleted, value},
+/// newest first, then more.
+fn decodeHistoryAnswer(allocator: Allocator, data: []const u8) FloError!types.HistoryResult {
     var r: Reader = .{ .data = data };
     const n = try r.int(u8);
-    if (n > r.remaining() / (8 + 8 + 4)) return FloError.IncompleteResponse;
+    if (n > r.remaining() / (8 + 8 + 1 + 4)) return FloError.IncompleteResponse;
     const entries = try allocator.alloc(types.VersionEntry, n);
     var got: usize = 0;
     errdefer {
@@ -802,11 +839,13 @@ fn decodeHistoryAnswer(allocator: Allocator, data: []const u8) FloError![]types.
     while (got < n) : (got += 1) {
         const version = try r.int(u64);
         const at_ms = try r.int(i64);
+        const deleted = try r.boolean();
         const value = try r.lenBytes(u32);
-        entries[got] = .{ .version = version, .at_ms = at_ms, .value = try allocator.dupe(u8, value) };
+        entries[got] = .{ .version = version, .at_ms = at_ms, .deleted = deleted, .value = try allocator.dupe(u8, value) };
     }
+    const more = try r.boolean();
     try r.end();
-    return entries;
+    return .{ .versions = entries, .more = more, .allocator = allocator };
 }
 
 /// kv.mget's answer: entries for the first keys, then `next`, the index of
@@ -843,7 +882,7 @@ fn decodeIncrAnswer(data: []const u8) FloError!IncrAnswer {
 }
 
 /// kv.exists's answer; version is 0 when absent or a buffered write.
-const ExistsAnswer = struct { exists: bool, version: u64 };
+const ExistsAnswer = struct { exists: bool, version: u64, stale: bool = false };
 
 fn decodeExistsAnswer(data: []const u8) FloError!ExistsAnswer {
     var r: Reader = .{ .data = data };
@@ -944,8 +983,10 @@ test "the other KV ops' requests match the server's schemas byte for byte" {
     var scan: [MAX_SCAN_BODY]u8 = undefined;
     try expectHex("0102000000026331", try encodeScanBody(&scan, 2, "c1"));
     var hist: [MAX_HISTORY_BODY]u8 = undefined;
-    try expectHex("010200000000", try encodeHistoryBody(&hist, 2, null));
-    try expectHex("0102000000010200726b", try encodeHistoryBody(&hist, 2, "rk"));
+    try expectHex("01020000000000", try encodeHistoryBody(&hist, 2, null, null));
+    try expectHex("010200000000010200726b", try encodeHistoryBody(&hist, 2, null, "rk"));
+    // before_version present.
+    try expectHex("010200000001050000000000000000", try encodeHistoryBody(&hist, 2, 5, null));
     const keys = [_][]const u8{ "a", "b" };
     var mget: [mgetBodySize(&keys)]u8 = undefined;
     try expectHex("020001006101006200", encodeMgetBody(&mget, &keys, null));
@@ -982,14 +1023,14 @@ test "the other KV ops' answers decode as the server's schemas write them" {
     try testing.expectEqual(@as(usize, 0), last.keys.len);
     try testing.expect(last.cursor == null);
 
-    const versions = try decodeHistoryAnswer(a, hex("010300000000000000e803000000000000020000007633"));
-    defer {
-        for (versions) |*v| v.deinit(a);
-        a.free(versions);
-    }
+    var history = try decodeHistoryAnswer(a, hex("010300000000000000e8030000000000000002000000763301"));
+    defer history.deinit();
+    const versions = history.versions;
+    try testing.expect(history.more);
     try testing.expectEqual(@as(usize, 1), versions.len);
     try testing.expectEqual(@as(u64, 3), versions[0].version);
     try testing.expectEqual(@as(i64, 1000), versions[0].at_ms);
+    try testing.expect(!versions[0].deleted);
     try testing.expectEqualStrings("v3", versions[0].value);
 
     var out: [2]types.MGetEntry = undefined;
@@ -1011,7 +1052,7 @@ test "the other KV ops' answers decode as the server's schemas write them" {
     try testing.expect(exists.exists);
     try testing.expectEqual(@as(u64, 5), exists.version);
 
-    var doc = try decodeGetAnswer(a, hex("0300000000000000020000007b7d"));
+    var doc = try decodeJsonGetAnswer(a, hex("0300000000000000020000007b7d"));
     defer doc.deinit(a);
     try testing.expectEqual(@as(u64, 3), doc.version);
     try testing.expectEqualStrings("{}", doc.value);
@@ -1037,9 +1078,8 @@ fn decodeAny(which: usize, data: []const u8) FloError!void {
             r.deinit();
         },
         2 => {
-            const v = try decodeHistoryAnswer(a, data);
-            for (v) |*e| e.deinit(a);
-            a.free(v);
+            var v = try decodeHistoryAnswer(a, data);
+            v.deinit();
         },
         3 => {
             var out: [2]types.MGetEntry = undefined;
@@ -1048,7 +1088,7 @@ fn decodeAny(which: usize, data: []const u8) FloError!void {
         4 => _ = try decodeIncrAnswer(data),
         5 => _ = try decodeExistsAnswer(data),
         6 => {
-            var r = try decodeGetAnswer(a, data);
+            var r = try decodeJsonGetAnswer(a, data);
             r.deinit(a);
         },
         7 => _ = try decodeJsonSetAnswer(data),
@@ -1056,15 +1096,55 @@ fn decodeAny(which: usize, data: []const u8) FloError!void {
         9 => _ = try decodeTxnBeginAnswer(data),
         10 => _ = try decodeCommitAnswer(data),
         11 => _ = try decodeSetAnswer(data),
+        12, 13 => {
+            var r = try decodeGetAnswer(a, data);
+            r.deinit(a);
+        },
         else => unreachable,
     }
+}
+
+test "kv.get's answer carries the key's expiry when it has a TTL" {
+    const a = testing.allocator;
+    var plain = try decodeGetAnswer(a, hex("0300000000000000010000007600"));
+    defer plain.deinit(a);
+    try testing.expectEqual(@as(u64, 3), plain.version);
+    try testing.expectEqualStrings("v", plain.value);
+    try testing.expectEqual(@as(?i64, null), plain.expires_at_ms);
+
+    var ttl = try decodeGetAnswer(a, hex("030000000000000001000000760100ca9a3b00000000"));
+    defer ttl.deinit(a);
+    try testing.expectEqual(@as(?i64, 1_000_000_000), ttl.expires_at_ms);
+
+    // Cut inside the i64.
+    try testing.expectError(FloError.IncompleteResponse, decodeGetAnswer(a, hex("030000000000000001000000760100ca9a")));
+}
+
+test "kv.history marks a delete's version" {
+    const a = testing.allocator;
+    // v3 "c", v2 deleted, v1 "a".
+    var history = try decodeHistoryAnswer(a, hex("03" ++
+        "0300000000000000" ++ "0300000000000000" ++ "00" ++ "01000000" ++ "63" ++
+        "0200000000000000" ++ "0200000000000000" ++ "01" ++ "00000000" ++
+        "0100000000000000" ++ "0100000000000000" ++ "00" ++ "01000000" ++ "61" ++ "00"));
+    defer history.deinit();
+    const versions = history.versions;
+    try testing.expect(!history.more);
+    try testing.expectEqual(@as(usize, 3), versions.len);
+    try testing.expect(!versions[0].deleted);
+    try testing.expectEqualStrings("c", versions[0].value);
+    try testing.expect(versions[1].deleted);
+    try testing.expectEqual(@as(u64, 2), versions[1].version);
+    try testing.expectEqualStrings("", versions[1].value);
+    try testing.expect(!versions[2].deleted);
+    try testing.expectEqualStrings("a", versions[2].value);
 }
 
 test "answers decode whole or not at all" {
     const answers = [_][]const u8{
         hex("0101"),
         hex("02000100610200626201026332"),
-        hex("010300000000000000e803000000000000020000007633"),
+        hex("010300000000000000e8030000000000000002000000763300"),
         hex("0200010200000000000000010000007800000000000000000000000000010200"),
         hex("010400000000000000012a00000000000000"),
         hex("010500000000000000"),
@@ -1074,6 +1154,8 @@ test "answers decode whole or not at all" {
         hex("01000000000000000200000000000000"),
         hex("0a000000000000000200"),
         hex("010900000000000000"),
+        hex("0300000000000000010000007600"),
+        hex("030000000000000001000000760100ca9a3b00000000"),
     };
     for (answers, 0..) |data, which| {
         try decodeAny(which, data);
@@ -1087,6 +1169,9 @@ test "answers decode whole or not at all" {
     // A bool or presence byte is 0 or 1.
     try testing.expectError(FloError.IncompleteResponse, decodeDeleteAnswer(&.{ 1, 2 }));
     try testing.expectError(FloError.IncompleteResponse, decodeSetAnswer(&.{2}));
+    // kv.get's expires_at_ms presence byte, and a history entry's deleted.
+    try testing.expectError(FloError.IncompleteResponse, decodeAny(12, hex("0300000000000000010000007602")));
+    try testing.expectError(FloError.IncompleteResponse, decodeAny(2, hex("010300000000000000e8030000000000000202000000763300")));
     // A scan count its data can't hold is refused before it allocates.
     try testing.expectError(FloError.IncompleteResponse, decodeScanAnswer(testing.allocator, &.{ 0xff, 0xff, 0 }));
 }
@@ -1227,7 +1312,7 @@ test "transaction ops carry the txn and its routing key; commit and rollback car
     try testing.expectEqual(op(.kv_expire), srv.last_op);
     try expectHex("60ea00000000000000010200726b010100000000000000", srv.lastBody());
 
-    try testing.expect(!try txn.exists("k"));
+    try testing.expect(!(try txn.exists("k")).exists);
     try testing.expectEqual(op(.kv_exists), srv.last_op);
     try expectHex("010200726b010100000000000000", srv.lastBody());
 
@@ -1346,7 +1431,7 @@ test "incr, expire, exists and the JSON ops answer through their schemas" {
     try kv.expire("k", 0, .{ .cas_version = 3 });
     try expectHex("00000000000000000103000000000000000000", srv.lastBody());
 
-    try testing.expect(try kv.exists("k", .{}));
+    try testing.expect((try kv.exists("k", .{})).exists);
 
     var doc = (try kv.jsonGet("k", "", .{})).?;
     defer doc.deinit(testing.allocator);
@@ -1362,8 +1447,8 @@ test "incr, expire, exists and the JSON ops answer through their schemas" {
 }
 
 test "status 12 and an unknown status each surface with their message, and the next reply is read whole" {
-    // A kv.get answer: [version:u64][value_len:u32][value].
-    const ok_body = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 'v' };
+    // A kv.get answer: [version:u64][value_len:u32][value][expires_at_ms: none].
+    const ok_body = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 'v', 0 };
     var srv = try test_server.OkServer.listen();
     srv.replies = &.{
         // Refusal bodies: [reason:u16][ran:u8][message].
@@ -1458,7 +1543,7 @@ test "values up to the server's bounds go out in one frame; a frame over it is r
 test "history of a missing key is empty" {
     var srv = try test_server.OkServer.listen();
     srv.replies = &.{
-        .{ .status = 0, .body = hex("00") },
+        .{ .status = 0, .body = hex("0000") },
         .{ .status = 2, .body = "\x0d\x00\x00missing" },
     };
     try srv.start();
@@ -1470,9 +1555,67 @@ test "history of a missing key is empty" {
     var kv = KV.init(&client);
 
     for (0..2) |_| {
-        const versions = try kv.history("gone", .{ .routing_key = "rk" });
-        defer testing.allocator.free(versions);
-        try testing.expectEqual(@as(usize, 0), versions.len);
+        var history = try kv.history("gone", .{ .routing_key = "rk" });
+        defer history.deinit();
+        try testing.expectEqual(@as(usize, 0), history.versions.len);
+        try testing.expect(!history.more and !history.stale);
     }
-    try expectHex("010a000000010200726b", srv.lastBody());
+    try expectHex("010a00000000010200726b", srv.lastBody());
+}
+
+test "a halted shard's answers read as stale, a missing key on one is StaleNotFound, and an unknown flag is refused" {
+    const not_found = "\x0d\x00\x00key not found";
+    const get_v = hex("0300000000000000010000007600");
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 0, .body = get_v, .flags = 1 }, // get, stale
+        .{ .status = 0, .body = get_v }, // get
+        .{ .status = 2, .body = not_found, .flags = 1 }, // get, stale not-found
+        .{ .status = 2, .body = not_found }, // get, absent
+        .{ .status = 2, .body = not_found, .flags = 1 }, // json get, stale not-found
+        .{ .status = 2, .body = not_found }, // json get, absent
+        .{ .status = 0, .body = hex("010500000000000000"), .flags = 1 }, // exists
+        .{ .status = 0, .body = hex("01000000000000000000000000000000"), .flags = 1 }, // mget: missing
+        .{ .status = 0, .body = hex("000000"), .flags = 1 }, // scan
+        .{ .status = 0, .body = hex("0000"), .flags = 1 }, // history
+        .{ .status = 2, .body = not_found, .flags = 1 }, // history, stale not-found
+        .{ .status = 0, .body = get_v, .flags = 2 }, // get, unknown flag
+        .{ .status = 0, .body = get_v, .flags = 0x81 }, // get, stale and an unknown high bit
+    };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var kv = KV.init(&client);
+
+    var stale = (try kv.get("k", .{})).?;
+    defer stale.deinit(testing.allocator);
+    try testing.expect(stale.stale);
+    try testing.expectEqualStrings("v", stale.value);
+    var fresh = (try kv.get("k", .{})).?;
+    defer fresh.deinit(testing.allocator);
+    try testing.expect(!fresh.stale);
+
+    try testing.expectError(FloError.StaleNotFound, kv.get("k", .{}));
+    try testing.expect(try kv.get("k", .{}) == null);
+    try testing.expectError(FloError.StaleNotFound, kv.jsonGet("k", "", .{}));
+    try testing.expect(try kv.jsonGet("k", "", .{}) == null);
+
+    try testing.expect((try kv.exists("k", .{})).stale);
+    var got = try kv.mget(&.{"k"}, .{});
+    defer got.deinit();
+    try testing.expect(!got.entries[0].found and got.entries[0].stale);
+    var page = try kv.scan("", .{});
+    defer page.deinit();
+    try testing.expect(page.stale);
+    var history = try kv.history("k", .{});
+    defer history.deinit();
+    try testing.expect(history.stale);
+    var gone = try kv.history("k", .{});
+    defer gone.deinit();
+    try testing.expect(gone.stale and gone.versions.len == 0);
+
+    try testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
+    try testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
 }

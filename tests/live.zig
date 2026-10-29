@@ -4,7 +4,9 @@
 //! CI=1, where a missing server is a failure, not a skip.
 //! FLO_FAST_EXPIRY_ENDPOINT names a second server, configured to remove a
 //! worker silent for a second, for the re-registration test; it skips (or
-//! fails under CI=1) the same way.
+//! fails under CI=1) the same way. FLO_OPS_JSON names the pinned flo's
+//! ops.json, for the status and reason check, which skips (or fails) the
+//! same way too.
 
 const std = @import("std");
 const flo = @import("flo");
@@ -61,7 +63,7 @@ test "live: the server speaks this SDK's protocol and table" {
     const run = try std.process.Child.run(.{ .allocator = testing.allocator, .argv = &.{ binary, "version", "--verbose" }, .env_map = &env_map });
     defer testing.allocator.free(run.stdout);
     defer testing.allocator.free(run.stderr);
-    // "... (protocol 2, table 0x2fba7dd9ae941830; ..."
+    // "... (protocol 3, table 0x05fe53f432e943c4; ..."
     const p = std.mem.indexOf(u8, run.stdout, "protocol ") orelse return error.NoProtocol;
     const t = std.mem.indexOf(u8, run.stdout, "table 0x") orelse return error.NoTable;
     const proto_end = std.mem.indexOfScalarPos(u8, run.stdout, p, ',') orelse return error.NoProtocol;
@@ -98,6 +100,215 @@ test "live: puts, gets and mgets keys" {
     try testing.expect(got.entries[2].found);
     try testing.expectEqualStrings("2", got.entries[2].value);
     try testing.expectEqual(b.version, got.entries[2].version);
+}
+
+test "live: a key set with a TTL reads back with its expiry" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var kv = flo.KV.init(&live.client);
+    const ttl: i64 = 60_000;
+    const before = std.time.milliTimestamp();
+    _ = try kv.put("ttl", "v", .{ .ttl_ms = @intCast(ttl) });
+    const after = std.time.milliTimestamp();
+    var got = (try kv.get("ttl", .{})).?;
+    defer got.deinit(testing.allocator);
+    const expires = got.expires_at_ms orelse return error.NoExpiry;
+    try testing.expect(expires >= before + ttl and expires <= after + ttl);
+
+    _ = try kv.put("plain", "v", .{});
+    var plain = (try kv.get("plain", .{})).?;
+    defer plain.deinit(testing.allocator);
+    try testing.expectEqual(@as(?i64, null), plain.expires_at_ms);
+}
+
+test "live: a key's history marks the version a delete wrote" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var kv = flo.KV.init(&live.client);
+    _ = try kv.put("k", "one", .{});
+    try testing.expect(try kv.delete("k", .{}));
+    _ = try kv.put("k", "two", .{});
+    var history = try kv.history("k", .{});
+    defer history.deinit();
+    const versions = history.versions;
+    try testing.expect(!history.more and !history.stale);
+    try testing.expectEqual(@as(usize, 3), versions.len);
+    try testing.expect(!versions[0].deleted);
+    try testing.expectEqualStrings("two", versions[0].value);
+    try testing.expect(versions[1].deleted);
+    try testing.expect(!versions[2].deleted);
+    try testing.expectEqualStrings("one", versions[2].value);
+}
+
+test "live: worker info shows a worker's row, metadata and processes" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var actions = flo.Actions.init(&live.client);
+    try actions.register("info-w", null, .{
+        .max_concurrency = 4,
+        .processes = &.{ .{ .name = "send" }, .{ .name = "events/g", .kind = .stream_consumer } },
+        .metadata = "\x00raw\xff",
+        .machine_id = "info-host",
+    });
+    var info = try actions.workerInfo("info-w", .{});
+    defer info.deinit();
+    try testing.expectEqualStrings("info-w", info.worker.id);
+    try testing.expectEqual(flo.WorkerType.action, info.worker.worker_type);
+    try testing.expectEqual(@as(u32, 4), info.worker.max_concurrency);
+    try testing.expectEqualStrings("info-host", info.worker.machine_id.?);
+    try testing.expectEqualStrings("\x00raw\xff", info.metadata.?);
+    try testing.expectEqual(@as(usize, 2), info.processes.len);
+    try testing.expectEqualStrings("send", info.processes[0].name);
+    try testing.expectEqual(flo.ProcessKind.action, info.processes[0].kind);
+    try testing.expectEqualStrings("events/g", info.processes[1].name);
+    try testing.expectEqual(flo.ProcessKind.stream_consumer, info.processes[1].kind);
+    try testing.expectEqual(@as(u64, 0), info.processes[1].run_count);
+}
+
+test "live: worker info for a worker the server doesn't know is not found" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var actions = flo.Actions.init(&live.client);
+    try testing.expectError(flo.FloError.NotFound, actions.workerInfo("no-such-worker", .{}));
+    const last = live.client.lastError().?;
+    try testing.expectEqual(@as(u8, 2), last.code);
+    try testing.expectEqual(flo.Reason.not_found, last.reason);
+}
+
+test "live: the server refuses a registration of more than 1024 processes" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var actions = flo.Actions.init(&live.client);
+    var processes: [1025]flo.ProcessEntry = undefined;
+    var names: [1025][8]u8 = undefined;
+    for (&processes, &names, 0..) |*p, *n, i| p.* = .{ .name = std.fmt.bufPrint(n, "p{d}", .{i}) catch unreachable };
+    try testing.expectError(flo.FloError.BadRequest, actions.register("many-w", null, .{ .processes = &processes }));
+    const last = live.client.lastError().?;
+    try testing.expectEqual(@as(u8, 3), last.code);
+    try testing.expectEqual(flo.Reason.out_of_range, last.reason);
+    try testing.expectEqual(flo.Ran.no, last.ran);
+    try testing.expectEqualStrings("more than 1024 processes", last.message);
+}
+
+test "live: the server refuses a process name or machine id past its limit as too long" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var actions = flo.Actions.init(&live.client);
+    const long_name = [_]u8{'n'} ** 4097;
+    try testing.expectError(flo.FloError.BadRequest, actions.register("long-name-w", null, .{ .processes = &.{.{ .name = &long_name }} }));
+    var last = live.client.lastError().?;
+    try testing.expectEqual(@as(u8, 3), last.code);
+    try testing.expectEqual(flo.Reason.field_too_long, last.reason);
+    try testing.expectEqual(flo.Ran.no, last.ran);
+    try testing.expectEqualStrings("process name longer than 4096 bytes", last.message);
+
+    const long_host = [_]u8{'h'} ** 256;
+    try testing.expectError(flo.FloError.BadRequest, actions.register("long-host-w", &.{"job"}, .{ .machine_id = &long_host }));
+    last = live.client.lastError().?;
+    try testing.expectEqual(@as(u8, 3), last.code);
+    try testing.expectEqual(flo.Reason.field_too_long, last.reason);
+    try testing.expectEqual(flo.Ran.no, last.ran);
+    try testing.expectEqualStrings("machine id longer than 255 bytes", last.message);
+}
+
+test "live: kv.history pages a key's versions, newest first, each once" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var kv = flo.KV.init(&live.client);
+    var written: [5]u64 = undefined;
+    for (&written, 0..) |*v, i| {
+        var buf: [4]u8 = undefined;
+        v.* = (try kv.put("paged", std.fmt.bufPrint(&buf, "v{d}", .{i}) catch unreachable, .{})).version;
+    }
+
+    var seen: [5]u64 = undefined;
+    var n: usize = 0;
+    var pages: usize = 0;
+    var before: ?u64 = null;
+    while (true) {
+        var page = try kv.history("paged", .{ .limit = 2, .before_version = before });
+        defer page.deinit();
+        pages += 1;
+        // A page can come back empty; stop rather than ask from nothing.
+        if (page.versions.len == 0) break;
+        for (page.versions) |v| {
+            try testing.expect(n < seen.len);
+            seen[n] = v.version;
+            n += 1;
+        }
+        if (!page.more) break;
+        before = page.versions[page.versions.len - 1].version;
+    }
+    try testing.expectEqual(@as(usize, 3), pages);
+    try testing.expectEqual(@as(usize, 5), n);
+    for (seen, 0..) |v, i| try testing.expectEqual(written[written.len - 1 - i], v);
+
+    var past = try kv.history("paged", .{ .before_version = written[0] });
+    defer past.deinit();
+    try testing.expectEqual(@as(usize, 0), past.versions.len);
+    try testing.expect(!past.more);
+}
+
+test "live: worker.list with an action lists only the workers that run it" {
+    const ep = try endpoint();
+    var ns_buf: [32]u8 = undefined;
+    const namespace = freshNamespace(&ns_buf);
+    var client = flo.Client.init(testing.allocator, ep, .{ .namespace = namespace, .timeout_ms = 10_000 });
+    defer client.deinit();
+    try client.connect();
+    var actions = flo.Actions.init(&client);
+    try actions.register("fw-1", &.{"send"}, .{});
+    try actions.register("fw-2", &.{"bill"}, .{});
+    try actions.register("fw-3", &.{ "bill", "send" }, .{});
+
+    var send = try actions.listWorkers(.{ .action = "send" });
+    defer send.deinit();
+    try testing.expectEqual(@as(usize, 2), send.workers.len);
+    try testing.expectEqualStrings("fw-1", send.workers[0].id);
+    try testing.expectEqualStrings("fw-3", send.workers[1].id);
+    var all = try actions.listWorkers(.{});
+    defer all.deinit();
+    try testing.expectEqual(@as(usize, 3), all.workers.len);
+}
+
+/// The `{code, name}` list `field` names in ops.json, as it holds it.
+fn expectSameNames(comptime E: type, ops: std.json.Value, field: []const u8) !void {
+    const list = (ops.object.get(field) orelse return error.NoSuchList).array.items;
+    const fields = @typeInfo(E).@"enum".fields;
+    try testing.expectEqual(list.len, fields.len);
+    next: for (list) |entry| {
+        const code = entry.object.get("code").?.integer;
+        const name = entry.object.get("name").?.string;
+        inline for (fields) |f| {
+            if (f.value == code) {
+                if (std.mem.eql(u8, f.name, name)) continue :next;
+                break;
+            }
+        }
+        std.debug.print("{s}: the server's {s} {d} is {s}; this SDK has no such value\n", .{ @typeName(E), field, code, name });
+        return error.Drift;
+    }
+}
+
+test "status codes and refusal reasons are the server's" {
+    // FLO_OPS_JSON is flo's `zig build gen` output for the pinned commit.
+    const path = env("FLO_OPS_JSON") orelse {
+        if (env("CI") != null) return error.NoOpsJsonInCI;
+        return error.SkipZigTest;
+    };
+    const text = try std.fs.cwd().readFileAlloc(testing.allocator, path, 16 * 1024 * 1024);
+    defer testing.allocator.free(text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});
+    defer parsed.deinit();
+    try expectSameNames(flo.StatusCode, parsed.value, "statuses");
+    try expectSameNames(flo.Reason, parsed.value, "reasons");
 }
 
 test "live: appends to a stream and reads it back in order, with headers" {
