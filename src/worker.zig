@@ -547,6 +547,8 @@ pub const ActionWorker = struct {
                 std.log.err("[flo-worker] Heartbeat failed: {}", .{err});
                 return;
             }
+            // Only worker.register is sent again: the server keeps workers in
+            // memory, so it can't halt a shard or answer outcome_pending.
             std.log.warn("[flo-worker] The server no longer knows this worker; registering again", .{});
             self.registerWorker() catch |rerr| {
                 std.log.warn("[flo-worker] Failed to register again: {}", .{rerr});
