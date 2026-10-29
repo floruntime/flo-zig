@@ -264,9 +264,20 @@ pub const StreamWorker = struct {
         try self.joinGroups();
         if (!@atomicLoad(bool, &self.running, .monotonic)) return;
 
-        self.registerWorker() catch |err| {
-            std.log.warn("[flo-stream-worker] Failed to register in worker registry: {}", .{err});
-        };
+        // A halted shard holds the start until it's repaired, or a stop or
+        // drain ends the wait; any other failure only warns.
+        var halted = retry_mod.haltedBackoff();
+        while (true) {
+            self.registerWorker() catch |err| {
+                if (self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-stream-worker]", "worker registration")) {
+                    if (types.goingOn(&self.running, &self.draining)) continue;
+                    break;
+                }
+                std.log.warn("[flo-stream-worker] Failed to register in worker registry: {}", .{err});
+            };
+            break;
+        }
+        halted.reset();
 
         self.last_heartbeat_ns = std.time.nanoTimestamp();
 
@@ -304,11 +315,12 @@ pub const StreamWorker = struct {
 
             if (self.pollAndProcess(stream_list[stream_idx])) {
                 failed.reset();
+                halted.reset();
             } else |err| {
                 if (client_mod.isConnectionError(err)) {
                     std.log.warn("[flo-stream-worker] Connection lost: {}, reconnecting...", .{err});
                     self.client.disconnect();
-                } else {
+                } else if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-stream-worker]", "group read")) {
                     const ms = failed.next(self.client.prng.random());
                     std.log.err("[flo-stream-worker] GroupRead error: {}, retrying in {d}ms...", .{ err, ms });
                     types.pauseUnlessHalted(&self.running, &self.draining, ms);
@@ -356,12 +368,14 @@ pub const StreamWorker = struct {
 
     /// Join the group on every stream. A join the server refused without
     /// running it (overloaded or unavailable, past the client's own retries)
-    /// is tried again with the worker backoff until it succeeds or the
-    /// worker stops or drains; any other error is returned.
+    /// is tried again with the worker backoff, and one a halted shard
+    /// refused with the halted backoff, until it succeeds or the worker
+    /// stops or drains; any other error is returned.
     fn joinGroups(self: *Self) !void {
         var stream = self.streamApi();
         for (self.config.getStreams()) |stream_name| {
             var failed = retry_mod.workerBackoff();
+            var halted = retry_mod.haltedBackoff();
             while (true) {
                 stream.groupJoin(
                     stream_name,
@@ -369,6 +383,10 @@ pub const StreamWorker = struct {
                     self.consumer_name,
                     .{ .namespace = self.config.namespace },
                 ) catch |err| {
+                    if (self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-stream-worker]", "group join")) {
+                        if (!types.goingOn(&self.running, &self.draining)) return;
+                        continue;
+                    }
                     if (!self.client.refusedUnrun(err)) return err;
                     const ms = failed.next(self.client.prng.random());
                     std.log.warn("[flo-stream-worker] [{s}] Group join refused: {}, retrying in {d}ms...", .{ stream_name, err, ms });
@@ -1215,4 +1233,38 @@ test "StreamWorker registers again, with the same options, when its heartbeat fi
     try std.testing.expect(std.mem.indexOf(u8, first, "events/default") != null);
     try std.testing.expectEqualSlices(u8, first, test_server.valueOf(srv.requestOf(.worker_register, 1)));
     try std.testing.expect(!w.drain_sent);
+}
+
+test "StreamWorker waits out a halted shard at its join, registration and reads, then carries on" {
+    const handler = struct {
+        fn handle(_: *StreamContext) anyerror!void {}
+    }.handle;
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    // unavailable, reason shard_halted, ran no.
+    const halted: @import("test_server.zig").Reply = .{ .status = 12, .body = "\x1d\x00\x00shard 0 halted at index 8; an operator must repair it" };
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .stream_group_join, .nth = 0, .action = .{ .reply = halted } },
+        .{ .op = .stream_group_join, .nth = 1, .action = .{ .reply = halted } },
+        .{ .op = .stream_group_join, .nth = 2, .action = .{ .reply = halted } },
+        .{ .op = .worker_register, .nth = 0, .action = .{ .reply = halted } },
+        .{ .op = .worker_register, .nth = 1, .action = .{ .reply = halted } },
+        .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = halted } },
+        .{ .op = .stream_group_read, .nth = 1, .action = .{ .reply = halted } },
+        .{ .op = .stream_group_read, .nth = 2, .action = .{ .reply = halted } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, handler);
+    defer w.deinit();
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    var waited: u32 = 0;
+    while (srv.countOf(.stream_group_read) < 5 and waited < 8000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+
+    try std.testing.expectEqual(@as(u32, 4), srv.countOf(.stream_group_join));
+    try std.testing.expectEqual(@as(u32, 3), srv.countOf(.worker_register));
+    try std.testing.expect(srv.countOf(.stream_group_read) >= 5);
 }

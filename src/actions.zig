@@ -128,7 +128,7 @@ pub const Actions = struct {
     /// **Caller owns the returned page and must call `page.deinit()`.**
     pub fn listWorkers(self: *Self, options: types.WorkerListOptions) FloError!types.WorkerListPage {
         var buf: [MAX_WORKER_LIST_BODY]u8 = undefined;
-        const body = try encodeWorkerListBody(&buf, options.limit, options.cursor orelse "");
+        const body = try encodeWorkerListBody(&buf, options.limit, options.cursor orelse "", options.action orelse "");
         var response = try self.client.sendRequest(.worker_list, self.client.getNamespace(options.namespace), "", body, "");
         defer response.deinit();
         if (response.status != .ok) return response.status.toError();
@@ -607,17 +607,21 @@ const max_worker_id = 4096;
 /// The longest machine id a worker.list row carries.
 const max_machine_id = 255;
 
-const MAX_WORKER_LIST_BODY = 1 + 4 + 2 + max_worker_id;
+const MAX_WORKER_LIST_BODY = 1 + 4 + 2 + max_worker_id + 2 + max_worker_id;
 
-/// worker.list's request: limit (present), cursor ("" for the first page).
-fn encodeWorkerListBody(buf: *[MAX_WORKER_LIST_BODY]u8, limit: u32, cursor: []const u8) FloError![]const u8 {
+/// worker.list's request: limit (present), cursor ("" for the first page),
+/// action ("" for every worker).
+fn encodeWorkerListBody(buf: *[MAX_WORKER_LIST_BODY]u8, limit: u32, cursor: []const u8, action: []const u8) FloError![]const u8 {
     if (limit < 1 or limit > types.MAX_WORKER_LIST) return FloError.BadRequest;
-    if (cursor.len > max_worker_id) return FloError.BadRequest;
-    buf[0] = 1;
-    std.mem.writeInt(u32, buf[1..5], limit, .little);
-    std.mem.writeInt(u16, buf[5..7], @intCast(cursor.len), .little);
-    @memcpy(buf[7..][0..cursor.len], cursor);
-    return buf[0 .. 7 + cursor.len];
+    if (cursor.len > max_worker_id or action.len > max_worker_id) return FloError.BadRequest;
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeByte(1) catch unreachable;
+    w.writeInt(u32, limit, .little) catch unreachable;
+    for ([_][]const u8{ cursor, action }) |field| {
+        w.writeInt(u16, @intCast(field.len), .little) catch unreachable;
+        w.writeAll(field) catch unreachable;
+    }
+    return w.buffered();
 }
 
 /// worker.register's value. The server refuses what it won't keep (too many
@@ -995,7 +999,7 @@ test "listWorkers sends its limit and cursor and returns the rows and the next c
     var page = try actions.listWorkers(.{ .limit = 2, .cursor = "w0" });
     defer page.deinit();
     // [present][limit:u32][cursor_len:u16][cursor]
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 0, 0, 0, 2, 0, 'w', '0' }, srv.lastBody());
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 0, 0, 0, 2, 0, 'w', '0', 0, 0 }, srv.lastBody());
     try std.testing.expectEqual(@as(usize, 2), page.workers.len);
     const w1 = page.workers[0];
     try std.testing.expectEqualStrings("w1", w1.id);
@@ -1012,10 +1016,11 @@ test "listWorkers sends its limit and cursor and returns the rows and the next c
     try std.testing.expect(page.workers[1].machine_id == null);
     try std.testing.expectEqualStrings("w2", page.cursor.?);
 
-    // The first page: an empty cursor and the default limit, the server's.
-    var last = try actions.listWorkers(.{});
+    // The first page: an empty cursor and the default limit, the server's;
+    // only workers running "send".
+    var last = try actions.listWorkers(.{ .action = "send" });
     defer last.deinit();
-    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 4, 0, 0, 0, 0 }, srv.lastBody());
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 4, 0, 0, 0, 0, 4, 0, 's', 'e', 'n', 'd' }, srv.lastBody());
     try std.testing.expectEqual(@as(usize, 0), last.workers.len);
     try std.testing.expect(last.cursor == null);
 }

@@ -141,24 +141,32 @@ const existed = try kv.delete("key", .{});
 // Delete only if the key is still at version 5
 _ = try kv.delete("key", .{ .cas_version = 5 });
 
-// Scan key names with a prefix ("" for all); limit is 1-1024, default 1024
-var page = try kv.scan("prefix:", .{ .limit = 100 });
-defer page.deinit();
-for (page.keys) |name| std.debug.print("{s}\n", .{name});
-
-// Next page: pass back the cursor; it is null on the last page
-if (page.cursor) |cursor| {
-    var next = try kv.scan("prefix:", .{ .limit = 100, .cursor = cursor });
-    defer next.deinit();
+// Scan key names with a prefix ("" for all); limit is 1-1024, default 1024.
+// Pass each page's cursor back for the next; it is null on the last page.
+var cursor_buf: [64]u8 = undefined;
+var cursor: ?[]const u8 = null;
+while (true) {
+    var page = try kv.scan("prefix:", .{ .limit = 100, .cursor = cursor });
+    defer page.deinit();
+    for (page.keys) |name| std.debug.print("{s}\n", .{name});
+    const next = page.cursor orelse break;
+    if (page.keys.len == 0) break; // an empty page ends the loop too
+    @memcpy(cursor_buf[0..next.len], next);
+    cursor = cursor_buf[0..next.len];
 }
 
-// Version history, newest first (limit 1-65, default 10); each entry has
-// version, at_ms (write time), deleted (a delete wrote it; value is empty)
-// and value. A missing key has no versions.
-const versions = try kv.history("key", .{ .limit = 10 });
-defer {
-    for (versions) |*v| v.deinit(allocator);
-    allocator.free(versions);
+// Version history, newest first, a page at a time (limit 1-65, default 10);
+// each entry has version, at_ms (write time), deleted (a delete wrote it;
+// value is empty) and value. A missing key has no versions. While `more` is
+// set, ask again with before_version set to the page's last version.
+var before: ?u64 = null;
+while (true) {
+    var history = try kv.history("key", .{ .limit = 10, .before_version = before });
+    defer history.deinit();
+    if (history.versions.len == 0) break;
+    for (history.versions) |v| std.debug.print("v{d} at {d}\n", .{ v.version, v.at_ms });
+    if (!history.more) break;
+    before = history.versions[history.versions.len - 1].version;
 }
 
 // Many keys at once (1-256, each at most 4096 bytes): one entry per key, in
@@ -179,7 +187,7 @@ try kv.expire("session", 0, .{});
 // Renew a lease only if you still hold its version
 try kv.expire("lease", 30_000, .{ .cas_version = 7 });
 
-const present = try kv.exists("key", .{});
+const present = (try kv.exists("key", .{})).exists;
 
 // JSON documents; path "" or "$" is the whole document
 _ = try kv.jsonSet("user:1", "$", "{\"name\":\"ada\"}", .{});
@@ -424,9 +432,12 @@ try actions.touch("worker-1", task.task_type, task.task_id, .{ .extend_ms = 3000
 #### Inspecting Workers
 
 ```zig
-// A page of the namespace's workers, in id order
+// A page of the namespace's workers, in id order; `action` lists only the
+// workers that run it
 var page = try actions.listWorkers(.{});
 defer page.deinit();
+var senders = try actions.listWorkers(.{ .action = "send-email" });
+defer senders.deinit();
 
 // One worker: its row (machine_id included), the metadata it registered
 // with as raw bytes, and its processes, each with a kind and run counts.
@@ -436,9 +447,10 @@ defer info.deinit();
 for (info.processes) |p| std.debug.print("{s} {s} ran {d}\n", .{ p.name, @tagName(p.kind), p.run_count });
 ```
 
-The server judges a registration's limits (at most 1024 processes, names up to 4096
-bytes); a refusal comes back as `error.BadRequest`, with `client.lastError()` giving
-its reason and message.
+The server judges a registration's limits; a refusal comes back as
+`error.BadRequest`, with `client.lastError()` giving its reason and message: more
+than 1024 processes is `out_of_range`; a process name over 4096 bytes, processes too
+long to list together, or a machine id over 255 bytes is `field_too_long`.
 
 ### Workflow Operations
 
@@ -522,6 +534,8 @@ All operations return `flo.FloError` which includes:
 - `RateLimited` - Request rate limit exceeded
 - `Unavailable` - No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (an offline shard needs an operator)
 - `InternalError` - Internal server error (not retryable: the write may have committed)
+- `OutcomePending` - The write committed but hasn't applied, because its shard halted (never retried)
+- `StaleNotFound` - `get` or `jsonGet` on a halted shard: the key is missing as of the halt, which isn't the same as missing
 - `UnexpectedResponse` - Unexpected response format
 - `ServerError` - Generic server error, including status codes this SDK doesn't know
 
@@ -535,6 +549,27 @@ didn't run it (`client.lastError().?.ran == .no`), the client sends it again
 itself, as a new request with a new request id, after a jittered wait. Because
 the server never ran it, this is safe for writes too. Any other refusal, or one
 that may have run, comes straight back.
+
+The client never retries two refusals from a halted shard. `unavailable` with
+reason `shard_halted` didn't run, but the shard takes no writes until an operator
+repairs it, so a retry can't succeed. `outcome_pending` (`error.OutcomePending`,
+reason `shard_halted`, ran unknown) is a write that committed and hasn't applied:
+sending it again would write it twice, or halt the shard again. The message says
+whether it applies when the shard resumes.
+
+The workers are different: their registration, group join and polls are theirs
+to retry. On `shard_halted` they wait, from 100 ms up to 30 s, logging a warning
+with the server's message each time, and carry on by themselves once the shard is
+repaired; a stop or drain ends the wait. A worker started during a halt comes up
+once it's over.
+
+A halted shard still answers reads, from its state just before the entry it
+halted at. Such a read succeeds with `stale` set on its result (`GetResult`,
+`MGetEntry`, `ScanResult`, `HistoryResult`, `ExistsResult`): it is not an error,
+but it doesn't hold anything written since. A key missing from such an answer is
+missing as of the halt, so `get` and `jsonGet` return `error.StaleNotFound`
+rather than null. Only the KV reads carry the flag for now: other reads (streams,
+queues, actions, workers) drop it.
 
 | `RetryPolicy` field | Default | |
 |---|---|---|

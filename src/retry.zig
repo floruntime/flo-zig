@@ -32,10 +32,12 @@ pub fn nsFromMs(ms: u64) u64 {
     return ms *| std.time.ns_per_ms;
 }
 
-/// Whether an answer with `status` and the refusal body's `ran` is one the
-/// server says it didn't run, of a kind worth sending again.
-pub fn isRefusedUnrun(status: types.StatusCode, ran: types.Ran) bool {
-    return (status == .overloaded or status == .unavailable) and ran == .no;
+/// Whether an answer with `status` and the refusal body's `ran` and
+/// `reason` is one the server says it didn't run, of a kind worth sending
+/// again. A halted shard's refusal isn't: it takes no writes until an
+/// operator repairs it.
+pub fn isRefusedUnrun(status: types.StatusCode, ran: types.Ran, reason: types.Reason) bool {
+    return (status == .overloaded or status == .unavailable) and ran == .no and reason != .shard_halted;
 }
 
 /// A capped, doubling, fully jittered wait.
@@ -73,6 +75,14 @@ pub fn workerBackoff() Backoff {
     return Backoff.init(worker_initial_backoff_ms, worker_max_backoff_ms);
 }
 
+/// A worker's registration, group join and polls wait out a halted shard
+/// this way, up to 30 s between tries, until an operator repairs it.
+pub const halted_max_backoff_ms: u64 = 30_000;
+
+pub fn haltedBackoff() Backoff {
+    return Backoff.init(worker_initial_backoff_ms, halted_max_backoff_ms);
+}
+
 /// A generator seeded from the OS, so clients started together don't wait
 /// in step.
 pub fn seededPrng() std.Random.DefaultPrng {
@@ -81,13 +91,15 @@ pub fn seededPrng() std.Random.DefaultPrng {
     return std.Random.DefaultPrng.init(seed);
 }
 
-test "isRefusedUnrun: only overloaded or unavailable with ran = no" {
-    try std.testing.expect(isRefusedUnrun(.overloaded, .no));
-    try std.testing.expect(isRefusedUnrun(.unavailable, .no));
-    try std.testing.expect(!isRefusedUnrun(.overloaded, .unknown));
-    try std.testing.expect(!isRefusedUnrun(.unavailable, .yes));
-    try std.testing.expect(!isRefusedUnrun(.conflict, .no));
-    try std.testing.expect(!isRefusedUnrun(.internal_error, .no));
+test "isRefusedUnrun: only overloaded or unavailable with ran = no, and not a halted shard" {
+    try std.testing.expect(isRefusedUnrun(.overloaded, .no, .shard_busy));
+    try std.testing.expect(isRefusedUnrun(.unavailable, .no, .leader_unknown));
+    try std.testing.expect(!isRefusedUnrun(.unavailable, .no, .shard_halted));
+    try std.testing.expect(!isRefusedUnrun(.outcome_pending, .unknown, .shard_halted));
+    try std.testing.expect(!isRefusedUnrun(.overloaded, .unknown, .shard_busy));
+    try std.testing.expect(!isRefusedUnrun(.unavailable, .yes, .unclassified));
+    try std.testing.expect(!isRefusedUnrun(.conflict, .no, .unclassified));
+    try std.testing.expect(!isRefusedUnrun(.internal_error, .no, .internal));
 }
 
 test "Backoff waits stay under their doubling ceiling" {

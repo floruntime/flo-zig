@@ -336,8 +336,15 @@ pub fn serializeRequest(
 // =============================================================================
 
 /// Raw response from server
+/// Response flag: the answer reads a halted shard's state from just before
+/// the entry it halted at, and nothing written since.
+pub const RESPONSE_STALE: u8 = 0x01;
+
 pub const RawResponse = struct {
     status: StatusCode,
+    /// The answer carries RESPONSE_STALE: a successful read (or not-found)
+    /// from a halted shard.
+    stale: bool = false,
     data: []const u8,
     allocator: Allocator,
 
@@ -519,7 +526,7 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
-    try std.testing.expectEqual(@as(u64, 0x505fdaa07e866b96), header.table_hash);
+    try std.testing.expectEqual(@as(u64, 0x05fe53f432e943c4), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
 }
 

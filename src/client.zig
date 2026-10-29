@@ -214,7 +214,7 @@ pub const Client = struct {
             var resp = try self.sendOnce(op_code, namespace, key, value, options);
             // last_error_ran is set only when the refusal's body decoded.
             if (attempt >= self.retry.max_attempts or self.last_error_code != @intFromEnum(resp.status) or
-                !retry.isRefusedUnrun(resp.status, self.last_error_ran)) return resp;
+                !retry.isRefusedUnrun(resp.status, self.last_error_ran, self.last_error_reason)) return resp;
             resp.deinit();
             const ms = wait.next(self.prng.random());
             if (self.debug) std.log.info("[flo] status {d}, not run: retrying in {d}ms", .{ self.last_error_code, ms });
@@ -227,7 +227,36 @@ pub const Client = struct {
     pub fn refusedUnrun(self: *const Self, err: anyerror) bool {
         if (err != FloError.Overloaded and err != FloError.Unavailable) return false;
         const last = self.lastError() orelse return false;
-        return retry.isRefusedUnrun(@enumFromInt(last.code), last.ran);
+        return retry.isRefusedUnrun(@enumFromInt(last.code), last.ran, last.reason);
+    }
+
+    /// Whether err is a halted shard's refusal of the last request: reason
+    /// shard_halted, with unavailable (not run) or outcome_pending.
+    pub fn refusedHalted(self: *const Self, err: anyerror) bool {
+        if (err != FloError.Unavailable and err != FloError.OutcomePending) return false;
+        const last = self.lastError() orelse return false;
+        return last.reason == .shard_halted;
+    }
+
+    /// For a worker's own supervision calls (registration, group join,
+    /// polls), which wait out a halted shard where a caller's request would
+    /// get the refusal back: whether err is a halted shard's refusal, and if
+    /// so, a warning with the server's message and the next wait of
+    /// `backoff`, cut short once `running` turns false or `halt` true.
+    pub fn waitIfHalted(
+        self: *Self,
+        err: anyerror,
+        backoff: *retry.Backoff,
+        running: *const bool,
+        halt: ?*const bool,
+        comptime who: []const u8,
+        what: []const u8,
+    ) bool {
+        if (!self.refusedHalted(err)) return false;
+        const ms = backoff.next(self.prng.random());
+        std.log.warn(who ++ " {s} refused, shard halted: {s}; retrying in {d}ms", .{ what, self.lastError().?.message, ms });
+        types.pauseUnlessHalted(running, halt, ms);
+        return true;
     }
 
     /// Send a request once, under a new request id, and receive its response.
@@ -299,6 +328,11 @@ pub const Client = struct {
             self.disconnect();
             return FloError.InvalidChecksum;
         }
+        // A flag this SDK doesn't know may change what the answer means.
+        if (response_header.flags & ~wire.RESPONSE_STALE != 0) {
+            if (data.len > 0) self.allocator.free(data);
+            return FloError.IncompleteResponse;
+        }
 
         if (response_header.status != 0) {
             // A refusal's body: [reason:u16][ran:u8][message].
@@ -320,6 +354,7 @@ pub const Client = struct {
 
         return wire.RawResponse{
             .status = response_header.getStatus(),
+            .stale = response_header.flags & wire.RESPONSE_STALE != 0,
             .data = data,
             .allocator = self.allocator,
         };
@@ -884,4 +919,48 @@ test "an answer whose checksum doesn't match is refused" {
     try client.connect();
     try std.testing.expectError(FloError.InvalidChecksum, client.sendRequest(.kv_get, "default", "k", "", ""));
     try std.testing.expect(!client.isConnected());
+}
+
+test "a halted shard's refusals are never retried: outcome_pending, and unavailable with shard_halted" {
+    const Reply = @import("test_server.zig").Reply;
+    // [reason:u16][ran:u8][message]
+    const pending: Reply = .{ .status = 13, .body = "\x1d\x00\x02committed at index 9, applies when the shard resumes" };
+    const halted: Reply = .{ .status = 12, .body = "\x1d\x00\x00shard halted at index 8" };
+    const leaderless: Reply = .{ .status = 12, .body = "\x05\x00\x00no leader" };
+    for ([_]Reply{ pending, halted }) |refusal| {
+        var srv = try @import("test_server.zig").OkServer.listen();
+        srv.replies = &.{ refusal, refusal, refusal, refusal };
+        try srv.start();
+        defer srv.deinit();
+        var client = Client.init(std.testing.allocator, srv.endpoint, .{ .retry = fast_retry });
+        defer client.deinit();
+        try client.connect();
+        var resp = try client.sendRequest(.kv_put, "default", "k", "", "");
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
+        const last = client.lastError().?;
+        try std.testing.expectEqual(types.Reason.shard_halted, last.reason);
+        if (refusal.status == 13) {
+            try std.testing.expectEqual(FloError.OutcomePending, resp.status.toError());
+            try std.testing.expectEqual(types.Ran.unknown, last.ran);
+            try std.testing.expectEqualStrings("committed at index 9, applies when the shard resumes", last.message);
+        } else {
+            try std.testing.expectEqual(FloError.Unavailable, resp.status.toError());
+            try std.testing.expectEqual(types.Ran.no, last.ran);
+        }
+        try std.testing.expect(client.refusedHalted(resp.status.toError()));
+        try std.testing.expect(!client.refusedUnrun(resp.status.toError()));
+    }
+    // A leader change is still retried.
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.replies = &.{leaderless};
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{ .retry = fast_retry });
+    defer client.deinit();
+    try client.connect();
+    var resp = try client.sendRequest(.kv_put, "default", "k", "", "");
+    defer resp.deinit();
+    try std.testing.expectEqual(StatusCode.ok, resp.status);
+    try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.acquire));
 }

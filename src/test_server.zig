@@ -13,6 +13,8 @@ pub const Reply = struct {
     /// OkServer sends the body with its first byte flipped, under the
     /// checksum of the body as given.
     flip_body_byte: bool = false,
+    /// The answer header's flags byte.
+    flags: u8 = 0,
 };
 
 pub const OkServer = struct {
@@ -87,6 +89,7 @@ pub const OkServer = struct {
             resp[20] = types.VERSION;
             std.mem.writeInt(u64, resp[24..32], types.TABLE_HASH, .little);
             resp[21] = reply.status;
+            resp[22] = reply.flags;
             var resp_crc = std.hash.crc.Crc32Iscsi.init();
             resp_crc.update(resp[0..16]);
             resp_crc.update(resp[20..32]);
@@ -319,6 +322,7 @@ pub const ScriptServer = struct {
         std.mem.writeInt(u64, h[8..16], request_id, .little);
         h[20] = types.VERSION;
         h[21] = r.status;
+        h[22] = r.flags;
         std.mem.writeInt(u64, h[24..32], types.TABLE_HASH, .little);
         var crc = std.hash.crc.Crc32Iscsi.init();
         crc.update(h[0..16]);

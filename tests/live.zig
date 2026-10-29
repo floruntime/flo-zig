@@ -63,7 +63,7 @@ test "live: the server speaks this SDK's protocol and table" {
     const run = try std.process.Child.run(.{ .allocator = testing.allocator, .argv = &.{ binary, "version", "--verbose" }, .env_map = &env_map });
     defer testing.allocator.free(run.stdout);
     defer testing.allocator.free(run.stderr);
-    // "... (protocol 3, table 0x505fdaa07e866b96; ..."
+    // "... (protocol 3, table 0x05fe53f432e943c4; ..."
     const p = std.mem.indexOf(u8, run.stdout, "protocol ") orelse return error.NoProtocol;
     const t = std.mem.indexOf(u8, run.stdout, "table 0x") orelse return error.NoTable;
     const proto_end = std.mem.indexOfScalarPos(u8, run.stdout, p, ',') orelse return error.NoProtocol;
@@ -130,11 +130,10 @@ test "live: a key's history marks the version a delete wrote" {
     _ = try kv.put("k", "one", .{});
     try testing.expect(try kv.delete("k", .{}));
     _ = try kv.put("k", "two", .{});
-    const versions = try kv.history("k", .{});
-    defer {
-        for (versions) |*v| v.deinit(testing.allocator);
-        testing.allocator.free(versions);
-    }
+    var history = try kv.history("k", .{});
+    defer history.deinit();
+    const versions = history.versions;
+    try testing.expect(!history.more and !history.stale);
     try testing.expectEqual(@as(usize, 3), versions.len);
     try testing.expect(!versions[0].deleted);
     try testing.expectEqualStrings("two", versions[0].value);
@@ -191,9 +190,92 @@ test "live: the server refuses a registration of more than 1024 processes" {
     try testing.expectError(flo.FloError.BadRequest, actions.register("many-w", null, .{ .processes = &processes }));
     const last = live.client.lastError().?;
     try testing.expectEqual(@as(u8, 3), last.code);
-    try testing.expectEqual(flo.Reason.unclassified, last.reason);
+    try testing.expectEqual(flo.Reason.out_of_range, last.reason);
     try testing.expectEqual(flo.Ran.no, last.ran);
     try testing.expectEqualStrings("more than 1024 processes", last.message);
+}
+
+test "live: the server refuses a process name or machine id past its limit as too long" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var actions = flo.Actions.init(&live.client);
+    const long_name = [_]u8{'n'} ** 4097;
+    try testing.expectError(flo.FloError.BadRequest, actions.register("long-name-w", null, .{ .processes = &.{.{ .name = &long_name }} }));
+    var last = live.client.lastError().?;
+    try testing.expectEqual(@as(u8, 3), last.code);
+    try testing.expectEqual(flo.Reason.field_too_long, last.reason);
+    try testing.expectEqual(flo.Ran.no, last.ran);
+    try testing.expectEqualStrings("process name longer than 4096 bytes", last.message);
+
+    const long_host = [_]u8{'h'} ** 256;
+    try testing.expectError(flo.FloError.BadRequest, actions.register("long-host-w", &.{"job"}, .{ .machine_id = &long_host }));
+    last = live.client.lastError().?;
+    try testing.expectEqual(@as(u8, 3), last.code);
+    try testing.expectEqual(flo.Reason.field_too_long, last.reason);
+    try testing.expectEqual(flo.Ran.no, last.ran);
+    try testing.expectEqualStrings("machine id longer than 255 bytes", last.message);
+}
+
+test "live: kv.history pages a key's versions, newest first, each once" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var kv = flo.KV.init(&live.client);
+    var written: [5]u64 = undefined;
+    for (&written, 0..) |*v, i| {
+        var buf: [4]u8 = undefined;
+        v.* = (try kv.put("paged", std.fmt.bufPrint(&buf, "v{d}", .{i}) catch unreachable, .{})).version;
+    }
+
+    var seen: [5]u64 = undefined;
+    var n: usize = 0;
+    var pages: usize = 0;
+    var before: ?u64 = null;
+    while (true) {
+        var page = try kv.history("paged", .{ .limit = 2, .before_version = before });
+        defer page.deinit();
+        pages += 1;
+        // A page can come back empty; stop rather than ask from nothing.
+        if (page.versions.len == 0) break;
+        for (page.versions) |v| {
+            try testing.expect(n < seen.len);
+            seen[n] = v.version;
+            n += 1;
+        }
+        if (!page.more) break;
+        before = page.versions[page.versions.len - 1].version;
+    }
+    try testing.expectEqual(@as(usize, 3), pages);
+    try testing.expectEqual(@as(usize, 5), n);
+    for (seen, 0..) |v, i| try testing.expectEqual(written[written.len - 1 - i], v);
+
+    var past = try kv.history("paged", .{ .before_version = written[0] });
+    defer past.deinit();
+    try testing.expectEqual(@as(usize, 0), past.versions.len);
+    try testing.expect(!past.more);
+}
+
+test "live: worker.list with an action lists only the workers that run it" {
+    const ep = try endpoint();
+    var ns_buf: [32]u8 = undefined;
+    const namespace = freshNamespace(&ns_buf);
+    var client = flo.Client.init(testing.allocator, ep, .{ .namespace = namespace, .timeout_ms = 10_000 });
+    defer client.deinit();
+    try client.connect();
+    var actions = flo.Actions.init(&client);
+    try actions.register("fw-1", &.{"send"}, .{});
+    try actions.register("fw-2", &.{"bill"}, .{});
+    try actions.register("fw-3", &.{ "bill", "send" }, .{});
+
+    var send = try actions.listWorkers(.{ .action = "send" });
+    defer send.deinit();
+    try testing.expectEqual(@as(usize, 2), send.workers.len);
+    try testing.expectEqualStrings("fw-1", send.workers[0].id);
+    try testing.expectEqualStrings("fw-3", send.workers[1].id);
+    var all = try actions.listWorkers(.{});
+    defer all.deinit();
+    try testing.expectEqual(@as(usize, 3), all.workers.len);
 }
 
 /// The `{code, name}` list `field` names in ops.json, as it holds it.
