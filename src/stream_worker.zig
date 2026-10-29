@@ -485,6 +485,8 @@ pub const StreamWorker = struct {
             }
             // Removed for its silence: register again, so the registry knows
             // it. The registration marks it active, so a drain is told again.
+            // Only worker.register is sent again: the server keeps workers in
+            // memory, so it can't halt a shard or answer outcome_pending.
             std.log.warn("[flo-stream-worker] The server no longer knows this worker; registering again", .{});
             self.registerWorker() catch |rerr| {
                 std.log.warn("[flo-stream-worker] Failed to register again: {}", .{rerr});
