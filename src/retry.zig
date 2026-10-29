@@ -135,3 +135,20 @@ test "a huge backoff converts to nanoseconds without overflowing" {
     try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), nsFromMs(50));
     try std.testing.expectEqual(std.math.maxInt(u64), nsFromMs(std.math.maxInt(u64)));
 }
+
+test "haltedBackoff's ceilings double from 100 ms to exactly 30 s, and never pass it" {
+    var b = haltedBackoff();
+    var prng = std.Random.DefaultPrng.init(1);
+    var expected: u64 = 100;
+    var reached = false;
+    for (0..40) |_| {
+        const wait = b.next(prng.random());
+        // next() returns a wait in [0, ceiling] and doubles the ceiling after.
+        try std.testing.expect(wait <= expected);
+        expected = @min(expected * 2, 30_000);
+        try std.testing.expectEqual(expected, b.ceiling_ms);
+        reached = reached or b.ceiling_ms == 30_000;
+    }
+    try std.testing.expect(reached);
+    try std.testing.expectEqual(@as(u64, 30_000), halted_max_backoff_ms);
+}

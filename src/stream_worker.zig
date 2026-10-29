@@ -265,7 +265,9 @@ pub const StreamWorker = struct {
         if (!@atomicLoad(bool, &self.running, .monotonic)) return;
 
         // A halted shard holds the start until it's repaired, or a stop or
-        // drain ends the wait; any other failure only warns.
+        // drain ends the wait. A registration that committed but hasn't
+        // applied ends the start, so it isn't resent; any other failure only
+        // warns.
         var halted = retry_mod.haltedBackoff();
         while (true) {
             self.registerWorker() catch |err| {
@@ -273,6 +275,7 @@ pub const StreamWorker = struct {
                     if (types.goingOn(&self.running, &self.draining)) continue;
                     break;
                 }
+                if (err == FloError.OutcomePending) return err;
                 std.log.warn("[flo-stream-worker] Failed to register in worker registry: {}", .{err});
             };
             break;
@@ -1267,4 +1270,104 @@ test "StreamWorker waits out a halted shard at its join, registration and reads,
     try std.testing.expectEqual(@as(u32, 4), srv.countOf(.stream_group_join));
     try std.testing.expectEqual(@as(u32, 3), srv.countOf(.worker_register));
     try std.testing.expect(srv.countOf(.stream_group_read) >= 5);
+}
+
+const halted_start_test = struct {
+    var returned = std.atomic.Value(bool).init(false);
+    var result: anyerror!void = {};
+
+    fn run(w: *StreamWorker) void {
+        result = w.start();
+        returned.store(true, .release);
+    }
+
+    fn begin(w: *StreamWorker) !std.Thread {
+        returned.store(false, .release);
+        result = {};
+        return std.Thread.spawn(.{}, run, .{w});
+    }
+
+    /// Whether start returned within `ms`; stops the worker if not, so a
+    /// failing test ends instead of hanging.
+    fn returnedWithin(w: *StreamWorker, ms: u32) bool {
+        var waited: u32 = 0;
+        while (!returned.load(.acquire) and waited < ms) : (waited += 5) std.Thread.sleep(5 * std.time.ns_per_ms);
+        const ok = returned.load(.acquire);
+        if (!ok) w.stop();
+        return ok;
+    }
+
+    fn handle(_: *StreamContext) anyerror!void {}
+};
+
+/// unavailable, reason shard_halted, ran no.
+const halted_refusal: @import("test_server.zig").Reply = .{ .status = 12, .body = "\x1d\x00\x00shard 0 halted at index 8; an operator must repair it" };
+
+test "StreamWorker whose registration is outcome_pending returns it after one try" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 13, .body = "\x1d\x00\x02shard 0 halted at this entry; a repair skips it" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, halted_start_test.handle);
+    defer w.deinit();
+    const thread = try halted_start_test.begin(&w);
+    const prompt = halted_start_test.returnedWithin(&w, 1000);
+    thread.join();
+    try std.testing.expect(prompt);
+    try std.testing.expectError(FloError.OutcomePending, halted_start_test.result);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_read));
+    try std.testing.expectEqualStrings("shard 0 halted at this entry; a repair skips it", w.client.lastError().?.message);
+}
+
+test "StreamWorker stopped or drained while a halted shard holds its group join returns at once, sending nothing more" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    for ([_]bool{ false, true }) |drain| {
+        var srv = try ScriptServer.listen();
+        srv.rules = &.{.{ .op = .stream_group_join, .action = .{ .reply = halted_refusal } }};
+        try srv.start();
+        defer srv.deinit();
+
+        var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, halted_start_test.handle);
+        defer w.deinit();
+        // Seeded, so the wait the stop cuts short is a long one.
+        w.client.prng = std.Random.DefaultPrng.init(7);
+        const thread = try halted_start_test.begin(&w);
+        var waited: u32 = 0;
+        while (srv.countOf(.stream_group_join) < 5 and waited < 8000) : (waited += 5) std.Thread.sleep(5 * std.time.ns_per_ms);
+        if (drain) w.drain() else w.stop();
+        const prompt = halted_start_test.returnedWithin(&w, 100);
+        thread.join();
+        try std.testing.expect(prompt);
+        try halted_start_test.result;
+        try std.testing.expectEqual(@as(u32, 5), srv.countOf(.stream_group_join));
+        try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_read));
+    }
+}
+
+test "StreamWorker never resends an ack a halted shard refused" {
+    const record = "\x00" ** 8 ++ "\x00" ++ "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4;
+    const records = "\x01\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ record;
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    const pending: @import("test_server.zig").Reply = .{ .status = 13, .body = "\x1d\x00\x02committed; applies when the shard resumes" };
+    for ([_]@import("test_server.zig").Reply{ halted_refusal, pending }) |refusal| {
+        var srv = try ScriptServer.listen();
+        const rules = [_]ScriptServer.Rule{
+            .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = records } } },
+            .{ .op = .stream_group_ack, .action = .{ .reply = refusal } },
+        };
+        srv.rules = &rules;
+        try srv.start();
+        defer srv.deinit();
+
+        var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, halted_start_test.handle);
+        defer w.deinit();
+        w.running = true;
+        try w.pollAndProcess("events");
+        try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_ack));
+        try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_nack));
+        try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
+    }
 }

@@ -1580,6 +1580,7 @@ test "a halted shard's answers read as stale, a missing key on one is StaleNotFo
         .{ .status = 0, .body = hex("0000"), .flags = 1 }, // history
         .{ .status = 2, .body = not_found, .flags = 1 }, // history, stale not-found
         .{ .status = 0, .body = get_v, .flags = 2 }, // get, unknown flag
+        .{ .status = 0, .body = get_v, .flags = 0x81 }, // get, stale and an unknown high bit
     };
     try srv.start();
     defer srv.deinit();
@@ -1615,5 +1616,6 @@ test "a halted shard's answers read as stale, a missing key on one is StaleNotFo
     defer gone.deinit();
     try testing.expect(gone.stale and gone.versions.len == 0);
 
+    try testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
     try testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
 }

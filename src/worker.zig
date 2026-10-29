@@ -348,7 +348,8 @@ pub const ActionWorker = struct {
         }
         self.drain_retry_ns = 0;
         // A halted shard holds the start until it's repaired, or a stop or
-        // drain ends the wait.
+        // drain ends the wait. A registration that committed but hasn't
+        // applied (outcome_pending) is returned, not resent.
         var halted = retry_mod.haltedBackoff();
         while (true) {
             self.registerWorker() catch |err| {
@@ -1842,19 +1843,125 @@ test "ActionWorker waits out a halted shard at registration and in its polls, th
     try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_complete));
 }
 
-test "ActionWorker stopped while a halted shard holds its registration returns" {
+/// Runs start on a thread and keeps its error, for tests that bound how long
+/// it takes: one that doesn't return in time is stopped, so it can't hang.
+const start_test = struct {
+    var returned = std.atomic.Value(bool).init(false);
+    var result: anyerror!void = {};
+
+    fn run(w: *ActionWorker) void {
+        result = w.start();
+        returned.store(true, .release);
+    }
+
+    fn begin(w: *ActionWorker) !std.Thread {
+        returned.store(false, .release);
+        result = {};
+        return std.Thread.spawn(.{}, run, .{w});
+    }
+
+    fn returnedWithin(w: *ActionWorker, ms: u32) bool {
+        var waited: u32 = 0;
+        while (!returned.load(.acquire) and waited < ms) : (waited += 5) std.Thread.sleep(5 * std.time.ns_per_ms);
+        const ok = returned.load(.acquire);
+        if (!ok) w.stop();
+        return ok;
+    }
+};
+
+test "ActionWorker stopped or drained while a halted shard holds its registration returns at once, sending nothing more" {
+    for ([_]bool{ false, true }) |drain| {
+        var srv = try ScriptServer.listen();
+        srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = halted_refusal } }};
+        try srv.start();
+        defer srv.deinit();
+
+        var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+        defer w.deinit();
+        // Seeded, so the wait the stop cuts short is a long one.
+        w.client.prng = std.Random.DefaultPrng.init(7);
+        try w.registerAction("job", test_handlers.ok, .{});
+        const thread = try start_test.begin(&w);
+        var waited: u32 = 0;
+        while (srv.countOf(.worker_register) < 5 and waited < 8000) : (waited += 5) std.Thread.sleep(5 * std.time.ns_per_ms);
+        if (drain) w.drain() else w.stop();
+        const prompt = start_test.returnedWithin(&w, 100);
+        thread.join();
+        try std.testing.expect(prompt);
+        try start_test.result;
+        try std.testing.expectEqual(@as(u32, 5), srv.countOf(.worker_register));
+        try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_await));
+    }
+}
+
+test "ActionWorker registers every action it handles as a process, past 64" {
+    const value_of = @import("test_server.zig").valueOf;
     var srv = try ScriptServer.listen();
-    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = halted_refusal } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint });
+    defer w.deinit();
+    for (0..70) |i| {
+        var buf: [8]u8 = undefined;
+        try w.registerAction(try std.fmt.bufPrint(&buf, "job-{d:0>2}", .{i}), test_handlers.ok, .{});
+    }
+    try w.registerWorker();
+
+    // [type:u8][max_concurrency:u32][count:u16]([name_len:u16][name][kind:u8])*
+    const value = value_of(srv.requestOf(.worker_register, 0));
+    try std.testing.expectEqual(@as(u16, 70), std.mem.readInt(u16, value[5..7], .little));
+    var off: usize = 7;
+    for (0..70) |i| {
+        var buf: [8]u8 = undefined;
+        const len = std.mem.readInt(u16, value[off..][0..2], .little);
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "job-{d:0>2}", .{i}), value[off + 2 ..][0..len]);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(types.ProcessKind.action)), value[off + 2 + len]);
+        off += 2 + len + 1;
+    }
+}
+
+test "ActionWorker whose registration is outcome_pending returns it after one try, without waiting" {
+    var srv = try ScriptServer.listen();
+    // outcome_pending, reason shard_halted, ran unknown.
+    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 13, .body = "\x1d\x00\x02shard 0 halted at this entry; a repair skips it. Don't resend it unchanged" } } }};
     try srv.start();
     defer srv.deinit();
 
     var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
     defer w.deinit();
     try w.registerAction("job", test_handlers.ok, .{});
-    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
-    var waited: u32 = 0;
-    while (srv.countOf(.worker_register) < 2 and waited < 5000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
-    w.stop();
+    const thread = try start_test.begin(&w);
+    const prompt = start_test.returnedWithin(&w, 1000);
     thread.join();
+    try std.testing.expect(prompt);
+    try std.testing.expectError(FloError.OutcomePending, start_test.result);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
     try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_await));
+    const last = w.client.lastError().?;
+    try std.testing.expectEqual(types.Reason.shard_halted, last.reason);
+    try std.testing.expectEqual(types.Ran.unknown, last.ran);
+    try std.testing.expectEqualStrings("shard 0 halted at this entry; a repair skips it. Don't resend it unchanged", last.message);
+}
+
+test "ActionWorker never resends a complete or fail a halted shard refused" {
+    const pending: @import("test_server.zig").Reply = .{ .status = 13, .body = "\x1d\x00\x02committed; applies when the shard resumes" };
+    for ([_]@import("test_server.zig").Reply{ halted_refusal, pending }) |refusal| {
+        for ([_]types.OpCode{ .action_complete, .action_fail }) |op| {
+            var srv = try ScriptServer.listen();
+            const rules = [_]ScriptServer.Rule{.{ .op = op, .action = .{ .reply = refusal } }};
+            srv.rules = &rules;
+            try srv.start();
+            defer srv.deinit();
+
+            var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+            defer w.deinit();
+            w.running = true;
+            const task: TaskAssignment = .{ .task_id = "t1", .task_type = "job", .payload = "", .created_at = 0, .attempt = 1, .allocator = std.testing.allocator };
+            const rep: ActionWorker.Report = if (op == .action_complete) .{ .complete = .{ .data = "done" } } else .{ .fail = .{ .message = "boom" } };
+            try std.testing.expect(!w.report(&w.client, true, &task, rep));
+            try std.testing.expectEqual(@as(u32, 1), srv.countOf(op));
+            try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
+        }
+    }
 }

@@ -175,7 +175,7 @@ pub const ScriptServer = struct {
     pub const Request = struct {
         op: types.OpCode,
         len: usize,
-        bytes: [512]u8,
+        bytes: [1024]u8,
     };
 
     server: std.net.Server,
@@ -187,7 +187,7 @@ pub const ScriptServer = struct {
     closed: bool = false,
     connections: std.atomic.Value(u32) = .init(0),
     mutex: std.Thread.Mutex = .{},
-    log: [64]Request = undefined,
+    log: [96]Request = undefined,
     count: usize = 0,
     /// Serve each connection on a thread of its own, so a client may hold
     /// several at once; by default they're served one after another.

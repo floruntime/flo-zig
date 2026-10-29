@@ -561,7 +561,10 @@ The workers are different: their registration, group join and polls are theirs
 to retry. On `shard_halted` they wait, from 100 ms up to 30 s, logging a warning
 with the server's message each time, and carry on by themselves once the shard is
 repaired; a stop or drain ends the wait. A worker started during a halt comes up
-once it's over.
+once it's over. They wait only on a refusal that didn't run: a registration
+answered `outcome_pending` ends `start()` with `error.OutcomePending`, since
+resending it could halt the shard again, and a complete, fail or ack refused
+either way is not sent again.
 
 A halted shard still answers reads, from its state just before the entry it
 halted at. Such a read succeeds with `stale` set on its result (`GetResult`,
