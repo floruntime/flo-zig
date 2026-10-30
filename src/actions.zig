@@ -122,6 +122,18 @@ pub const Actions = struct {
         return parseActionRunStatus(self.client.allocator, run_id, response.data);
     }
 
+    /// A page of the namespace's registered action names. Pass the page's
+    /// cursor to get the next; it is null on the last page.
+    /// **Caller owns the returned page and must call `page.deinit()`.**
+    pub fn listActions(self: *Self, options: types.ActionListOptions) FloError!types.ActionListPage {
+        const value = try wire.encodeListValue(self.client.allocator, options.limit, options.cursor orelse "");
+        defer self.client.allocator.free(value);
+        var response = try self.client.sendRequest(.action_list, self.client.getNamespace(options.namespace), options.prefix, value, "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeActionListAnswer(self.client.allocator, response.data);
+    }
+
     /// A page of the namespace's workers, in id order: those after
     /// `options.cursor`, at most `options.limit`. Pass the page's cursor to
     /// get the next; it is null on the last page.
@@ -698,6 +710,36 @@ fn decodeWorkerRow(allocator: std.mem.Allocator, r: *Reader) FloError!types.Work
     };
 }
 
+/// action.list's answer: names (u32 count), each with a value the server
+/// leaves empty, then the list trailer.
+///   [count:u32]([name_len:u16][name][value_len:u32][value])*
+///   [has_more:u8][cursor_len:u16][cursor]
+fn decodeActionListAnswer(allocator: std.mem.Allocator, data: []const u8) FloError!types.ActionListPage {
+    var r: Reader = .{ .data = data };
+    const n = try r.int(u32);
+    // Each entry is at least its two lengths: a count the data can't hold is
+    // refused before it sizes an allocation.
+    if (n > r.remaining() / 6) return FloError.IncompleteResponse;
+    const names = try allocator.alloc([]const u8, n);
+    var got: usize = 0;
+    errdefer {
+        for (names[0..got]) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    while (got < n) : (got += 1) {
+        const name = try r.lenBytes(u16);
+        _ = try r.lenBytes(u32);
+        names[got] = try allocator.dupe(u8, name);
+    }
+    const trailer = try wire.parseListTrailer(data, r.pos);
+    return .{
+        .names = names,
+        .has_more = trailer.has_more,
+        .cursor = if (trailer.cursor) |c| try allocator.dupe(u8, c) else null,
+        .allocator = allocator,
+    };
+}
+
 /// A worker row's smallest encoding: an empty id, no machine id.
 const min_worker_row = 2 + 1 + 1 + 4 + 4 + 8 + 8 + 8 + 8 + 1;
 
@@ -976,6 +1018,77 @@ fn testWorkerRow(out: *std.ArrayList(u8), a: std.mem.Allocator, id: []const u8, 
         try out.appendSlice(a, &.{ 1, @intCast(m.len) });
         try out.appendSlice(a, m);
     } else try out.append(a, 0);
+}
+
+test "listActions sends its limit and cursor and returns the names, has_more and the next cursor" {
+    const a = std.testing.allocator;
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        // Two names, then has_more and a 3-byte cursor.
+        .{ .status = 0, .body = &.{ 2, 0, 0, 0, 1, 0, 'a', 0, 0, 0, 0, 2, 0, 'b', 'c', 0, 0, 0, 0, 1, 3, 0, 1, 0, 9 } },
+        // The last page: nothing more, no cursor.
+        .{ .status = 0, .body = &.{ 1, 0, 0, 0, 1, 0, 'd', 0, 0, 0, 0, 0, 0, 0 } },
+    };
+    try srv.start();
+    defer srv.deinit();
+    var client = @import("client.zig").Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var actions = Actions.init(&client);
+
+    // The first page: the limit, and no cursor.
+    var page = try actions.listActions(.{ .limit = 2 });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.action_list)), srv.last_op);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0 }, srv.lastValue());
+    try std.testing.expectEqual(@as(usize, 2), page.names.len);
+    try std.testing.expectEqualStrings("a", page.names[0]);
+    try std.testing.expectEqualStrings("bc", page.names[1]);
+    try std.testing.expect(page.has_more);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 9 }, page.cursor.?);
+
+    // The next: the cursor follows the limit (0, the server's default).
+    var last = try actions.listActions(.{ .cursor = page.cursor });
+    defer last.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 1, 0, 9 }, srv.lastValue());
+    try std.testing.expectEqualStrings("", srv.lastKey());
+    try std.testing.expectEqual(@as(usize, 1), last.names.len);
+    try std.testing.expectEqualStrings("d", last.names[0]);
+    try std.testing.expect(!last.has_more);
+    try std.testing.expect(last.cursor == null);
+}
+
+test "listActions sends its prefix as the key, and only the limit and cursor as the value" {
+    const a = std.testing.allocator;
+    var srv = try test_server.OkServer.listen();
+    srv.body = &.{ 0, 0, 0, 0, 0, 0, 0 };
+    try srv.start();
+    defer srv.deinit();
+    var client = @import("client.zig").Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var actions = Actions.init(&client);
+
+    var page = try actions.listActions(.{ .prefix = "send-", .limit = 5, .cursor = "c" });
+    defer page.deinit();
+    try std.testing.expectEqualStrings("send-", srv.lastKey());
+    try std.testing.expectEqualSlices(u8, &.{ 5, 0, 0, 0, 'c' }, srv.lastValue());
+    try std.testing.expectEqual(@as(usize, 0), page.names.len);
+}
+
+test "an action.list answer cut short or short of memory is refused and leaks nothing" {
+    const data = [_]u8{ 2, 0, 0, 0, 1, 0, 'a', 0, 0, 0, 0, 2, 0, 'b', 'c', 0, 0, 0, 0, 1, 3, 0, 1, 0, 9 };
+    for (0..data.len) |cut| {
+        try std.testing.expectError(FloError.IncompleteResponse, decodeActionListAnswer(std.testing.allocator, data[0..cut]));
+    }
+    // A count the data can't hold.
+    try std.testing.expectError(FloError.IncompleteResponse, decodeActionListAnswer(std.testing.allocator, &.{ 0xff, 0xff, 0, 0, 0, 0, 0 }));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: std.mem.Allocator, d: []const u8) !void {
+            var page = try decodeActionListAnswer(a, d);
+            page.deinit();
+        }
+    }.run, .{@as([]const u8, &data)});
 }
 
 test "listWorkers sends its limit and cursor and returns the rows and the next cursor" {

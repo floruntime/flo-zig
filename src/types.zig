@@ -74,6 +74,8 @@ pub const Reason = enum(u16) {
     /// didn't run; with outcome_pending it committed. Never retried by the
     /// client.
     shard_halted = 29,
+    /// The op is served only on the node's admin socket.
+    admin_only = 30,
 };
 
 /// Whether a refused request took effect: retry logic reads this, not the
@@ -211,17 +213,16 @@ pub const OpCode = enum(u16) {
     namespace_delete = 0x011,
     namespace_list = 0x012,
     namespace_info = 0x013,
-    namespace_config_set = 0x014,
-    namespace_config_get = 0x015,
+    /// Sent shard to shard, never by a client.
+    namespace_ensure = 0x016,
 
     // ── Cluster (0x030 – 0x04F) ──
     cluster_status = 0x030,
     cluster_members = 0x031,
-    cluster_join = 0x032,
-    cluster_leave = 0x033,
-    cluster_transfer_leader = 0x034,
-    cluster_add_node = 0x035,
-    cluster_remove_node = 0x036,
+    cluster_promote = 0x032,
+    cluster_remove = 0x033,
+    /// Served only on a node's admin socket.
+    cluster_repair_skip = 0x034,
 
     // ── KV + Transactions + Snapshots (0x100 – 0x12F) ──
     kv_put = 0x100,
@@ -350,6 +351,9 @@ pub const StatusCode = enum(u8) {
     /// before it. The message says whether it applies when the shard
     /// resumes. Never retried: resending would write it twice.
     outcome_pending = 13,
+    /// The namespace the request names doesn't exist; not_found is a
+    /// missing key.
+    no_namespace = 14,
 
     // The server may send codes this SDK predates; `_` keeps them a value
     // rather than illegal behaviour, and toError maps them to ServerError.
@@ -372,6 +376,7 @@ pub const StatusCode = enum(u8) {
             .rate_limited => "Request rate limit exceeded",
             .unavailable => "Unavailable: no leader or the shard isn't taking writes; retry",
             .outcome_pending => "Committed, not applied: its shard halted; don't resend it unchanged",
+            .no_namespace => "No such namespace",
             // No buffer to format the code into; Client.lastError has it.
             _ => "Unknown status",
         };
@@ -391,6 +396,7 @@ pub const StatusCode = enum(u8) {
             .internal_error => FloError.InternalError,
             .unavailable => FloError.Unavailable,
             .outcome_pending => FloError.OutcomePending,
+            .no_namespace => FloError.NoNamespace,
             else => FloError.ServerError,
         };
     }
@@ -472,6 +478,9 @@ pub const FloError = error{
     // Server errors
     ServerError,
     NotFound,
+    /// The namespace the request names doesn't exist (status no_namespace),
+    /// as against a missing key (NotFound).
+    NoNamespace,
     BadRequest,
     Conflict,
     Unauthorized,
@@ -1112,6 +1121,33 @@ pub const ActionStatusOptions = struct {
     namespace: ?[]const u8 = null,
 };
 
+pub const ActionListOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Only names starting with this; "" for all.
+    prefix: []const u8 = "",
+    /// The cursor the previous page returned; null for the first page.
+    cursor: ?[]const u8 = null,
+    /// Names per page; 0 is the server's default.
+    limit: u32 = 0,
+};
+
+/// A page of a namespace's registered action names.
+pub const ActionListPage = struct {
+    names: [][]const u8,
+    has_more: bool,
+    /// Pass as `ActionListOptions.cursor` for the next page; null on the
+    /// last page.
+    cursor: ?[]const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ActionListPage) void {
+        for (self.names) |n| self.allocator.free(n);
+        self.allocator.free(self.names);
+        if (self.cursor) |c| self.allocator.free(c);
+    }
+};
+
 /// Worker type
 pub const WorkerType = enum(u8) {
     /// Processes action tasks
@@ -1543,6 +1579,24 @@ test "workerBlockMs: 0 means the default, over MAX_BLOCK_MS is refused" {
     try std.testing.expectEqual(@as(u32, 1000), try workerBlockMs(1000));
     try std.testing.expectEqual(MAX_BLOCK_MS, try workerBlockMs(MAX_BLOCK_MS));
     try std.testing.expectError(FloError.BlockTooLong, workerBlockMs(MAX_BLOCK_MS + 1));
+}
+
+test "a missing namespace is its own error, not a missing key" {
+    try std.testing.expectEqual(FloError.NoNamespace, StatusCode.no_namespace.toError());
+    try std.testing.expectEqual(FloError.NotFound, StatusCode.not_found.toError());
+    try std.testing.expectEqual(StatusCode.no_namespace, @as(StatusCode, @enumFromInt(14)));
+    try std.testing.expectEqual(Reason.admin_only, @as(Reason, @enumFromInt(30)));
+}
+
+test "the op codes match the server's: namespace settings retired, ensure and repair skip known" {
+    try std.testing.expect(!@hasField(OpCode, "namespace_config_set"));
+    try std.testing.expect(!@hasField(OpCode, "namespace_config_get"));
+    try std.testing.expectEqual(@as(u16, 0x016), @intFromEnum(OpCode.namespace_ensure));
+    try std.testing.expectEqual(@as(u16, 0x032), @intFromEnum(OpCode.cluster_promote));
+    try std.testing.expectEqual(@as(u16, 0x033), @intFromEnum(OpCode.cluster_remove));
+    try std.testing.expectEqual(@as(u16, 0x034), @intFromEnum(OpCode.cluster_repair_skip));
+    // A retired code is no longer a name.
+    try std.testing.expect(std.enums.tagName(OpCode, @enumFromInt(0x014)) == null);
 }
 
 test "unavailable is retryable, internal_error is not, unknown codes are a server error" {
