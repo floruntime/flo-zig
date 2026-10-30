@@ -1426,6 +1426,33 @@ pub const WorkflowListDefinitionsOptions = struct {
     cursor: ?[]const u8 = null,
 };
 
+pub const WorkflowDefinitionEntry = struct {
+    name: []const u8,
+    version: []const u8,
+    created_at: i64,
+
+    pub fn deinit(self: *WorkflowDefinitionEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.version);
+    }
+};
+
+/// One page of workflow definitions. A page can hold fewer than `limit`
+/// entries while `has_more` is set: keep asking until it is clear.
+pub const WorkflowListDefinitionsResult = struct {
+    entries: []WorkflowDefinitionEntry,
+    has_more: bool,
+    /// Pass as `WorkflowListDefinitionsOptions.cursor` for the next page; null on the last page.
+    cursor: ?[]const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *WorkflowListDefinitionsResult) void {
+        for (self.entries) |*entry| entry.deinit(self.allocator);
+        self.allocator.free(self.entries);
+        if (self.cursor) |c| self.allocator.free(c);
+    }
+};
+
 pub const WorkflowDisableOptions = struct {
     namespace: ?[]const u8 = null,
 };
@@ -1502,7 +1529,8 @@ pub const ProcessingListEntry = struct {
     }
 };
 
-/// Result of a processing list operation.
+/// One page of processing jobs. A page can hold fewer than `limit` entries
+/// while `has_more` is set: keep asking until it is clear.
 pub const ProcessingListResult = struct {
     entries: []ProcessingListEntry,
     has_more: bool,
