@@ -245,6 +245,36 @@ pub const Stream = struct {
         };
     }
 
+    /// Delete a stream's records and metadata. Deleting a missing stream
+    /// succeeds. A stream that still holds records is refused with
+    /// `FloError.Conflict` unless `force` is set.
+    pub fn delete(
+        self: *Stream,
+        stream_name: []const u8,
+        options: types.StreamDeleteOptions,
+    ) FloError!void {
+        const ns = self.client.getNamespace(options.namespace);
+
+        var opts_buf: [2]u8 = undefined;
+        var builder = wire.OptionsBuilder.init(&opts_buf);
+        if (options.force) {
+            try builder.addFlag(.force);
+        }
+
+        var response = try self.client.sendRequest(
+            .stream_delete,
+            ns,
+            stream_name,
+            "",
+            builder.getOptions(),
+        );
+        defer response.deinit();
+
+        if (response.status != .ok) {
+            return response.status.toError();
+        }
+    }
+
     // =========================================================================
     // Consumer Group Operations
     // =========================================================================
@@ -747,4 +777,32 @@ test "an append refuses a header past what its u16 lengths hold" {
     const value = try Stream.encodeAppendValue(a, "p", &.{.{ .key = "k", .value = long[0..std.math.maxInt(u16)] }});
     defer a.free(value);
     try std.testing.expectEqual(@as(usize, 4 + 4 + 1 + 2 + 2 + 1 + 2 + std.math.maxInt(u16)), value.len);
+}
+
+test "delete sends the stream as the key, with the force flag only when asked; a non-empty stream is a conflict" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 0 },
+        .{ .status = 0 },
+        .{ .status = @intFromEnum(types.StatusCode.conflict), .body = "\x0c\x00\x00stream is not empty; pass --force to delete" },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    // Body after the key: [value_len:u32=0][options_len:u16][options].
+    try stream.delete("events", .{});
+    try std.testing.expectEqual(@as(u16, 0x140), srv.last_op);
+    try std.testing.expectEqualStrings("events", srv.lastKey());
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0 }, srv.lastBody());
+
+    try stream.delete("events", .{ .force = true });
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 2, 0, 0x2C, 0 }, srv.lastBody());
+
+    try std.testing.expectError(FloError.Conflict, stream.delete("events", .{}));
 }

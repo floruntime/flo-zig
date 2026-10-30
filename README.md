@@ -311,6 +311,9 @@ std.debug.print("Stream has {d} records\n", .{info.count});
 // Trim stream
 const trimmed = try stream.trim("events", .{ .max_len = 1000 });
 _ = trimmed.removed;
+
+// Delete a stream; a stream that still holds records needs force
+try stream.delete("events", .{ .force = true });
 ```
 
 ### Stream Consumer Groups

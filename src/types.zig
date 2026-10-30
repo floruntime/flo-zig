@@ -252,6 +252,7 @@ pub const OpCode = enum(u16) {
     stream_list = 0x13B,
     stream_create = 0x13D,
     stream_alter = 0x13F,
+    stream_delete = 0x140,
 
     // ── Stream Consumer Groups (0x150 – 0x16F) ──
     stream_group_create = 0x150,
@@ -420,6 +421,7 @@ pub const OptionTag = enum(u8) {
     partition_key = 0x25, // string: Key for partition routing
     max_age_seconds = 0x26, // u64: Maximum age in seconds for retention
     dry_run = 0x28, // void: Flag to preview what would be deleted without deleting
+    force = 0x2C, // void: Flag to delete a stream that still holds records
 
     // Consumer Group Options (0x30 - 0x3F)
     ack_timeout_ms = 0x30, // u32: Time before unacked message auto-redelivers
@@ -980,6 +982,14 @@ pub const StreamTrimResult = struct {
 pub const StreamInfoOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+};
+
+/// Options for stream delete operations
+pub const StreamDeleteOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Delete the stream even if it still holds records
+    force: bool = false,
 };
 
 /// Options for consumer group join

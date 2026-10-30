@@ -135,6 +135,7 @@ pub const Header = types.Header;
 pub const StreamReadOptions = types.StreamReadOptions;
 pub const StreamTrimOptions = types.StreamTrimOptions;
 pub const StreamInfoOptions = types.StreamInfoOptions;
+pub const StreamDeleteOptions = types.StreamDeleteOptions;
 pub const StreamGroupJoinOptions = types.StreamGroupJoinOptions;
 pub const StreamGroupReadOptions = types.StreamGroupReadOptions;
 pub const StreamGroupAckOptions = types.StreamGroupAckOptions;
