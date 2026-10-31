@@ -757,7 +757,7 @@ test "live: workflow listDefinitions pages every definition back exactly once" {
             \\name: {s}
             \\version: 1.0.0
             \\start:
-            \\  run: "@actions/validate"
+            \\  run: "@actions/zig-runs-unserved"
             \\  transitions:
             \\    success: flo.Completed
             \\    failure: flo.Failed
@@ -843,7 +843,7 @@ fn createWaitingWorkflow(workflow: *flo.Workflow, name: []const u8) !void {
         \\name: {s}
         \\version: 1.0.0
         \\start:
-        \\  run: "@actions/validate"
+        \\  run: "@actions/zig-runs-unserved"
         \\  transitions:
         \\    success: flo.Completed
         \\    failure: flo.Failed
