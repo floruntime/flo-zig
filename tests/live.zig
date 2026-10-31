@@ -947,7 +947,7 @@ test "live: workflow listRuns pages every run back exactly once, newest first" {
     };
 }
 
-test "live: a run started with a client-chosen id is found by that id, and the id is taken on every workflow" {
+test "live: a run started with a client-chosen id is found by that id, and a later start of the id on another workflow is refused" {
     var live: Live = .{ .client = undefined };
     try live.init();
     defer live.deinit();

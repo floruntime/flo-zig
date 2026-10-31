@@ -4,9 +4,13 @@
 
 - **Breaking:** pinned to the table hash of flo `3614d95` (`0xc751512225a42d04`);
   this SDK and older servers refuse each other.
-- **Breaking:** `FloError.NoNamespace` (status 14) is its own error, apart from
-  `NotFound`. Reads, lists and scans in a namespace never created return it;
-  a write still creates the namespace.
+- **Breaking:** reads, lists and scans in a namespace never created now
+  return `FloError.NoNamespace` (status 14), where they answered empty or
+  `NotFound`; a write still creates the namespace.
+- A run id chosen at start (`.run_id`) is found by status, history, signal
+  and cancel on any shard, and a later start of the same id on another
+  workflow is refused as `FloError.Conflict`. Two starts of one id sent at
+  once can both run; a lookup by the id then refuses it as `Conflict`.
 - **Breaking:** `Workflow.listRuns` returns a page (`runs`, `has_more`,
   `cursor`), newest first, instead of raw bytes, and takes a `cursor` and a
   `search`; `status_filter` is renamed `status`. A page can be short while
