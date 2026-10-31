@@ -63,7 +63,7 @@ test "live: the server speaks this SDK's protocol and table" {
     const run = try std.process.Child.run(.{ .allocator = testing.allocator, .argv = &.{ binary, "version", "--verbose" }, .env_map = &env_map });
     defer testing.allocator.free(run.stdout);
     defer testing.allocator.free(run.stderr);
-    // "... (protocol 3, table 0x05fe53f432e943c4; ..."
+    // "... (protocol 3, table 0xa8de7758afa69427; ..."
     const p = std.mem.indexOf(u8, run.stdout, "protocol ") orelse return error.NoProtocol;
     const t = std.mem.indexOf(u8, run.stdout, "table 0x") orelse return error.NoTable;
     const proto_end = std.mem.indexOfScalarPos(u8, run.stdout, p, ',') orelse return error.NoProtocol;
@@ -603,4 +603,224 @@ test "live: a worker the server removed registers again on its next heartbeat, a
         if (std.time.milliTimestamp() > run_deadline) return error.RunNeverCompleted;
         std.Thread.sleep(20 * std.time.ns_per_ms);
     }
+}
+
+/// Names collected across a list's pages, each with how often it came back.
+const Seen = struct {
+    counts: std.StringHashMap(u32),
+
+    fn init() Seen {
+        return .{ .counts = std.StringHashMap(u32).init(testing.allocator) };
+    }
+
+    fn deinit(self: *Seen) void {
+        var it = self.counts.keyIterator();
+        while (it.next()) |k| testing.allocator.free(k.*);
+        self.counts.deinit();
+    }
+
+    fn add(self: *Seen, name: []const u8) !void {
+        if (self.counts.getPtr(name)) |c| {
+            c.* += 1;
+            return;
+        }
+        try self.counts.put(try testing.allocator.dupe(u8, name), 1);
+    }
+
+    /// Exactly `prefix` 00..`n`-1, each once, and nothing else.
+    fn expectExactly(self: *const Seen, comptime prefix: []const u8, n: usize) !void {
+        var it = self.counts.iterator();
+        while (it.next()) |e| if (e.value_ptr.* != 1 or !std.mem.startsWith(u8, e.key_ptr.*, prefix)) {
+            std.debug.print("{s} came back {d} times\n", .{ e.key_ptr.*, e.value_ptr.* });
+            return error.WrongNames;
+        };
+        for (0..n) |i| {
+            var buf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&buf, prefix ++ "{d:0>2}", .{i}) catch unreachable;
+            if (!self.counts.contains(name)) {
+                std.debug.print("{s} never came back\n", .{name});
+                return error.WrongNames;
+            }
+        }
+        try testing.expectEqual(n, self.counts.count());
+    }
+};
+
+/// Holds the cursor a page returned past that page's deinit.
+const Cursor = struct {
+    buf: ?[]u8 = null,
+
+    fn set(self: *Cursor, next: []const u8) !void {
+        self.deinit();
+        self.buf = try testing.allocator.dupe(u8, next);
+    }
+
+    fn get(self: *const Cursor) ?[]const u8 {
+        return self.buf;
+    }
+
+    fn deinit(self: *Cursor) void {
+        if (self.buf) |b| testing.allocator.free(b);
+        self.buf = null;
+    }
+};
+
+const PAGE = 3;
+
+fn nameOf(buf: []u8, comptime prefix: []const u8, i: usize) []const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "{d:0>2}", .{i}) catch unreachable;
+}
+
+// On a server of many shards a page holds names from a few at a time, so a
+// page can be short with more to come: each pager below stops on the
+// cursor or has_more alone.
+test "live: kv.scan pages every key back exactly once" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var kv = flo.KV.init(&live.client);
+    const n = 40;
+    for (0..n) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try kv.put(nameOf(&buf, "scan-", i), "x", .{});
+    }
+
+    var seen = Seen.init();
+    defer seen.deinit();
+    var cursor: Cursor = .{};
+    defer cursor.deinit();
+    var pages: usize = 0;
+    while (true) {
+        pages += 1;
+        try testing.expect(pages <= 2 * n); // the cursor moves on
+        var page = try kv.scan("", .{ .limit = PAGE, .cursor = cursor.get() });
+        defer page.deinit();
+        try testing.expect(page.keys.len <= PAGE);
+        for (page.keys) |k| try seen.add(k);
+        try cursor.set(page.cursor orelse break);
+    }
+    try testing.expect(pages >= n / PAGE);
+    try seen.expectExactly("scan-", n);
+}
+
+test "live: listActions pages every action back exactly once" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var actions = flo.Actions.init(&live.client);
+    const n = 30;
+    for (0..n) |i| {
+        var buf: [16]u8 = undefined;
+        try actions.registerAction(nameOf(&buf, "act-", i), .user, .{});
+    }
+
+    var seen = Seen.init();
+    defer seen.deinit();
+    var cursor: Cursor = .{};
+    defer cursor.deinit();
+    var pages: usize = 0;
+    while (true) {
+        pages += 1;
+        try testing.expect(pages <= 2 * n);
+        var page = try actions.listActions(.{ .limit = PAGE, .cursor = cursor.get() });
+        defer page.deinit();
+        try testing.expect(page.names.len <= PAGE);
+        for (page.names) |name| try seen.add(name);
+        if (!page.has_more) break;
+        try cursor.set(page.cursor orelse return error.MoreWithoutCursor);
+    }
+    try testing.expect(pages >= n / PAGE);
+    try seen.expectExactly("act-", n);
+}
+
+test "live: workflow listDefinitions pages every definition back exactly once" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var workflow = flo.Workflow.init(&live.client);
+    const n = 30;
+    for (0..n) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = nameOf(&name_buf, "wf-", i);
+        var yaml_buf: [256]u8 = undefined;
+        const yaml = try std.fmt.bufPrint(&yaml_buf,
+            \\kind: Workflow
+            \\name: {s}
+            \\version: 1.0.0
+            \\start:
+            \\  run: "@actions/validate"
+            \\  transitions:
+            \\    success: flo.Completed
+            \\    failure: flo.Failed
+            \\
+        , .{name});
+        try workflow.create(name, yaml, .{});
+    }
+
+    var seen = Seen.init();
+    defer seen.deinit();
+    var cursor: Cursor = .{};
+    defer cursor.deinit();
+    var pages: usize = 0;
+    while (true) {
+        pages += 1;
+        try testing.expect(pages <= 2 * n);
+        var page = try workflow.listDefinitions(testing.allocator, .{ .limit = PAGE, .cursor = cursor.get() });
+        defer page.deinit();
+        try testing.expect(page.entries.len <= PAGE);
+        for (page.entries) |e| try seen.add(e.name);
+        if (!page.has_more) break;
+        try cursor.set(page.cursor orelse return error.MoreWithoutCursor);
+    }
+    try testing.expect(pages >= n / PAGE);
+    try seen.expectExactly("wf-", n);
+}
+
+test "live: processing list pages every job back exactly once" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var processing = flo.Processing.init(&live.client);
+    // A kv sink: outside the default namespace, a many-shard server refuses
+    // a stream or queue sink that isn't on the job's shard.
+    const n = 20;
+    for (0..n) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = nameOf(&name_buf, "job-", i);
+        var yaml_buf: [256]u8 = undefined;
+        const yaml = try std.fmt.bufPrint(&yaml_buf,
+            \\kind: Processing
+            \\name: {s}
+            \\sources:
+            \\  - stream:
+            \\      name: {s}-in
+            \\sinks:
+            \\  - kv:
+            \\      key_prefix: {s}-out
+            \\
+        , .{ name, name, name });
+        const job_id = processing.submit(testing.allocator, yaml, .{}) catch |err| {
+            if (live.client.lastError()) |last| std.debug.print("submit: {s}\n", .{last.message});
+            return err;
+        };
+        testing.allocator.free(job_id);
+    }
+
+    var seen = Seen.init();
+    defer seen.deinit();
+    var cursor: Cursor = .{};
+    defer cursor.deinit();
+    var pages: usize = 0;
+    while (true) {
+        pages += 1;
+        try testing.expect(pages <= 2 * n);
+        var page = try processing.list(testing.allocator, .{ .limit = PAGE, .cursor = cursor.get() });
+        defer page.deinit();
+        try testing.expect(page.entries.len <= PAGE);
+        for (page.entries) |e| try seen.add(e.name);
+        if (!page.has_more) break;
+        try cursor.set(page.cursor orelse return error.MoreWithoutCursor);
+    }
+    try testing.expect(pages >= n / PAGE);
+    try seen.expectExactly("job-", n);
 }
