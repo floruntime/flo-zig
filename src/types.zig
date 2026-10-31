@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0xa8de7758afa69427;
+pub const TABLE_HASH: u64 = 0xc751512225a42d04;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -353,9 +353,8 @@ pub const StatusCode = enum(u8) {
     /// resumes. Never retried: resending would write it twice.
     outcome_pending = 13,
     /// The namespace the request names doesn't exist; not_found is a
-    /// missing key. Reads in a missing namespace answer this from the
-    /// server version that adds it; until then they answer as an empty
-    /// namespace (a get not_found, a list or scan empty).
+    /// missing key. Reads, lists and scans in a namespace never created
+    /// answer this; a write creates the namespace.
     no_namespace = 14,
 
     // The server may send codes this SDK predates; `_` keeps them a value
@@ -483,9 +482,8 @@ pub const FloError = error{
     ServerError,
     NotFound,
     /// The namespace the request names doesn't exist (status no_namespace),
-    /// as against a missing key (NotFound). Reads return it from the server
-    /// version that adds it; before that a read in a missing namespace
-    /// answers as an empty one.
+    /// as against a missing key (NotFound). Reads, lists and scans in a
+    /// namespace never created return it; a write creates the namespace.
     NoNamespace,
     BadRequest,
     Conflict,
@@ -918,10 +916,10 @@ pub const StreamAppendResult = struct {
     id: StreamID,
 };
 
-/// Stream info/metadata
+/// Stream info/metadata. On an empty stream the ids are zero.
 pub const StreamInfo = struct {
-    first_seq: u64,
-    last_seq: u64,
+    first_id: StreamID,
+    last_id: StreamID,
     count: u64,
     bytes: u64,
     partition_count: u32 = 1,
@@ -1419,9 +1417,45 @@ pub const WorkflowHistoryOptions = struct {
 
 pub const WorkflowListRunsOptions = struct {
     namespace: ?[]const u8 = null,
+    /// One workflow's runs; null for every workflow's.
     workflow_name: ?[]const u8 = null,
-    status_filter: ?[]const u8 = null,
+    /// Only runs in this status ("running", "completed", ...); null for any.
+    status: ?[]const u8 = null,
+    /// Case-insensitive text a run must match; null for no search.
+    search: ?[]const u8 = null,
+    /// The previous page's cursor; null for the first page.
+    cursor: ?[]const u8 = null,
+    /// 0 asks for the server's default (100); it holds a page to 1024.
     limit: u32 = 100,
+};
+
+pub const WorkflowRunEntry = struct {
+    run_id: []const u8,
+    workflow: []const u8,
+    status: []const u8,
+    created_at: i64,
+
+    pub fn deinit(self: *WorkflowRunEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.run_id);
+        allocator.free(self.workflow);
+        allocator.free(self.status);
+    }
+};
+
+/// One page of workflow runs, newest first. A page can hold fewer than
+/// `limit` runs while `has_more` is set: keep asking until it is clear.
+pub const WorkflowListRunsResult = struct {
+    runs: []WorkflowRunEntry,
+    has_more: bool,
+    /// Pass as `WorkflowListRunsOptions.cursor` for the next page; null on the last page.
+    cursor: ?[]const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *WorkflowListRunsResult) void {
+        for (self.runs) |*entry| entry.deinit(self.allocator);
+        self.allocator.free(self.runs);
+        if (self.cursor) |c| self.allocator.free(c);
+    }
 };
 
 pub const WorkflowListDefinitionsOptions = struct {

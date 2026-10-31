@@ -150,7 +150,8 @@ pub const Stream = struct {
         return parseStreamReadResponse(self.client.allocator, response.data);
     }
 
-    /// Get stream information (metadata).
+    /// Get stream information (metadata). A stream that doesn't exist is
+    /// FloError.NotFound, never an empty stream.
     pub fn info(
         self: *Stream,
         stream_name: []const u8,
@@ -805,4 +806,21 @@ test "delete sends the stream as the key, with the force flag only when asked; a
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 2, 0, 0x2C, 0 }, srv.lastBody());
 
     try std.testing.expectError(FloError.Conflict, stream.delete("events", .{}));
+}
+
+test "info of a stream the server doesn't know is not found, not an empty stream" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{.{ .status = @intFromEnum(types.StatusCode.not_found), .body = "\x10\x00\x00stream not found" }};
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    try std.testing.expectError(FloError.NotFound, stream.info("nope", .{}));
+    try std.testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.stream_info)), srv.last_op);
+    try std.testing.expectEqualStrings("nope", srv.lastKey());
 }

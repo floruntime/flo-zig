@@ -397,37 +397,26 @@ pub const Workflow = struct {
         return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
     }
 
-    /// List workflow runs. Returns raw response bytes (caller owns).
+    /// List one page of workflow runs, newest first: one workflow's, or
+    /// every workflow's when `options.workflow_name` is null. Pass the
+    /// page's cursor to get the next; stop when `has_more` is clear, not on
+    /// a short page. Caller owns the result; call deinit() when done.
     pub fn listRuns(
         self: *Self,
         allocator: Allocator,
         options: types.WorkflowListRunsOptions,
-    ) FloError![]u8 {
+    ) FloError!types.WorkflowListRunsResult {
         const ns = self.client.getNamespace(options.namespace);
         const key = options.workflow_name orelse "";
 
-        // Value: [limit:u32][status_len:u16][status]?
-        var value_buf: [512]u8 = undefined;
-        var offset: usize = 0;
-
-        std.mem.writeInt(u32, value_buf[offset..][0..4], options.limit, .little);
-        offset += 4;
-
-        if (options.status_filter) |sf| {
-            std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(sf.len), .little);
-            offset += 2;
-            @memcpy(value_buf[offset..][0..sf.len], sf);
-            offset += sf.len;
-        } else {
-            std.mem.writeInt(u16, value_buf[offset..][0..2], 0, .little);
-            offset += 2;
-        }
+        const value = try encodeListRunsValue(self.client.allocator, options);
+        defer self.client.allocator.free(value);
 
         var response = try self.client.sendRequest(
             .workflow_list_runs,
             ns,
             key,
-            value_buf[0..offset],
+            value,
             "",
         );
         defer response.deinit();
@@ -436,7 +425,28 @@ pub const Workflow = struct {
             return response.status.toError();
         }
 
-        return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
+        return parseRunList(allocator, response.data) catch |err| answerError(err);
+    }
+
+    /// `[limit:u32][status_len:u16][status][cursor_len:u16][cursor][search_len:u16][search]`,
+    /// every field sent, an absent one as length 0.
+    fn encodeListRunsValue(allocator: Allocator, options: types.WorkflowListRunsOptions) FloError![]u8 {
+        const fields = [_][]const u8{ options.status orelse "", options.cursor orelse "", options.search orelse "" };
+        var len: usize = 4;
+        for (fields) |f| {
+            if (f.len > std.math.maxInt(u16)) return FloError.ValueTooLarge;
+            len += 2 + f.len;
+        }
+        const value = allocator.alloc(u8, len) catch return FloError.OutOfMemory;
+        std.mem.writeInt(u32, value[0..4], options.limit, .little);
+        var pos: usize = 4;
+        for (fields) |f| {
+            std.mem.writeInt(u16, value[pos..][0..2], @intCast(f.len), .little);
+            pos += 2;
+            @memcpy(value[pos..][0..f.len], f);
+            pos += f.len;
+        }
+        return value;
     }
 
     /// List one page of workflow definitions, from `options.cursor`. Pass the
@@ -669,6 +679,53 @@ fn parseDefinitionList(allocator: Allocator, data: []const u8) !types.WorkflowLi
     };
 }
 
+/// workflow.list_runs' answer:
+///   [count:u32]([run_id_len:u16][run_id][workflow_len:u16][workflow][status_len:u16][status][created_at:i64])*
+///   [has_more:u8][cursor_len:u16][cursor]
+fn parseRunList(allocator: Allocator, data: []const u8) !types.WorkflowListRunsResult {
+    if (data.len < 4) return error.UnexpectedEndOfData;
+    const count = std.mem.readInt(u32, data[0..4], .little);
+    var pos: usize = 4;
+    // Each entry is at least its three lengths and created_at: a count the
+    // data can't hold is refused before it sizes an allocation.
+    if (count > (data.len - pos) / (2 + 2 + 2 + 8)) return error.UnexpectedEndOfData;
+
+    const runs = try allocator.alloc(types.WorkflowRunEntry, count);
+    var i: u32 = 0;
+    errdefer {
+        for (runs[0..i]) |*r| r.deinit(allocator);
+        allocator.free(runs);
+    }
+
+    while (i < count) : (i += 1) {
+        const run_id = try lenBytes(data, &pos);
+        const workflow = try lenBytes(data, &pos);
+        const run_status = try lenBytes(data, &pos);
+        if (pos + 8 > data.len) return error.UnexpectedEndOfData;
+        const created_at = std.mem.readInt(i64, data[pos..][0..8], .little);
+        pos += 8;
+
+        const run_id_copy = try allocator.dupe(u8, run_id);
+        errdefer allocator.free(run_id_copy);
+        const workflow_copy = try allocator.dupe(u8, workflow);
+        errdefer allocator.free(workflow_copy);
+        runs[i] = .{
+            .run_id = run_id_copy,
+            .workflow = workflow_copy,
+            .status = try allocator.dupe(u8, run_status),
+            .created_at = created_at,
+        };
+    }
+
+    const trailer = try wire.parseListTrailer(data, pos);
+    return .{
+        .runs = runs,
+        .has_more = trailer.has_more,
+        .cursor = if (trailer.cursor) |c| try allocator.dupe(u8, c) else null,
+        .allocator = allocator,
+    };
+}
+
 /// A u16-length-prefixed field, borrowed from `data`.
 fn lenBytes(data: []const u8, pos: *usize) ![]const u8 {
     if (pos.* + 2 > data.len) return error.UnexpectedEndOfData;
@@ -773,6 +830,79 @@ test "listDefinitions pages on past a short page until has_more is clear, sendin
     try std.testing.expectEqualStrings("d", last.definitions[0].name);
     try std.testing.expectEqualStrings("2", last.definitions[0].version);
     try std.testing.expectEqual(@as(i64, 9), last.definitions[0].created_at);
+    try std.testing.expect(!last.has_more);
+    try std.testing.expect(last.cursor == null);
+}
+
+// Two runs: "r2" of "wf" running at 9, "r1" of "b" completed at -1;
+// has_more=1, cursor "\x09\x00\x00\x00\x00\x00\x00\x00r1".
+const runs_page = "\x02\x00\x00\x00" ++
+    "\x02\x00r2" ++ "\x02\x00wf" ++ "\x07\x00running" ++ "\x09\x00\x00\x00\x00\x00\x00\x00" ++
+    "\x02\x00r1" ++ "\x01\x00b" ++ "\x09\x00completed" ++ "\xff\xff\xff\xff\xff\xff\xff\xff" ++
+    "\x01" ++ "\x0a\x00" ++ "\x09\x00\x00\x00\x00\x00\x00\x00r1";
+
+test "a runs page decodes per the server's layout" {
+    var page = try parseRunList(std.testing.allocator, runs_page);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), page.runs.len);
+    try std.testing.expectEqualStrings("r2", page.runs[0].run_id);
+    try std.testing.expectEqualStrings("wf", page.runs[0].workflow);
+    try std.testing.expectEqualStrings("running", page.runs[0].status);
+    try std.testing.expectEqual(@as(i64, 9), page.runs[0].created_at);
+    try std.testing.expectEqualStrings("r1", page.runs[1].run_id);
+    try std.testing.expectEqualStrings("b", page.runs[1].workflow);
+    try std.testing.expectEqualStrings("completed", page.runs[1].status);
+    try std.testing.expectEqual(@as(i64, -1), page.runs[1].created_at);
+    try std.testing.expect(page.has_more);
+    try std.testing.expectEqualSlices(u8, "\x09\x00\x00\x00\x00\x00\x00\x00r1", page.cursor.?);
+}
+
+test "a runs page whose cursor contradicts has_more, or with bytes past it, is refused" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.UnexpectedResponse, parseRunList(a, "\x00\x00\x00\x00" ++ "\x00" ++ "\x01\x00c"));
+    try std.testing.expectError(error.UnexpectedResponse, parseRunList(a, "\x00\x00\x00\x00" ++ "\x01" ++ "\x00\x00"));
+    try std.testing.expectError(error.UnexpectedResponse, parseRunList(a, runs_page ++ "x"));
+}
+
+fn parseRunsAndFree(a: Allocator, data: []const u8) !void {
+    var page = try parseRunList(a, data);
+    page.deinit();
+}
+
+test "a runs answer cut anywhere, overcounted, or short of memory leaks nothing" {
+    const a = std.testing.allocator;
+    for (0..runs_page.len) |n| try std.testing.expect(std.meta.isError(parseRunsAndFree(a, runs_page[0..n])));
+    // A count far past what the data holds is refused before it allocates.
+    try std.testing.expectError(error.UnexpectedEndOfData, parseRunsAndFree(a, "\xff\xff\xff\xff" ++ runs_page[4..]));
+    try std.testing.checkAllAllocationFailures(a, parseRunsAndFree, .{@as([]const u8, runs_page)});
+}
+
+test "listRuns sends every field, empty ones as length 0, and pages on past a short page" {
+    const a = std.testing.allocator;
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 0, .body = runs_page },
+        .{ .status = 0, .body = "\x00\x00\x00\x00" ++ "\x00\x00\x00" },
+    };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var workflow = Workflow.init(&client);
+
+    var page = try workflow.listRuns(a, .{ .limit = 10 });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.workflow_list_runs)), srv.last_op);
+    try std.testing.expectEqualStrings("", srv.lastKey());
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, srv.lastValue());
+    try std.testing.expect(page.has_more);
+
+    var last = try workflow.listRuns(a, .{ .workflow_name = "wf", .status = "running", .search = "Ord", .cursor = page.cursor, .limit = 10 });
+    defer last.deinit();
+    try std.testing.expectEqualStrings("wf", srv.lastKey());
+    try std.testing.expectEqualSlices(u8, "\x0a\x00\x00\x00" ++ "\x07\x00running" ++ "\x0a\x00\x09\x00\x00\x00\x00\x00\x00\x00r1" ++ "\x03\x00Ord", srv.lastValue());
+    try std.testing.expectEqual(@as(usize, 0), last.runs.len);
     try std.testing.expect(!last.has_more);
     try std.testing.expect(last.cursor == null);
 }
