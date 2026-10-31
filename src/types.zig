@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0x05fe53f432e943c4;
+pub const TABLE_HASH: u64 = 0xa8de7758afa69427;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -74,6 +74,8 @@ pub const Reason = enum(u16) {
     /// didn't run; with outcome_pending it committed. Never retried by the
     /// client.
     shard_halted = 29,
+    /// The op is served only on the node's admin socket.
+    admin_only = 30,
 };
 
 /// Whether a refused request took effect: retry logic reads this, not the
@@ -211,17 +213,16 @@ pub const OpCode = enum(u16) {
     namespace_delete = 0x011,
     namespace_list = 0x012,
     namespace_info = 0x013,
-    namespace_config_set = 0x014,
-    namespace_config_get = 0x015,
+    /// Sent shard to shard, never by a client.
+    namespace_ensure = 0x016,
 
     // ── Cluster (0x030 – 0x04F) ──
     cluster_status = 0x030,
     cluster_members = 0x031,
-    cluster_join = 0x032,
-    cluster_leave = 0x033,
-    cluster_transfer_leader = 0x034,
-    cluster_add_node = 0x035,
-    cluster_remove_node = 0x036,
+    cluster_promote = 0x032,
+    cluster_remove = 0x033,
+    /// Served only on a node's admin socket.
+    cluster_repair_skip = 0x034,
 
     // ── KV + Transactions + Snapshots (0x100 – 0x12F) ──
     kv_put = 0x100,
@@ -251,6 +252,7 @@ pub const OpCode = enum(u16) {
     stream_list = 0x13B,
     stream_create = 0x13D,
     stream_alter = 0x13F,
+    stream_delete = 0x140,
 
     // ── Stream Consumer Groups (0x150 – 0x16F) ──
     stream_group_create = 0x150,
@@ -350,6 +352,11 @@ pub const StatusCode = enum(u8) {
     /// before it. The message says whether it applies when the shard
     /// resumes. Never retried: resending would write it twice.
     outcome_pending = 13,
+    /// The namespace the request names doesn't exist; not_found is a
+    /// missing key. Reads in a missing namespace answer this from the
+    /// server version that adds it; until then they answer as an empty
+    /// namespace (a get not_found, a list or scan empty).
+    no_namespace = 14,
 
     // The server may send codes this SDK predates; `_` keeps them a value
     // rather than illegal behaviour, and toError maps them to ServerError.
@@ -372,6 +379,7 @@ pub const StatusCode = enum(u8) {
             .rate_limited => "Request rate limit exceeded",
             .unavailable => "Unavailable: no leader or the shard isn't taking writes; retry",
             .outcome_pending => "Committed, not applied: its shard halted; don't resend it unchanged",
+            .no_namespace => "No such namespace",
             // No buffer to format the code into; Client.lastError has it.
             _ => "Unknown status",
         };
@@ -391,6 +399,7 @@ pub const StatusCode = enum(u8) {
             .internal_error => FloError.InternalError,
             .unavailable => FloError.Unavailable,
             .outcome_pending => FloError.OutcomePending,
+            .no_namespace => FloError.NoNamespace,
             else => FloError.ServerError,
         };
     }
@@ -414,6 +423,7 @@ pub const OptionTag = enum(u8) {
     partition_key = 0x25, // string: Key for partition routing
     max_age_seconds = 0x26, // u64: Maximum age in seconds for retention
     dry_run = 0x28, // void: Flag to preview what would be deleted without deleting
+    force = 0x2C, // void: Flag to delete a stream that still holds records
 
     // Consumer Group Options (0x30 - 0x3F)
     ack_timeout_ms = 0x30, // u32: Time before unacked message auto-redelivers
@@ -472,6 +482,11 @@ pub const FloError = error{
     // Server errors
     ServerError,
     NotFound,
+    /// The namespace the request names doesn't exist (status no_namespace),
+    /// as against a missing key (NotFound). Reads return it from the server
+    /// version that adds it; before that a read in a missing namespace
+    /// answers as an empty one.
+    NoNamespace,
     BadRequest,
     Conflict,
     Unauthorized,
@@ -973,6 +988,14 @@ pub const StreamInfoOptions = struct {
     namespace: ?[]const u8 = null,
 };
 
+/// Options for stream delete operations
+pub const StreamDeleteOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Delete the stream even if it still holds records
+    force: bool = false,
+};
+
 /// Options for consumer group join
 pub const StreamGroupJoinOptions = struct {
     /// Override client's default namespace
@@ -1110,6 +1133,33 @@ pub const ActionInvokeOptions = struct {
 pub const ActionStatusOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+};
+
+pub const ActionListOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Only names starting with this; "" for all.
+    prefix: []const u8 = "",
+    /// The cursor the previous page returned; null for the first page.
+    cursor: ?[]const u8 = null,
+    /// Names per page; 0 is the server's default.
+    limit: u32 = 0,
+};
+
+/// A page of a namespace's registered action names.
+pub const ActionListPage = struct {
+    names: [][]const u8,
+    has_more: bool,
+    /// Pass as `ActionListOptions.cursor` for the next page; null on the
+    /// last page.
+    cursor: ?[]const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ActionListPage) void {
+        for (self.names) |n| self.allocator.free(n);
+        self.allocator.free(self.names);
+        if (self.cursor) |c| self.allocator.free(c);
+    }
 };
 
 /// Worker type
@@ -1380,6 +1430,33 @@ pub const WorkflowListDefinitionsOptions = struct {
     cursor: ?[]const u8 = null,
 };
 
+pub const WorkflowDefinitionEntry = struct {
+    name: []const u8,
+    version: []const u8,
+    created_at: i64,
+
+    pub fn deinit(self: *WorkflowDefinitionEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.version);
+    }
+};
+
+/// One page of workflow definitions. A page can hold fewer than `limit`
+/// definitions while `has_more` is set: keep asking until it is clear.
+pub const WorkflowListDefinitionsResult = struct {
+    definitions: []WorkflowDefinitionEntry,
+    has_more: bool,
+    /// Pass as `WorkflowListDefinitionsOptions.cursor` for the next page; null on the last page.
+    cursor: ?[]const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *WorkflowListDefinitionsResult) void {
+        for (self.definitions) |*entry| entry.deinit(self.allocator);
+        self.allocator.free(self.definitions);
+        if (self.cursor) |c| self.allocator.free(c);
+    }
+};
+
 pub const WorkflowDisableOptions = struct {
     namespace: ?[]const u8 = null,
 };
@@ -1456,19 +1533,20 @@ pub const ProcessingListEntry = struct {
     }
 };
 
-/// Result of a processing list operation.
+/// One page of processing jobs. A page can hold fewer than `limit` jobs
+/// while `has_more` is set: keep asking until it is clear.
 pub const ProcessingListResult = struct {
-    entries: []ProcessingListEntry,
+    jobs: []ProcessingListEntry,
     has_more: bool,
     /// Pass as `ProcessingListOptions.cursor` for the next page; null on the last page.
     cursor: ?[]const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ProcessingListResult) void {
-        for (self.entries) |*entry| {
+        for (self.jobs) |*entry| {
             entry.deinit(self.allocator);
         }
-        self.allocator.free(self.entries);
+        self.allocator.free(self.jobs);
         if (self.cursor) |c| self.allocator.free(c);
     }
 };
@@ -1543,6 +1621,24 @@ test "workerBlockMs: 0 means the default, over MAX_BLOCK_MS is refused" {
     try std.testing.expectEqual(@as(u32, 1000), try workerBlockMs(1000));
     try std.testing.expectEqual(MAX_BLOCK_MS, try workerBlockMs(MAX_BLOCK_MS));
     try std.testing.expectError(FloError.BlockTooLong, workerBlockMs(MAX_BLOCK_MS + 1));
+}
+
+test "a missing namespace is its own error, not a missing key" {
+    try std.testing.expectEqual(FloError.NoNamespace, StatusCode.no_namespace.toError());
+    try std.testing.expectEqual(FloError.NotFound, StatusCode.not_found.toError());
+    try std.testing.expectEqual(StatusCode.no_namespace, @as(StatusCode, @enumFromInt(14)));
+    try std.testing.expectEqual(Reason.admin_only, @as(Reason, @enumFromInt(30)));
+}
+
+test "the op codes match the server's: namespace settings retired, ensure and repair skip known" {
+    try std.testing.expect(!@hasField(OpCode, "namespace_config_set"));
+    try std.testing.expect(!@hasField(OpCode, "namespace_config_get"));
+    try std.testing.expectEqual(@as(u16, 0x016), @intFromEnum(OpCode.namespace_ensure));
+    try std.testing.expectEqual(@as(u16, 0x032), @intFromEnum(OpCode.cluster_promote));
+    try std.testing.expectEqual(@as(u16, 0x033), @intFromEnum(OpCode.cluster_remove));
+    try std.testing.expectEqual(@as(u16, 0x034), @intFromEnum(OpCode.cluster_repair_skip));
+    // A retired code is no longer a name.
+    try std.testing.expect(std.enums.tagName(OpCode, @enumFromInt(0x014)) == null);
 }
 
 test "unavailable is retryable, internal_error is not, unknown codes are a server error" {

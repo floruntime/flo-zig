@@ -311,6 +311,9 @@ std.debug.print("Stream has {d} records\n", .{info.count});
 // Trim stream
 const trimmed = try stream.trim("events", .{ .max_len = 1000 });
 _ = trimmed.removed;
+
+// Delete a stream; a stream that still holds records needs force
+try stream.delete("events", .{ .force = true });
 ```
 
 ### Stream Consumer Groups
@@ -474,6 +477,19 @@ try workflow.signal(run_id, "approval", "{\"approved\": true}", .{});
 // Cancel a running workflow
 try workflow.cancel(run_id, "no longer needed", .{});
 
+// List workflow definitions, a page at a time. A page can be short while
+// more remain: stop on has_more, not on the page's size.
+var defs_cursor: ?[]u8 = null;
+defer if (defs_cursor) |c| allocator.free(c);
+while (true) {
+    var defs = try workflow.listDefinitions(allocator, .{ .limit = 50, .cursor = defs_cursor });
+    defer defs.deinit();
+    for (defs.definitions) |def| std.debug.print("{s} v{s}\n", .{ def.name, def.version });
+    if (!defs.has_more) break;
+    if (defs_cursor) |c| allocator.free(c);
+    defs_cursor = try allocator.dupe(u8, defs.cursor.?);
+}
+
 // Disable/enable workflow definitions
 try workflow.disable("my-workflow", .{});
 try workflow.enable("my-workflow", .{});
@@ -501,11 +517,17 @@ std.debug.print("Job {s}: {s} (processed {d} records)\n", .{
 });
 if (status.failure_reason) |reason| std.debug.print("failed: {s}\n", .{reason});
 
-// List all processing jobs
-var jobs = try processing.list(allocator, .{ .limit = 50 });
-defer jobs.deinit();
-for (jobs.entries) |entry| {
-    std.debug.print("{s}: {s}\n", .{ entry.name, entry.status });
+// List all processing jobs, a page at a time. A page can be short while
+// more remain: stop on has_more, not on the page's size.
+var jobs_cursor: ?[]u8 = null;
+defer if (jobs_cursor) |c| allocator.free(c);
+while (true) {
+    var jobs = try processing.list(allocator, .{ .limit = 50, .cursor = jobs_cursor });
+    defer jobs.deinit();
+    for (jobs.jobs) |entry| std.debug.print("{s}: {s}\n", .{ entry.name, entry.status });
+    if (!jobs.has_more) break;
+    if (jobs_cursor) |c| allocator.free(c);
+    jobs_cursor = try allocator.dupe(u8, jobs.cursor.?);
 }
 
 // Gracefully stop a job

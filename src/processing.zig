@@ -100,7 +100,9 @@ pub const Processing = struct {
         return parseProcessingStatus(allocator, response.data) catch |err| answerError(err);
     }
 
-    /// List processing jobs.
+    /// List one page of processing jobs, from `options.cursor`. Pass the
+    /// page's cursor to get the next; stop when `has_more` is clear, not on a
+    /// short page.
     /// Caller owns the result; call deinit() when done.
     pub fn list(
         self: *Self,
@@ -284,6 +286,9 @@ fn parseProcessingList(allocator: Allocator, data: []const u8) !types.Processing
     var pos: usize = 0;
     const count = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
+    // Each entry is at least its three lengths and created_at: a count the
+    // data can't hold is refused before it sizes an allocation.
+    if (count > (data.len - pos) / (2 + 2 + 2 + 8)) return error.UnexpectedEndOfData;
 
     var entries = try allocator.alloc(types.ProcessingListEntry, count);
     var i: u32 = 0;
@@ -339,7 +344,7 @@ fn parseProcessingList(allocator: Allocator, data: []const u8) !types.Processing
     const cursor = if (trailer.cursor) |c| try allocator.dupe(u8, c) else null;
 
     return .{
-        .entries = entries,
+        .jobs = entries,
         .has_more = trailer.has_more,
         .cursor = cursor,
         .allocator = allocator,
@@ -403,9 +408,42 @@ test "list sends [limit][cursor] in the value and returns the next cursor" {
     defer result.deinit();
 
     try std.testing.expectEqualSlices(u8, &[_]u8{ 5, 0, 0, 0, 'c', '1' }, srv.lastValue());
-    try std.testing.expectEqual(@as(usize, 0), result.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), result.jobs.len);
     try std.testing.expect(result.has_more);
     try std.testing.expectEqualStrings("c2", result.cursor.?);
+}
+
+test "list pages on past a short page until has_more is clear, sending each page's cursor" {
+    const a = std.testing.allocator;
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.replies = &.{
+        // One job, fewer than the limit, yet has_more=1 and the cursor "c9".
+        .{ .status = 0, .body = &([_]u8{ 1, 0, 0, 0, 1, 0, 'p', 2, 0, 'j', '1', 7, 0 } ++ "running".* ++
+            [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 1, 2, 0, 'c', '9' }) },
+        // The last page: no jobs, nothing more.
+        .{ .status = 0, .body = &.{ 0, 0, 0, 0, 0, 0, 0 } },
+    };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var processing = Processing.init(&client);
+
+    var page = try processing.list(a, .{ .limit = 5 });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.processing_list)), srv.last_op);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 0, 0, 0 }, srv.lastValue());
+    try std.testing.expectEqual(@as(usize, 1), page.jobs.len);
+    try std.testing.expect(page.has_more);
+    try std.testing.expectEqualStrings("c9", page.cursor.?);
+
+    var last = try processing.list(a, .{ .limit = 5, .cursor = page.cursor });
+    defer last.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 5, 0, 0, 0, 'c', '9' }, srv.lastValue());
+    try std.testing.expectEqual(@as(usize, 0), last.jobs.len);
+    try std.testing.expect(!last.has_more);
+    try std.testing.expect(last.cursor == null);
 }
 
 test "status and list answers decode per the server's layouts" {
@@ -428,12 +466,19 @@ test "status and list answers decode per the server's layouts" {
         [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 0 };
     var list = try parseProcessingList(a, &list_body);
     defer list.deinit();
-    try std.testing.expectEqual(@as(usize, 1), list.entries.len);
-    try std.testing.expectEqualStrings("p", list.entries[0].name);
-    try std.testing.expectEqualStrings("j1", list.entries[0].job_id);
-    try std.testing.expectEqualStrings("running", list.entries[0].status);
-    try std.testing.expectEqual(@as(i64, 7), list.entries[0].created_at);
+    try std.testing.expectEqual(@as(usize, 1), list.jobs.len);
+    try std.testing.expectEqualStrings("p", list.jobs[0].name);
+    try std.testing.expectEqualStrings("j1", list.jobs[0].job_id);
+    try std.testing.expectEqualStrings("running", list.jobs[0].status);
+    try std.testing.expectEqual(@as(i64, 7), list.jobs[0].created_at);
     try std.testing.expect(!list.has_more);
+}
+
+test "a jobs page whose cursor contradicts has_more is refused" {
+    const a = std.testing.allocator;
+    // No jobs; has_more=0 with a cursor, then has_more=1 without one.
+    try std.testing.expectError(error.UnexpectedResponse, parseProcessingList(a, &.{ 0, 0, 0, 0, 0, 1, 0, 'c' }));
+    try std.testing.expectError(error.UnexpectedResponse, parseProcessingList(a, &.{ 0, 0, 0, 0, 1, 0, 0 }));
 }
 
 // job_id "j1", name "p", status 3 (failed), batch_size 50, records 1234, created_at 99, reason "boom"

@@ -409,8 +409,9 @@ pub const Transaction = struct {
 
 /// The longest routing key; its length prefix is a u16.
 const MAX_ROUTING_KEY = 4096;
-/// The longest scan cursor; its length prefix is a u8.
-const MAX_CURSOR = 64;
+/// The longest scan cursor: the shard it stopped on (u16), then the last
+/// key; its length prefix is a u16.
+const MAX_CURSOR = 2 + MAX_ROUTING_KEY;
 
 /// Send a table op; a refusal surfaces as its error.
 fn call(client: *Client, op: types.OpCode, namespace: []const u8, key: []const u8, body: []const u8) FloError!wire.RawResponse {
@@ -512,7 +513,7 @@ fn encodeDeleteBody(buf: *[MAX_DELETE_BODY]u8, cas_version: ?u64, routing_key: ?
     return w.written();
 }
 
-const MAX_SCAN_BODY = 5 + 1 + MAX_CURSOR;
+const MAX_SCAN_BODY = 5 + 2 + MAX_CURSOR;
 
 /// kv.scan's request: limit, cursor ("" for the first page).
 fn encodeScanBody(buf: *[MAX_SCAN_BODY]u8, limit: u32, cursor: []const u8) FloError![]const u8 {
@@ -521,7 +522,7 @@ fn encodeScanBody(buf: *[MAX_SCAN_BODY]u8, limit: u32, cursor: []const u8) FloEr
     var w: BodyWriter = .{ .buf = buf };
     w.put(&.{1});
     w.int(u32, limit);
-    w.lenBytes(u8, cursor);
+    w.lenBytes(u16, cursor);
     return w.written();
 }
 
@@ -815,7 +816,7 @@ fn decodeScanAnswer(allocator: Allocator, data: []const u8) FloError!types.ScanR
         allocator.free(keys);
     }
     while (got < n) : (got += 1) keys[got] = try allocator.dupe(u8, try r.lenBytes(u16));
-    const cursor: ?[]const u8 = if (try r.boolean()) try r.lenBytes(u8) else null;
+    const cursor: ?[]const u8 = if (try r.boolean()) try r.lenBytes(u16) else null;
     try r.end();
     return .{
         .keys = keys,
@@ -981,7 +982,7 @@ test "the other KV ops' requests match the server's schemas byte for byte" {
     var del: [MAX_DELETE_BODY]u8 = undefined;
     try expectHex("010700000000000000010200726b00", try encodeDeleteBody(&del, 7, "rk", null));
     var scan: [MAX_SCAN_BODY]u8 = undefined;
-    try expectHex("0102000000026331", try encodeScanBody(&scan, 2, "c1"));
+    try expectHex("010200000002006331", try encodeScanBody(&scan, 2, "c1"));
     var hist: [MAX_HISTORY_BODY]u8 = undefined;
     try expectHex("01020000000000", try encodeHistoryBody(&hist, 2, null, null));
     try expectHex("010200000000010200726b", try encodeHistoryBody(&hist, 2, null, "rk"));
@@ -1012,7 +1013,7 @@ test "the other KV ops' answers decode as the server's schemas write them" {
     try testing.expectEqual(@as(?bool, true), try decodeDeleteAnswer(hex("0101")));
     try testing.expectEqual(@as(?bool, null), try decodeDeleteAnswer(hex("00")));
 
-    var page = try decodeScanAnswer(a, hex("02000100610200626201026332"));
+    var page = try decodeScanAnswer(a, hex("0200010061020062620102006332"));
     defer page.deinit();
     try testing.expectEqual(@as(usize, 2), page.keys.len);
     try testing.expectEqualStrings("a", page.keys[0]);
@@ -1143,7 +1144,7 @@ test "kv.history marks a delete's version" {
 test "answers decode whole or not at all" {
     const answers = [_][]const u8{
         hex("0101"),
-        hex("02000100610200626201026332"),
+        hex("0200010061020062620102006332"),
         hex("010300000000000000e8030000000000000002000000763300"),
         hex("0200010200000000000000010000007800000000000000000000000000010200"),
         hex("010400000000000000012a00000000000000"),
@@ -1375,7 +1376,7 @@ test "requests out of bounds are refused before a round trip" {
 test "scan sends its limit and cursor and returns names and the next cursor" {
     var srv = try test_server.OkServer.listen();
     srv.replies = &.{
-        .{ .status = 0, .body = hex("02000100610200626201026332") },
+        .{ .status = 0, .body = hex("0200010061020062620102006332") },
         .{ .status = 0, .body = hex("000000") },
     };
     try srv.start();
@@ -1389,7 +1390,7 @@ test "scan sends its limit and cursor and returns names and the next cursor" {
     var result = try kv.scan("p", .{ .limit = 7, .cursor = "abc" });
     defer result.deinit();
     try testing.expectEqualStrings("p", srv.lastKey());
-    try expectHex("010700000003616263", srv.lastBody());
+    try expectHex("01070000000300616263", srv.lastBody());
     try testing.expectEqual(@as(usize, 2), result.keys.len);
     try testing.expectEqualStrings("bb", result.keys[1]);
     try testing.expectEqualStrings("c2", result.cursor.?);
@@ -1397,8 +1398,33 @@ test "scan sends its limit and cursor and returns names and the next cursor" {
     // First page: an empty cursor, and the default limit, the server's.
     var first = try kv.scan("p", .{});
     defer first.deinit();
-    try expectHex("010004000000", srv.lastBody());
+    try expectHex("01000400000000", srv.lastBody());
     try testing.expect(first.cursor == null);
+}
+
+test "a scan cursor as long as a key goes out and comes back whole" {
+    // [shard u16][last key], the key as long as the server takes one.
+    const cursor = "\x01\x00" ++ "k" ** MAX_ROUTING_KEY;
+    var answer: [2 + 1 + 2 + cursor.len]u8 = undefined;
+    @memcpy(answer[0..5], &[_]u8{ 0, 0, 1, cursor.len & 0xff, cursor.len >> 8 });
+    @memcpy(answer[5..], cursor);
+
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{.{ .status = 0, .body = &answer }};
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var kv = KV.init(&client);
+
+    var page = try kv.scan("", .{ .limit = 1, .cursor = cursor });
+    defer page.deinit();
+    const body = srv.lastBody();
+    try testing.expectEqual(@as(u16, cursor.len), std.mem.readInt(u16, body[5..7], .little));
+    try testing.expectEqualStrings(cursor, body[7..]);
+    try testing.expectEqualStrings(cursor, page.cursor.?);
 }
 
 test "incr, expire, exists and the JSON ops answer through their schemas" {

@@ -439,12 +439,15 @@ pub const Workflow = struct {
         return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
     }
 
-    /// List workflow definitions. Returns raw response bytes (caller owns).
+    /// List one page of workflow definitions, from `options.cursor`. Pass the
+    /// page's cursor to get the next; stop when `has_more` is clear, not on a
+    /// short page.
+    /// Caller owns the result; call deinit() when done.
     pub fn listDefinitions(
         self: *Self,
         allocator: Allocator,
         options: types.WorkflowListDefinitionsOptions,
-    ) FloError![]u8 {
+    ) FloError!types.WorkflowListDefinitionsResult {
         const ns = self.client.getNamespace(options.namespace);
 
         const value = try wire.encodeListValue(self.client.allocator, options.limit, options.cursor orelse "");
@@ -463,7 +466,7 @@ pub const Workflow = struct {
             return response.status.toError();
         }
 
-        return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
+        return parseDefinitionList(allocator, response.data) catch |err| answerError(err);
     }
 
     /// Disable a workflow definition (prevents new runs).
@@ -623,6 +626,59 @@ fn extractYamlField(data: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
+/// workflow.list_definitions' answer:
+///   [count:u32]([name_len:u16][name][version_len:u16][version][created_at:i64])*
+///   [has_more:u8][cursor_len:u16][cursor]
+fn parseDefinitionList(allocator: Allocator, data: []const u8) !types.WorkflowListDefinitionsResult {
+    if (data.len < 4) return error.UnexpectedEndOfData;
+    const count = std.mem.readInt(u32, data[0..4], .little);
+    var pos: usize = 4;
+    // Each entry is at least its two lengths and created_at: a count the data
+    // can't hold is refused before it sizes an allocation.
+    if (count > (data.len - pos) / (2 + 2 + 8)) return error.UnexpectedEndOfData;
+
+    const entries = try allocator.alloc(types.WorkflowDefinitionEntry, count);
+    var i: u32 = 0;
+    errdefer {
+        for (entries[0..i]) |*e| e.deinit(allocator);
+        allocator.free(entries);
+    }
+
+    while (i < count) : (i += 1) {
+        const name = try lenBytes(data, &pos);
+        const version = try lenBytes(data, &pos);
+        if (pos + 8 > data.len) return error.UnexpectedEndOfData;
+        const created_at = std.mem.readInt(i64, data[pos..][0..8], .little);
+        pos += 8;
+
+        const name_copy = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_copy);
+        entries[i] = .{
+            .name = name_copy,
+            .version = try allocator.dupe(u8, version),
+            .created_at = created_at,
+        };
+    }
+
+    const trailer = try wire.parseListTrailer(data, pos);
+    return .{
+        .definitions = entries,
+        .has_more = trailer.has_more,
+        .cursor = if (trailer.cursor) |c| try allocator.dupe(u8, c) else null,
+        .allocator = allocator,
+    };
+}
+
+/// A u16-length-prefixed field, borrowed from `data`.
+fn lenBytes(data: []const u8, pos: *usize) ![]const u8 {
+    if (pos.* + 2 > data.len) return error.UnexpectedEndOfData;
+    const len = std.mem.readInt(u16, data[pos.*..][0..2], .little);
+    pos.* += 2;
+    if (pos.* + len > data.len) return error.UnexpectedEndOfData;
+    defer pos.* += len;
+    return data[pos.*..][0..len];
+}
+
 /// A parse failure: out of memory stays itself, anything else is an answer
 /// this client can't read.
 fn answerError(err: anyerror) FloError {
@@ -645,4 +701,78 @@ test "status short of memory says so, not that the answer is bad" {
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(FloError.OutOfMemory, workflow.status(failing.allocator(), "r", .{}));
+}
+
+// Two definitions: "a" v"1" at 5, "bc" v"" at -1; has_more=1, cursor "\x01\x00z".
+const definitions_page = "\x02\x00\x00\x00" ++
+    "\x01\x00a" ++ "\x01\x001" ++ "\x05\x00\x00\x00\x00\x00\x00\x00" ++
+    "\x02\x00bc" ++ "\x00\x00" ++ "\xff\xff\xff\xff\xff\xff\xff\xff" ++
+    "\x01" ++ "\x03\x00" ++ "\x01\x00z";
+
+test "a definitions page decodes per the server's layout" {
+    var page = try parseDefinitionList(std.testing.allocator, definitions_page);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), page.definitions.len);
+    try std.testing.expectEqualStrings("a", page.definitions[0].name);
+    try std.testing.expectEqualStrings("1", page.definitions[0].version);
+    try std.testing.expectEqual(@as(i64, 5), page.definitions[0].created_at);
+    try std.testing.expectEqualStrings("bc", page.definitions[1].name);
+    try std.testing.expectEqualStrings("", page.definitions[1].version);
+    try std.testing.expectEqual(@as(i64, -1), page.definitions[1].created_at);
+    try std.testing.expect(page.has_more);
+    try std.testing.expectEqualSlices(u8, "\x01\x00z", page.cursor.?);
+}
+
+test "a definitions page whose cursor contradicts has_more is refused" {
+    const a = std.testing.allocator;
+    // No definitions; has_more=0 with a cursor, then has_more=1 without one.
+    try std.testing.expectError(error.UnexpectedResponse, parseDefinitionList(a, "\x00\x00\x00\x00" ++ "\x00" ++ "\x01\x00c"));
+    try std.testing.expectError(error.UnexpectedResponse, parseDefinitionList(a, "\x00\x00\x00\x00" ++ "\x01" ++ "\x00\x00"));
+}
+
+fn parseDefinitionsAndFree(a: Allocator, data: []const u8) !void {
+    var page = try parseDefinitionList(a, data);
+    page.deinit();
+}
+
+test "a definitions answer cut anywhere, overcounted, or short of memory leaks nothing" {
+    const a = std.testing.allocator;
+    for (0..definitions_page.len) |n| try std.testing.expect(std.meta.isError(parseDefinitionsAndFree(a, definitions_page[0..n])));
+    // A count far past what the data holds is refused before it allocates.
+    try std.testing.expectError(error.UnexpectedEndOfData, parseDefinitionsAndFree(a, "\xff\xff\xff\xff" ++ definitions_page[4..]));
+    try std.testing.checkAllAllocationFailures(a, parseDefinitionsAndFree, .{@as([]const u8, definitions_page)});
+}
+
+test "listDefinitions pages on past a short page until has_more is clear, sending each page's cursor" {
+    const a = std.testing.allocator;
+    var srv = try @import("test_server.zig").OkServer.listen();
+    srv.replies = &.{
+        // Two definitions, fewer than the limit, yet has_more=1.
+        .{ .status = 0, .body = definitions_page },
+        // The last page: one definition, nothing more.
+        .{ .status = 0, .body = "\x01\x00\x00\x00" ++ "\x01\x00d" ++ "\x01\x002" ++ "\x09\x00\x00\x00\x00\x00\x00\x00" ++ "\x00\x00\x00" },
+    };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var workflow = Workflow.init(&client);
+
+    var page = try workflow.listDefinitions(a, .{ .limit = 10 });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.workflow_list_definitions)), srv.last_op);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 0 }, srv.lastValue());
+    try std.testing.expectEqual(@as(usize, 2), page.definitions.len);
+    try std.testing.expect(page.has_more);
+
+    var last = try workflow.listDefinitions(a, .{ .limit = 10, .cursor = page.cursor });
+    defer last.deinit();
+    try std.testing.expectEqualSlices(u8, "\x0a\x00\x00\x00\x01\x00z", srv.lastValue());
+    try std.testing.expectEqual(@as(usize, 1), last.definitions.len);
+    try std.testing.expectEqualStrings("d", last.definitions[0].name);
+    try std.testing.expectEqualStrings("2", last.definitions[0].version);
+    try std.testing.expectEqual(@as(i64, 9), last.definitions[0].created_at);
+    try std.testing.expect(!last.has_more);
+    try std.testing.expect(last.cursor == null);
 }
