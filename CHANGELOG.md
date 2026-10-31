@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Breaking:** pinned to the table hash of flo `0484c0c` (`0xc751512225a42d04`);
+- **Breaking:** pinned to the table hash of flo `3614d95` (`0xc751512225a42d04`);
   this SDK and older servers refuse each other.
 - **Breaking:** `FloError.NoNamespace` (status 14) is its own error, apart from
   `NotFound`. Reads, lists and scans in a namespace never created return it;
