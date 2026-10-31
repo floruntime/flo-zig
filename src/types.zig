@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0x05fe53f432e943c4;
+pub const TABLE_HASH: u64 = 0xa8de7758afa69427;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
