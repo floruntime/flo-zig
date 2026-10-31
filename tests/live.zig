@@ -834,19 +834,27 @@ test "live: processing list pages every job back exactly once" {
     try seen.expectExactly("job-", n);
 }
 
-/// Creates a workflow whose runs wait on an action no worker runs, so they
-/// stay open for signals and cancels.
+/// Creates a workflow whose runs wait for a signal no test sends, so they
+/// stay open for signals and cancels. (A run of an action no one registered
+/// can fail at once, when the action would be on the run's own shard.)
 fn createWaitingWorkflow(workflow: *flo.Workflow, name: []const u8) !void {
-    var yaml_buf: [256]u8 = undefined;
+    var yaml_buf: [512]u8 = undefined;
     const yaml = try std.fmt.bufPrint(&yaml_buf,
         \\kind: Workflow
         \\name: {s}
         \\version: 1.0.0
+        \\terminals:
+        \\  Approved:
+        \\    status: completed
+        \\  Rejected:
+        \\    status: failed
         \\start:
-        \\  run: "@actions/zig-runs-unserved"
+        \\  wait_for_signal:
+        \\    type: never-sent
+        \\    timeout_ms: 600000
         \\  transitions:
-        \\    success: flo.Completed
-        \\    failure: flo.Failed
+        \\    success: Approved
+        \\    timeout: Rejected
         \\
     , .{name});
     try workflow.create(name, yaml, .{});
