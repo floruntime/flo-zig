@@ -45,6 +45,13 @@ const Live = struct {
     fn deinit(self: *Live) void {
         self.client.deinit();
     }
+
+    /// Creates the namespace with a write: a read in one never created is
+    /// no_namespace, not not_found.
+    fn createNamespace(self: *Live) !void {
+        var kv = flo.KV.init(&self.client);
+        _ = try kv.put("namespace-exists", "x", .{});
+    }
 };
 
 test "live: the server speaks this SDK's protocol and table" {
@@ -63,7 +70,7 @@ test "live: the server speaks this SDK's protocol and table" {
     const run = try std.process.Child.run(.{ .allocator = testing.allocator, .argv = &.{ binary, "version", "--verbose" }, .env_map = &env_map });
     defer testing.allocator.free(run.stdout);
     defer testing.allocator.free(run.stderr);
-    // "... (protocol 3, table 0xa8de7758afa69427; ..."
+    // "... (protocol 3, table 0xc751512225a42d04; ..."
     const p = std.mem.indexOf(u8, run.stdout, "protocol ") orelse return error.NoProtocol;
     const t = std.mem.indexOf(u8, run.stdout, "table 0x") orelse return error.NoTable;
     const proto_end = std.mem.indexOfScalarPos(u8, run.stdout, p, ',') orelse return error.NoProtocol;
@@ -172,6 +179,7 @@ test "live: worker info for a worker the server doesn't know is not found" {
     var live: Live = .{ .client = undefined };
     try live.init();
     defer live.deinit();
+    try live.createNamespace();
     var actions = flo.Actions.init(&live.client);
     try testing.expectError(flo.FloError.NotFound, actions.workerInfo("no-such-worker", .{}));
     const last = live.client.lastError().?;
@@ -357,6 +365,7 @@ test "live: the status of a run id the server never minted is not found" {
     var live: Live = .{ .client = undefined };
     try live.init();
     defer live.deinit();
+    try live.createNamespace();
     var actions = flo.Actions.init(&live.client);
     try testing.expectError(flo.FloError.NotFound, actions.getStatus("act-0-0", .{}));
 }
@@ -748,7 +757,7 @@ test "live: workflow listDefinitions pages every definition back exactly once" {
             \\name: {s}
             \\version: 1.0.0
             \\start:
-            \\  run: "@actions/validate"
+            \\  run: "@actions/zig-runs-unserved"
             \\  transitions:
             \\    success: flo.Completed
             \\    failure: flo.Failed
@@ -823,4 +832,183 @@ test "live: processing list pages every job back exactly once" {
     }
     try testing.expect(pages >= n / PAGE);
     try seen.expectExactly("job-", n);
+}
+
+/// Creates a workflow whose runs wait for a signal no test sends, so they
+/// stay open for signals and cancels. (A run of an action no one registered
+/// can fail at once, when the action would be on the run's own shard.)
+fn createWaitingWorkflow(workflow: *flo.Workflow, name: []const u8) !void {
+    var yaml_buf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&yaml_buf,
+        \\kind: Workflow
+        \\name: {s}
+        \\version: 1.0.0
+        \\terminals:
+        \\  Approved:
+        \\    status: completed
+        \\  Rejected:
+        \\    status: failed
+        \\start:
+        \\  wait_for_signal:
+        \\    type: never-sent
+        \\    timeout_ms: 600000
+        \\  transitions:
+        \\    success: Approved
+        \\    timeout: Rejected
+        \\
+    , .{name});
+    try workflow.create(name, yaml, .{});
+}
+
+/// A run listRuns returned, owned.
+const ListedRun = struct { run_id: []u8, workflow: []u8, created_at: i64 };
+
+/// Every run listRuns pages back for `workflow_name` (null for all), in
+/// the order the pages gave them; checks each page's limit and the order.
+fn listAllRuns(workflow: *flo.Workflow, workflow_name: ?[]const u8, out: *std.ArrayList(ListedRun)) !void {
+    var cursor: Cursor = .{};
+    defer cursor.deinit();
+    var pages: usize = 0;
+    while (true) {
+        pages += 1;
+        try testing.expect(pages <= 100);
+        var page = try workflow.listRuns(testing.allocator, .{ .workflow_name = workflow_name, .limit = PAGE, .cursor = cursor.get() });
+        defer page.deinit();
+        try testing.expect(page.runs.len <= PAGE);
+        for (page.runs) |r| {
+            const run_id = try testing.allocator.dupe(u8, r.run_id);
+            errdefer testing.allocator.free(run_id);
+            const name = try testing.allocator.dupe(u8, r.workflow);
+            errdefer testing.allocator.free(name);
+            try out.append(testing.allocator, .{ .run_id = run_id, .workflow = name, .created_at = r.created_at });
+        }
+        if (!page.has_more) break;
+        try cursor.set(page.cursor orelse return error.MoreWithoutCursor);
+    }
+    // Newest first, then by id: strictly, so no run came back twice.
+    for (out.items[0..out.items.len -| 1], out.items[@min(1, out.items.len)..]) |a, b| {
+        const ordered = a.created_at > b.created_at or (a.created_at == b.created_at and std.mem.lessThan(u8, a.run_id, b.run_id));
+        if (!ordered) {
+            std.debug.print("{s}@{d} came before {s}@{d}\n", .{ a.run_id, a.created_at, b.run_id, b.created_at });
+            return error.OutOfOrder;
+        }
+    }
+}
+
+fn freeRuns(runs: *std.ArrayList(ListedRun)) void {
+    for (runs.items) |r| {
+        testing.allocator.free(r.run_id);
+        testing.allocator.free(r.workflow);
+    }
+    runs.deinit(testing.allocator);
+}
+
+test "live: workflow listRuns pages every run back exactly once, newest first" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var workflow = flo.Workflow.init(&live.client);
+    const names = [_][]const u8{ "runs-a", "runs-b", "runs-c", "runs-d" };
+    const per = 4;
+    var started: [names.len * per][]u8 = undefined;
+    var n: usize = 0;
+    defer for (started[0..n]) |id| testing.allocator.free(id);
+    for (names) |name| try createWaitingWorkflow(&workflow, name);
+    for (0..per) |_| for (names) |name| {
+        started[n] = try workflow.start(testing.allocator, name, "{}", .{});
+        n += 1;
+    };
+
+    // Every workflow's runs.
+    var all: std.ArrayList(ListedRun) = .empty;
+    defer freeRuns(&all);
+    try listAllRuns(&workflow, null, &all);
+    try testing.expectEqual(started.len, all.items.len);
+    for (started, 0..) |id, i| {
+        const listed = for (all.items) |r| {
+            if (std.mem.eql(u8, r.run_id, id)) break r;
+        } else {
+            std.debug.print("run {s} never came back\n", .{id});
+            return error.MissingRun;
+        };
+        try testing.expectEqualStrings(names[i % names.len], listed.workflow);
+    }
+
+    // One workflow's runs: exactly the ones it started.
+    var one: std.ArrayList(ListedRun) = .empty;
+    defer freeRuns(&one);
+    try listAllRuns(&workflow, "runs-b", &one);
+    try testing.expectEqual(@as(usize, per), one.items.len);
+    for (one.items) |r| try testing.expectEqualStrings("runs-b", r.workflow);
+    for (started, 0..) |id, i| if (i % names.len == 1) {
+        for (one.items) |r| {
+            if (std.mem.eql(u8, r.run_id, id)) break;
+        } else return error.MissingRun;
+    };
+}
+
+test "live: a run started with a client-chosen id is found by that id, and a later start of the id on another workflow is refused" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var workflow = flo.Workflow.init(&live.client);
+    const others = [_][]const u8{ "chosen-b", "chosen-c", "chosen-d", "chosen-e", "chosen-f", "chosen-g" };
+    try createWaitingWorkflow(&workflow, "chosen-a");
+    for (others) |name| try createWaitingWorkflow(&workflow, name);
+
+    var uuid_buf: [36]u8 = undefined;
+    var raw: [16]u8 = undefined;
+    std.crypto.random.bytes(&raw);
+    const uuid = std.fmt.bufPrint(&uuid_buf, "{x}-{x}-{x}-{x}-{x}", .{ raw[0..4], raw[4..6], raw[6..8], raw[8..10], raw[10..16] }) catch unreachable;
+
+    for ([_][]const u8{ "order-123", "run-1", uuid }) |id| {
+        const got = try workflow.start(testing.allocator, "chosen-a", "{}", .{ .run_id = id });
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(id, got);
+
+        const st = try workflow.status(testing.allocator, id, .{});
+        defer st.deinit(testing.allocator);
+        try testing.expectEqualStrings(id, st.run_id);
+        try testing.expectEqualStrings("chosen-a", st.workflow);
+
+        const hist = try workflow.history(testing.allocator, id, .{});
+        testing.allocator.free(hist);
+
+        try workflow.signal(id, "nudge", "{}", .{});
+
+        // The id is this run's on any workflow, whichever shard holds it.
+        for (others) |name| {
+            try testing.expectError(flo.FloError.Conflict, workflow.start(testing.allocator, name, "{}", .{ .run_id = id }));
+        }
+
+        try workflow.cancel(id, "done", .{});
+        const after = try workflow.status(testing.allocator, id, .{});
+        defer after.deinit(testing.allocator);
+        try testing.expectEqualStrings("cancelled", after.status);
+        try testing.expectEqualStrings("chosen-a", after.workflow);
+    }
+}
+
+test "live: stream info of a stream that doesn't exist is not found" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var stream = flo.Stream.init(&live.client);
+    // The namespace exists, the stream doesn't.
+    _ = try stream.append("present", "x", .{});
+    try testing.expectError(flo.FloError.NotFound, stream.info("absent", .{}));
+    const info = try stream.info("present", .{});
+    try testing.expectEqual(@as(u64, 1), info.count);
+}
+
+test "live: a read in a namespace never created is no_namespace" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var kv = flo.KV.init(&live.client);
+    try testing.expectError(flo.FloError.NoNamespace, kv.get("k", .{}));
+    try testing.expectError(flo.FloError.NoNamespace, kv.scan("", .{}));
+    // A write creates it; the read then finds no key.
+    _ = try kv.put("other", "x", .{});
+    try testing.expect((try kv.get("k", .{})) == null);
 }
