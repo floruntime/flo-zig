@@ -662,7 +662,7 @@ fn parseDefinitionList(allocator: Allocator, data: []const u8) !types.WorkflowLi
 
     const trailer = try wire.parseListTrailer(data, pos);
     return .{
-        .entries = entries,
+        .definitions = entries,
         .has_more = trailer.has_more,
         .cursor = if (trailer.cursor) |c| try allocator.dupe(u8, c) else null,
         .allocator = allocator,
@@ -712,15 +712,22 @@ const definitions_page = "\x02\x00\x00\x00" ++
 test "a definitions page decodes per the server's layout" {
     var page = try parseDefinitionList(std.testing.allocator, definitions_page);
     defer page.deinit();
-    try std.testing.expectEqual(@as(usize, 2), page.entries.len);
-    try std.testing.expectEqualStrings("a", page.entries[0].name);
-    try std.testing.expectEqualStrings("1", page.entries[0].version);
-    try std.testing.expectEqual(@as(i64, 5), page.entries[0].created_at);
-    try std.testing.expectEqualStrings("bc", page.entries[1].name);
-    try std.testing.expectEqualStrings("", page.entries[1].version);
-    try std.testing.expectEqual(@as(i64, -1), page.entries[1].created_at);
+    try std.testing.expectEqual(@as(usize, 2), page.definitions.len);
+    try std.testing.expectEqualStrings("a", page.definitions[0].name);
+    try std.testing.expectEqualStrings("1", page.definitions[0].version);
+    try std.testing.expectEqual(@as(i64, 5), page.definitions[0].created_at);
+    try std.testing.expectEqualStrings("bc", page.definitions[1].name);
+    try std.testing.expectEqualStrings("", page.definitions[1].version);
+    try std.testing.expectEqual(@as(i64, -1), page.definitions[1].created_at);
     try std.testing.expect(page.has_more);
     try std.testing.expectEqualSlices(u8, "\x01\x00z", page.cursor.?);
+}
+
+test "a definitions page whose cursor contradicts has_more is refused" {
+    const a = std.testing.allocator;
+    // No definitions; has_more=0 with a cursor, then has_more=1 without one.
+    try std.testing.expectError(error.UnexpectedResponse, parseDefinitionList(a, "\x00\x00\x00\x00" ++ "\x00" ++ "\x01\x00c"));
+    try std.testing.expectError(error.UnexpectedResponse, parseDefinitionList(a, "\x00\x00\x00\x00" ++ "\x01" ++ "\x00\x00"));
 }
 
 fn parseDefinitionsAndFree(a: Allocator, data: []const u8) !void {
@@ -756,16 +763,16 @@ test "listDefinitions pages on past a short page until has_more is clear, sendin
     defer page.deinit();
     try std.testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.workflow_list_definitions)), srv.last_op);
     try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 0 }, srv.lastValue());
-    try std.testing.expectEqual(@as(usize, 2), page.entries.len);
+    try std.testing.expectEqual(@as(usize, 2), page.definitions.len);
     try std.testing.expect(page.has_more);
 
     var last = try workflow.listDefinitions(a, .{ .limit = 10, .cursor = page.cursor });
     defer last.deinit();
     try std.testing.expectEqualSlices(u8, "\x0a\x00\x00\x00\x01\x00z", srv.lastValue());
-    try std.testing.expectEqual(@as(usize, 1), last.entries.len);
-    try std.testing.expectEqualStrings("d", last.entries[0].name);
-    try std.testing.expectEqualStrings("2", last.entries[0].version);
-    try std.testing.expectEqual(@as(i64, 9), last.entries[0].created_at);
+    try std.testing.expectEqual(@as(usize, 1), last.definitions.len);
+    try std.testing.expectEqualStrings("d", last.definitions[0].name);
+    try std.testing.expectEqualStrings("2", last.definitions[0].version);
+    try std.testing.expectEqual(@as(i64, 9), last.definitions[0].created_at);
     try std.testing.expect(!last.has_more);
     try std.testing.expect(last.cursor == null);
 }

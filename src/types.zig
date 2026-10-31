@@ -353,7 +353,9 @@ pub const StatusCode = enum(u8) {
     /// resumes. Never retried: resending would write it twice.
     outcome_pending = 13,
     /// The namespace the request names doesn't exist; not_found is a
-    /// missing key.
+    /// missing key. Reads in a missing namespace answer this from the
+    /// server version that adds it; until then they answer as an empty
+    /// namespace (a get not_found, a list or scan empty).
     no_namespace = 14,
 
     // The server may send codes this SDK predates; `_` keeps them a value
@@ -481,7 +483,9 @@ pub const FloError = error{
     ServerError,
     NotFound,
     /// The namespace the request names doesn't exist (status no_namespace),
-    /// as against a missing key (NotFound).
+    /// as against a missing key (NotFound). Reads return it from the server
+    /// version that adds it; before that a read in a missing namespace
+    /// answers as an empty one.
     NoNamespace,
     BadRequest,
     Conflict,
@@ -1438,17 +1442,17 @@ pub const WorkflowDefinitionEntry = struct {
 };
 
 /// One page of workflow definitions. A page can hold fewer than `limit`
-/// entries while `has_more` is set: keep asking until it is clear.
+/// definitions while `has_more` is set: keep asking until it is clear.
 pub const WorkflowListDefinitionsResult = struct {
-    entries: []WorkflowDefinitionEntry,
+    definitions: []WorkflowDefinitionEntry,
     has_more: bool,
     /// Pass as `WorkflowListDefinitionsOptions.cursor` for the next page; null on the last page.
     cursor: ?[]const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *WorkflowListDefinitionsResult) void {
-        for (self.entries) |*entry| entry.deinit(self.allocator);
-        self.allocator.free(self.entries);
+        for (self.definitions) |*entry| entry.deinit(self.allocator);
+        self.allocator.free(self.definitions);
         if (self.cursor) |c| self.allocator.free(c);
     }
 };
@@ -1529,20 +1533,20 @@ pub const ProcessingListEntry = struct {
     }
 };
 
-/// One page of processing jobs. A page can hold fewer than `limit` entries
+/// One page of processing jobs. A page can hold fewer than `limit` jobs
 /// while `has_more` is set: keep asking until it is clear.
 pub const ProcessingListResult = struct {
-    entries: []ProcessingListEntry,
+    jobs: []ProcessingListEntry,
     has_more: bool,
     /// Pass as `ProcessingListOptions.cursor` for the next page; null on the last page.
     cursor: ?[]const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ProcessingListResult) void {
-        for (self.entries) |*entry| {
+        for (self.jobs) |*entry| {
             entry.deinit(self.allocator);
         }
-        self.allocator.free(self.entries);
+        self.allocator.free(self.jobs);
         if (self.cursor) |c| self.allocator.free(c);
     }
 };

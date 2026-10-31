@@ -380,12 +380,17 @@ pub const ListTrailer = struct {
     cursor: ?[]const u8,
 };
 
+/// The trailer ends the answer: bytes after it are refused, as is a cursor
+/// that contradicts has_more. A next page with no cursor can't be asked for,
+/// and a cursor on the last page means the answer is misread.
 pub fn parseListTrailer(data: []const u8, offset: usize) FloError!ListTrailer {
     if (data.len < offset + 3) return FloError.IncompleteResponse;
     const has_more = data[offset] != 0;
     const cursor_len = std.mem.readInt(u16, data[offset + 1 ..][0..2], .little);
     const start = offset + 3;
     if (data.len < start + cursor_len) return FloError.IncompleteResponse;
+    if (data.len != start + cursor_len) return FloError.UnexpectedResponse;
+    if (has_more != (cursor_len > 0)) return FloError.UnexpectedResponse;
     return .{
         .has_more = has_more,
         .cursor = if (cursor_len > 0) data[start..][0..cursor_len] else null,
@@ -560,6 +565,27 @@ test "OptionsBuilder refuses a blocking wait over 300000 ms" {
     try std.testing.expectError(FloError.BlockTooLong, builder.addU32(.block_ms, types.MAX_BLOCK_MS + 1));
     // Other u32 options are not blocking waits.
     try builder.addU32(.count, types.MAX_BLOCK_MS + 1);
+}
+
+test "parseListTrailer reads has_more and the cursor that ends the answer" {
+    const page = try parseListTrailer(&.{ 9, 1, 2, 0, 'c', '1' }, 1);
+    try std.testing.expect(page.has_more);
+    try std.testing.expectEqualStrings("c1", page.cursor.?);
+    const last = try parseListTrailer(&.{ 0, 0, 0 }, 0);
+    try std.testing.expect(!last.has_more);
+    try std.testing.expect(last.cursor == null);
+}
+
+test "parseListTrailer refuses bytes after the cursor" {
+    try std.testing.expectError(FloError.UnexpectedResponse, parseListTrailer(&.{ 1, 1, 0, 'c', 'x' }, 0));
+    try std.testing.expectError(FloError.UnexpectedResponse, parseListTrailer(&.{ 0, 0, 0, 0 }, 0));
+}
+
+test "parseListTrailer refuses a cursor that contradicts has_more" {
+    // has_more=0 with a cursor.
+    try std.testing.expectError(FloError.UnexpectedResponse, parseListTrailer(&.{ 0, 1, 0, 'c' }, 0));
+    // has_more=1 with no cursor.
+    try std.testing.expectError(FloError.UnexpectedResponse, parseListTrailer(&.{ 1, 0, 0 }, 0));
 }
 
 test "parseDequeueResponse reads every message as the server writes it" {

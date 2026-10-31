@@ -1091,6 +1091,13 @@ test "an action.list answer cut short or short of memory is refused and leaks no
     }.run, .{@as([]const u8, &data)});
 }
 
+test "an action.list answer whose cursor contradicts has_more is refused" {
+    const a = std.testing.allocator;
+    // No names; has_more=0 with a cursor, then has_more=1 without one.
+    try std.testing.expectError(FloError.UnexpectedResponse, decodeActionListAnswer(a, &.{ 0, 0, 0, 0, 0, 1, 0, 'c' }));
+    try std.testing.expectError(FloError.UnexpectedResponse, decodeActionListAnswer(a, &.{ 0, 0, 0, 0, 1, 0, 0 }));
+}
+
 test "listWorkers sends its limit and cursor and returns the rows and the next cursor" {
     const a = std.testing.allocator;
     var answer: std.ArrayList(u8) = .empty;

@@ -344,7 +344,7 @@ fn parseProcessingList(allocator: Allocator, data: []const u8) !types.Processing
     const cursor = if (trailer.cursor) |c| try allocator.dupe(u8, c) else null;
 
     return .{
-        .entries = entries,
+        .jobs = entries,
         .has_more = trailer.has_more,
         .cursor = cursor,
         .allocator = allocator,
@@ -408,7 +408,7 @@ test "list sends [limit][cursor] in the value and returns the next cursor" {
     defer result.deinit();
 
     try std.testing.expectEqualSlices(u8, &[_]u8{ 5, 0, 0, 0, 'c', '1' }, srv.lastValue());
-    try std.testing.expectEqual(@as(usize, 0), result.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), result.jobs.len);
     try std.testing.expect(result.has_more);
     try std.testing.expectEqualStrings("c2", result.cursor.?);
 }
@@ -434,14 +434,14 @@ test "list pages on past a short page until has_more is clear, sending each page
     defer page.deinit();
     try std.testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.processing_list)), srv.last_op);
     try std.testing.expectEqualSlices(u8, &.{ 5, 0, 0, 0 }, srv.lastValue());
-    try std.testing.expectEqual(@as(usize, 1), page.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), page.jobs.len);
     try std.testing.expect(page.has_more);
     try std.testing.expectEqualStrings("c9", page.cursor.?);
 
     var last = try processing.list(a, .{ .limit = 5, .cursor = page.cursor });
     defer last.deinit();
     try std.testing.expectEqualSlices(u8, &.{ 5, 0, 0, 0, 'c', '9' }, srv.lastValue());
-    try std.testing.expectEqual(@as(usize, 0), last.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), last.jobs.len);
     try std.testing.expect(!last.has_more);
     try std.testing.expect(last.cursor == null);
 }
@@ -466,12 +466,19 @@ test "status and list answers decode per the server's layouts" {
         [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 0 };
     var list = try parseProcessingList(a, &list_body);
     defer list.deinit();
-    try std.testing.expectEqual(@as(usize, 1), list.entries.len);
-    try std.testing.expectEqualStrings("p", list.entries[0].name);
-    try std.testing.expectEqualStrings("j1", list.entries[0].job_id);
-    try std.testing.expectEqualStrings("running", list.entries[0].status);
-    try std.testing.expectEqual(@as(i64, 7), list.entries[0].created_at);
+    try std.testing.expectEqual(@as(usize, 1), list.jobs.len);
+    try std.testing.expectEqualStrings("p", list.jobs[0].name);
+    try std.testing.expectEqualStrings("j1", list.jobs[0].job_id);
+    try std.testing.expectEqualStrings("running", list.jobs[0].status);
+    try std.testing.expectEqual(@as(i64, 7), list.jobs[0].created_at);
     try std.testing.expect(!list.has_more);
+}
+
+test "a jobs page whose cursor contradicts has_more is refused" {
+    const a = std.testing.allocator;
+    // No jobs; has_more=0 with a cursor, then has_more=1 without one.
+    try std.testing.expectError(error.UnexpectedResponse, parseProcessingList(a, &.{ 0, 0, 0, 0, 0, 1, 0, 'c' }));
+    try std.testing.expectError(error.UnexpectedResponse, parseProcessingList(a, &.{ 0, 0, 0, 0, 1, 0, 0 }));
 }
 
 // job_id "j1", name "p", status 3 (failed), batch_size 50, records 1234, created_at 99, reason "boom"

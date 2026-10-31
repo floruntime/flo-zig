@@ -484,7 +484,7 @@ defer if (defs_cursor) |c| allocator.free(c);
 while (true) {
     var defs = try workflow.listDefinitions(allocator, .{ .limit = 50, .cursor = defs_cursor });
     defer defs.deinit();
-    for (defs.entries) |def| std.debug.print("{s} v{s}\n", .{ def.name, def.version });
+    for (defs.definitions) |def| std.debug.print("{s} v{s}\n", .{ def.name, def.version });
     if (!defs.has_more) break;
     if (defs_cursor) |c| allocator.free(c);
     defs_cursor = try allocator.dupe(u8, defs.cursor.?);
@@ -524,7 +524,7 @@ defer if (jobs_cursor) |c| allocator.free(c);
 while (true) {
     var jobs = try processing.list(allocator, .{ .limit = 50, .cursor = jobs_cursor });
     defer jobs.deinit();
-    for (jobs.entries) |entry| std.debug.print("{s}: {s}\n", .{ entry.name, entry.status });
+    for (jobs.jobs) |entry| std.debug.print("{s}: {s}\n", .{ entry.name, entry.status });
     if (!jobs.has_more) break;
     if (jobs_cursor) |c| allocator.free(c);
     jobs_cursor = try allocator.dupe(u8, jobs.cursor.?);

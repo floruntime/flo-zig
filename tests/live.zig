@@ -767,8 +767,8 @@ test "live: workflow listDefinitions pages every definition back exactly once" {
         try testing.expect(pages <= 2 * n);
         var page = try workflow.listDefinitions(testing.allocator, .{ .limit = PAGE, .cursor = cursor.get() });
         defer page.deinit();
-        try testing.expect(page.entries.len <= PAGE);
-        for (page.entries) |e| try seen.add(e.name);
+        try testing.expect(page.definitions.len <= PAGE);
+        for (page.definitions) |e| try seen.add(e.name);
         if (!page.has_more) break;
         try cursor.set(page.cursor orelse return error.MoreWithoutCursor);
     }
@@ -816,8 +816,8 @@ test "live: processing list pages every job back exactly once" {
         try testing.expect(pages <= 2 * n);
         var page = try processing.list(testing.allocator, .{ .limit = PAGE, .cursor = cursor.get() });
         defer page.deinit();
-        try testing.expect(page.entries.len <= PAGE);
-        for (page.entries) |e| try seen.add(e.name);
+        try testing.expect(page.jobs.len <= PAGE);
+        for (page.jobs) |e| try seen.add(e.name);
         if (!page.has_more) break;
         try cursor.set(page.cursor orelse return error.MoreWithoutCursor);
     }
