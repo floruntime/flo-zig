@@ -370,15 +370,22 @@ Actions are task types that workers process. `Actions` is the low-level API; for
 handler-based worker that registers, awaits, and heartbeats for you, see `ActionWorker`.
 
 `ActionWorker.registerAction(name, handler, options)` registers the action with exactly
-`options` (`.{}`: a 30 s timeout and 3 attempts). Registering replaces an action's
-settings, so workers that register one action with different options leave it with
-whichever registered last. The timeout is the lease a worker holds each run for: the
-server takes 5000 to 43200000 ms, and 0 for its default, 300000. A run whose handler goes
-past its lease without touching it is taken back and run again; `.auto_touch = true` in
-`WorkerConfig` touches each run every third of its lease from a thread on its own
-connection while the handler runs; that thread allocates, so the worker's allocator must
-then be thread-safe. It's off by default; without it, call `ctx.touch()` from long
-handlers, at least every half lease. An action's `owner` is at most 256 bytes.
+`options` (`.{}`: the server's 300 s lease, and 3 attempts). Registering replaces an
+action's settings, so workers that register one action with different options leave it
+with whichever registered last. The timeout is the lease a worker holds each run for: the
+server takes 5000 to 43200000 ms, and 0 (the default here) for its default, 300000.
+Whatever the touches, a worker holds a run at most 12 h from its delivery. A run whose
+handler goes past its lease without touching it is taken back and run again;
+`.auto_touch = true` in `WorkerConfig` touches each run every sixth of its lease, counted
+from when it arrived, from a thread on its own connection while the handler runs; that
+thread allocates, so the worker's allocator must then be thread-safe. It's off by
+default; without it, call `ctx.touch()` from long handlers, at least every half lease.
+An action's `owner` is at most 256 bytes.
+
+A handler that returns an error fails the run with retry: it runs again while attempts
+are left (return `error.NonRetryable` to fail it for good). `stop()` stops taking work:
+running handlers are not interrupted, and finish and send their results before `start`
+returns. `drain()` does the same and also tells the server.
 
 `WorkerConfig.concurrency` is how many tasks an `ActionWorker` runs at once. The default,
 1, runs them one after another on the polling loop. Above 1, each runs on a thread and a
@@ -460,7 +467,8 @@ while (true) {
 
 ```zig
 // With half the lease or less left, a touch renews it for a full lease;
-// with more left it changes nothing. Touch at least every half lease.
+// with more left it changes nothing. Touch at least every half lease; a run
+// is still held at most 12 h from its delivery.
 const expires_at_ms = try actions.touch("worker-1", task.delivery(), .{});
 ```
 

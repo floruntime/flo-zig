@@ -198,10 +198,11 @@ pub fn pauseUnlessHalted(running: *const bool, halt: ?*const bool, ms: u64) void
     }
 }
 
-/// Log a worker result that was given up on. It is an error, but logged as a
-/// warning under test: the test runner fails any test that logs an error,
-/// and the worker tests drop results on purpose.
-pub fn logDropped(comptime format: []const u8, args: anytype) void {
+/// Log a worker error: a result given up on, or a handler that failed. It
+/// is an error, but logged as a warning under test: the test runner fails
+/// any test that logs an error, and the worker tests provoke these on
+/// purpose.
+pub fn logWorkerError(comptime format: []const u8, args: anytype) void {
     if (@import("builtin").is_test) std.log.warn(format, args) else std.log.err(format, args);
 }
 
@@ -1312,8 +1313,8 @@ pub const ActionRegisterOptions = struct {
     namespace: ?[]const u8 = null,
     /// The lease: how long a run may go without its worker completing,
     /// failing or touching it before it's taken back. The server takes 5000
-    /// to 43200000 ms, and 0 for 300000.
-    timeout_ms: u32 = 30_000,
+    /// to 43200000 ms; 0, the default, is its default of 300000.
+    timeout_ms: u32 = 0,
     /// Attempts in all, counting the first.
     max_retries: u32 = 3,
     /// Who owns the action, at most 256 bytes; more is refused with

@@ -67,8 +67,9 @@ pub const WorkerConfig = struct {
     machine_id: ?[]const u8 = null,
     /// How its connection retries refused-but-not-run requests.
     retry: retry_mod.RetryPolicy = .{},
-    /// Touch each run every third of its lease while the handler runs, from
-    /// a thread on a connection of its own. Off by default: a handler that
+    /// Touch each run every sixth of its lease while the handler runs, from
+    /// a thread on a connection of its own; a run is still held at most 12 h
+    /// from its delivery. Off by default: a handler that
     /// runs past the lease without calling ctx.touch is taken back and run
     /// again. That thread allocates, so with auto_touch
     /// on the allocator given to init must be thread-safe (a GPA,
@@ -125,7 +126,8 @@ pub const ActionContext = struct {
 
     /// Keep this task's lease, for long-running tasks: with half the lease
     /// or less left it runs a full lease from now. Touch at least every half
-    /// lease. Returns when the lease runs out, in Unix milliseconds;
+    /// lease. Whatever the touches, a worker holds a run at most 12 h from
+    /// its delivery. Returns when the lease runs out, in Unix milliseconds;
     /// `error.StaleReport` means the run has moved on.
     pub fn touch(self: *ActionContext) !i64 {
         return self.actions.touch(self.worker_id, self.delivery, .{ .namespace = self.namespace });
@@ -195,6 +197,10 @@ pub const ActionWorker = struct {
     /// auto_touch's connection for tasks run inline (concurrency 1), opened
     /// on first use; a slot has its own.
     touch_client: ?Client = null,
+    /// The next await's request key, and its length; 0 until one is made.
+    /// The poll loop's alone.
+    poll_key: [32]u8 = undefined,
+    poll_key_len: usize = 0,
     /// With concurrency above 1, one slot per task that may run at once,
     /// allocated on the first poll (the worker has its final address by
     /// then). `pool_mutex` guards each slot's `busy` and `busy_count`;
@@ -217,12 +223,14 @@ pub const ActionWorker = struct {
         /// use: a stalled touch then delays only its own task.
         touch_client: ?Client = null,
         task: TaskAssignment = undefined,
+        /// When `task`'s await answered.
+        arrived: std.time.Instant = undefined,
         thread: ?std.Thread = null,
         busy: bool = false,
 
         fn run(slot: *Slot) void {
             const w = slot.worker;
-            w.executeTask(&slot.task, w.slotClient(slot), false, &slot.touch_client);
+            w.executeTask(&slot.task, slot.arrived, w.slotClient(slot), false, &slot.touch_client);
             slot.task.deinit();
             w.pool_mutex.lock();
             defer w.pool_mutex.unlock();
@@ -290,7 +298,8 @@ pub const ActionWorker = struct {
     }
 
     /// Register an action handler, and the action with the server with
-    /// exactly `options` (`.{}`: a 30 s lease and 3 attempts). Registering replaces the action's settings, so workers
+    /// exactly `options` (`.{}`: the server's 300 s lease, and 3 attempts).
+    /// Registering replaces the action's settings, so workers
     /// that register one action with different options leave it with
     /// whichever registered last. `options.namespace` is ignored: the action
     /// goes in the worker's.
@@ -401,7 +410,11 @@ pub const ActionWorker = struct {
                     .unhealthy => types.pauseUnlessHalted(&self.running, &self.draining, failed.next(self.client.prng.random())),
                     .other => if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-worker]", "await")) {
                         const ms = failed.next(self.client.prng.random());
-                        std.log.err("[flo-worker] Await error: {}, retrying in {d}ms...", .{ err, ms });
+                        // A refusal that may pass is a warning: the poll goes
+                        // again with its request key.
+                        if (err == FloError.Unavailable or err == FloError.Overloaded) {
+                            std.log.warn("[flo-worker] Await refused: {}, retrying in {d}ms...", .{ err, ms });
+                        } else std.log.err("[flo-worker] Await error: {}, retrying in {d}ms...", .{ err, ms });
                         types.pauseUnlessHalted(&self.running, &self.draining, ms);
                     },
                 }
@@ -460,7 +473,11 @@ pub const ActionWorker = struct {
         );
     }
 
-    /// Stop the worker immediately.
+    /// Stop taking work. Safe from any thread: it only sets a flag. The poll
+    /// in flight returns within block_ms, and a task it hands out still
+    /// runs; handlers already running are not interrupted, and finish and
+    /// send their results before start returns. Nothing is sent to the
+    /// server; drain also tells it the worker takes no more work.
     pub fn stop(self: *Self) void {
         std.log.info("[flo-worker] Stopping worker...", .{});
         @atomicStore(bool, &self.running, false, .monotonic);
@@ -610,17 +627,23 @@ pub const ActionWorker = struct {
             };
         }
 
-        // Await task from server
+        // Await task from server. The poll's request key is kept until an
+        // await is answered: one refused, lost or timed out is sent again
+        // with it, and gets the delivery the first may have been given.
         var actions = self.api();
         const polled = try std.time.Instant.now();
+        if (self.poll_key_len == 0) self.poll_key_len = newRequestKey(&self.poll_key);
         const task_opt = try actions.awaitTask(
             self.worker_id,
             self.action_names.items,
             .{
                 .namespace = self.config.namespace,
                 .block_ms = self.config.block_ms,
+                .request_key = self.poll_key[0..self.poll_key_len],
             },
         );
+        self.poll_key_len = 0;
+        const arrived = std.time.Instant.now() catch polled;
 
         // No `try`: an error here would leak a task already handed to us.
         const elapsed = if (std.time.Instant.now()) |now| now.since(polled) else |_| 0;
@@ -634,6 +657,7 @@ pub const ActionWorker = struct {
             if (s_.thread) |t| t.join();
             s_.thread = null;
             s_.task = task;
+            s_.arrived = arrived;
             self.pool_mutex.lock();
             s_.busy = true;
             self.busy_count += 1;
@@ -654,7 +678,7 @@ pub const ActionWorker = struct {
             self.active_tasks -= 1;
             self.pool_mutex.unlock();
         }
-        self.executeTask(&task, &self.client, true, &self.touch_client);
+        self.executeTask(&task, arrived, &self.client, true, &self.touch_client);
     }
 
     fn ensureSlots(self: *Self) !void {
@@ -713,7 +737,7 @@ pub const ActionWorker = struct {
     /// Run `task` and send its result on `conn`: the poll connection
     /// (`register`: register again on a fresh one) or a slot's. auto_touch
     /// touches it on `touch_conn`.
-    fn executeTask(self: *Self, task: *TaskAssignment, conn: *Client, register: bool, touch_conn: *?Client) void {
+    fn executeTask(self: *Self, task: *TaskAssignment, arrived: std.time.Instant, conn: *Client, register: bool, touch_conn: *?Client) void {
         std.log.info("[flo-worker] Executing action: {s} (run={s}, attempt={d})", .{
             task.action,
             task.run_id,
@@ -724,8 +748,9 @@ pub const ActionWorker = struct {
 
         // Get handler
         const handler = self.handlers.get(task.action) orelse {
+            // Handed back untried, for a worker that runs it.
             std.log.err("[flo-worker] No handler for action: {s}", .{task.action});
-            _ = self.report(conn, register, task, .{ .fail = .{ .message = "No handler registered" } });
+            _ = self.report(conn, register, task, .{ .fail = .{ .message = "No handler registered", .abandoned = true } });
             return;
         };
 
@@ -747,7 +772,7 @@ pub const ActionWorker = struct {
         };
 
         var toucher: Toucher = undefined;
-        const touching = self.startTouching(&toucher, task, touch_conn);
+        const touching = self.startTouching(&toucher, task, arrived, touch_conn);
         // The handler's outcome alone decides complete or fail: a complete
         // that can't be delivered is never turned into a fail.
         const outcome = handler(&ctx);
@@ -773,7 +798,7 @@ pub const ActionWorker = struct {
             var error_buf: [256]u8 = undefined;
             const error_msg = std.fmt.bufPrint(&error_buf, "{}", .{err}) catch "Unknown error";
 
-            std.log.err("[flo-worker] Action failed: {s} - {s}", .{ task.action, error_msg });
+            types.logWorkerError("[flo-worker] Action failed: {s} - {s}", .{ task.action, error_msg });
             _ = self.report(conn, register, task, .{ .fail = .{ .message = error_msg, .retry = err != error.NonRetryable } });
         }
     }
@@ -781,38 +806,50 @@ pub const ActionWorker = struct {
     /// auto_touch never touches more often, whatever the lease.
     const min_touch_interval_ms: u64 = 100;
 
-    /// How often to touch a run held for `lease_ms`: every third of it (at
-    /// least min_touch_interval_ms apart). A touch renews only with half the
-    /// lease or less left, so one that fails still leaves another before
-    /// the lease runs out.
+    /// How often to touch a run held for `lease_ms`: every sixth of it, at
+    /// least min_touch_interval_ms apart. A touch renews the lease only
+    /// once half of it or less is left, so the touch at half the lease
+    /// renews it, and if that one fails two more come before it runs out.
     fn touchInterval(lease_ms: u64) u64 {
-        return @max(lease_ms / 3, min_touch_interval_ms);
+        return @max(lease_ms / 6, min_touch_interval_ms);
     }
 
-    /// One task's touching thread and the event that stops it.
+    /// One task's touching thread and the event that stops it. Touches
+    /// fall due every interval from when the task arrived, not from when
+    /// the last one returned, so a slow touch doesn't push the rest later.
     const Toucher = struct {
         worker: *Self,
         task: *const TaskAssignment,
         client: *?Client,
+        arrived: std.time.Instant,
         interval_ns: u64,
         stop: std.Thread.ResetEvent = .{},
 
         fn run(t: *Toucher) void {
-            while (true) {
-                t.stop.timedWait(t.interval_ns) catch {
-                    if (t.worker.touchOnce(t.client, t.task)) continue;
-                    return;
-                };
-                return; // stopped
+            var due: u64 = t.interval_ns;
+            while (!t.stop.isSet()) {
+                const since = t.sinceArrival(due);
+                if (since < due) {
+                    t.stop.timedWait(due - since) catch {};
+                    continue;
+                }
+                if (!t.worker.touchOnce(t.client, t.task)) return;
+                // The next due time after the touch: those missed while it
+                // ran are skipped.
+                due = (t.sinceArrival(due) / t.interval_ns + 1) *| t.interval_ns;
             }
+        }
+
+        fn sinceArrival(t: *const Toucher, fallback: u64) u64 {
+            return if (std.time.Instant.now()) |now| now.since(t.arrived) else |_| fallback;
         }
     };
 
-    /// Start touching `task` on a thread, when auto_touch is on; null
-    /// otherwise, or when the thread can't start.
-    fn startTouching(self: *Self, toucher: *Toucher, task: *const TaskAssignment, touch_conn: *?Client) ?std.Thread {
+    /// Start touching `task`, which arrived at `arrived`, on a thread, when
+    /// auto_touch is on; null otherwise, or when the thread can't start.
+    fn startTouching(self: *Self, toucher: *Toucher, task: *const TaskAssignment, arrived: std.time.Instant, touch_conn: *?Client) ?std.Thread {
         if (!self.config.auto_touch) return null;
-        toucher.* = .{ .worker = self, .task = task, .client = touch_conn, .interval_ns = touchInterval(task.lease_ms) *| std.time.ns_per_ms };
+        toucher.* = .{ .worker = self, .task = task, .client = touch_conn, .arrived = arrived, .interval_ns = touchInterval(task.lease_ms) *| std.time.ns_per_ms };
         return std.Thread.spawn(.{}, Toucher.run, .{toucher}) catch |err| {
             std.log.err("[flo-worker] Can't start touching run {s}: {}", .{ task.run_id, err });
             return null;
@@ -851,7 +888,7 @@ pub const ActionWorker = struct {
     /// A task's result, as the handler decided it.
     const Report = union(enum) {
         complete: struct { data: []const u8, outcome: []const u8 = "" },
-        fail: struct { message: []const u8, retry: bool = false },
+        fail: struct { message: []const u8, retry: bool = true, abandoned: bool = false },
     };
 
     /// Deliver a task's result. A send lost to a dropped connection or a
@@ -875,23 +912,24 @@ pub const ActionWorker = struct {
                 .fail => |f| actions.fail(self.worker_id, task.delivery(), f.message, .{
                     .namespace = self.config.namespace,
                     .retry = f.retry,
+                    .abandoned = f.abandoned,
                 }),
             };
             const err = if (result) return true else |e| e;
             if (!client_mod.isConnectionError(err)) {
-                types.logDropped("[flo-worker] {s} for run {s} refused: {}; dropped", .{ kind, task.run_id, err });
+                types.logWorkerError("[flo-worker] {s} for run {s} refused: {}; dropped", .{ kind, task.run_id, err });
                 return false;
             }
             if (sends >= max_result_sends) {
-                types.logDropped("[flo-worker] {s} for run {s} not delivered after {d} sends: {}; dropped", .{ kind, task.run_id, sends, err });
+                types.logWorkerError("[flo-worker] {s} for run {s} not delivered after {d} sends: {}; dropped", .{ kind, task.run_id, sends, err });
                 return false;
             }
             conn.disconnect();
             self.reconnectForResult(conn, register) catch |rerr| {
                 if (!@atomicLoad(bool, &self.running, .monotonic)) {
-                    types.logDropped("[flo-worker] {s} for run {s} not delivered: worker stopping and reconnect failed: {}; dropped", .{ kind, task.run_id, rerr });
+                    types.logWorkerError("[flo-worker] {s} for run {s} not delivered: worker stopping and reconnect failed: {}; dropped", .{ kind, task.run_id, rerr });
                 } else {
-                    types.logDropped("[flo-worker] {s} for run {s} not delivered: reconnect failed: {}; dropped", .{ kind, task.run_id, rerr });
+                    types.logWorkerError("[flo-worker] {s} for run {s} not delivered: reconnect failed: {}; dropped", .{ kind, task.run_id, rerr });
                 }
                 return false;
             };
@@ -905,6 +943,16 @@ const stopping_reconnect_ms = 2_000;
 
 /// Sends of one result, the first included, before it is dropped.
 const max_result_sends = 3;
+
+/// Write a fresh await request key into `buf`: 32 hex characters. Returns
+/// its length.
+fn newRequestKey(buf: *[32]u8) usize {
+    var raw: [16]u8 = undefined;
+    std.crypto.random.bytes(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    buf.* = hex;
+    return hex.len;
+}
 
 /// Generate a random worker ID.
 fn generateWorkerId(allocator: Allocator) ![]u8 {
@@ -1084,6 +1132,35 @@ fn pollOnce(srv: *ScriptServer, w: *ActionWorker, timeout_ms: u32) !void {
     try w.pollAndExecute();
 }
 
+test "ActionWorker fails a run whose handler errs with retry, and only error.NonRetryable without" {
+    const failing = struct {
+        fn boom(_: *ActionContext) anyerror!ActionHandlerResult {
+            return error.Boom;
+        }
+        fn final(_: *ActionContext) anyerror!ActionHandlerResult {
+            return error.NonRetryable;
+        }
+    };
+    inline for (.{ .{ failing.boom, "error.Boom", 1 }, .{ failing.final, "error.NonRetryable", 0 } }) |c| {
+        var srv = try ScriptServer.listen();
+        srv.rules = &.{.{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = test_task } } }};
+        try srv.start();
+        defer srv.deinit();
+        var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100, .concurrency = 1 });
+        defer w.deinit();
+        try w.registerAction("job", c[0], .{});
+        w.running = true;
+        try w.pollAndExecute();
+        try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_fail));
+        try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_complete));
+        // The body ends [1][retry][1][abandoned][1][delay_ms:u64][1][len:u16][error].
+        const req = srv.requestOf(.action_fail, 0);
+        try std.testing.expect(std.mem.endsWith(u8, req, c[1]));
+        const at = req.len - c[1].len - 15;
+        try std.testing.expectEqualSlices(u8, &.{ 1, c[2], 1, 0 }, req[at - 1 ..][0..4]);
+    }
+}
+
 test "ActionWorker resends a complete lost with its connection, unchanged, and never fails the task" {
     var srv = try ScriptServer.listen();
     srv.rules = &.{
@@ -1170,7 +1247,7 @@ fn executeWhileStopping(srv: *ScriptServer, w: *ActionWorker) !void {
     var task = (try actions.awaitTask(w.worker_id, w.action_names.items, .{ .block_ms = 100 })).?;
     defer task.deinit();
     w.stop();
-    w.executeTask(&task, &w.client, true, &w.touch_client);
+    w.executeTask(&task, try std.time.Instant.now(), &w.client, true, &w.touch_client);
 }
 
 test "ActionWorker still resends a lost result while stopping" {
@@ -1272,13 +1349,40 @@ test "ActionWorker refuses an action owner too long to register" {
     try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_register));
 }
 
-test "ActionWorker touches every third of a run's lease, at most every 100 ms" {
+test "ActionWorker touches every sixth of a run's lease, at most every 100 ms" {
     for ([_][2]u64{
         .{ 300, 100 },
-        .{ 30_000, 10_000 },
+        .{ 30_000, 5_000 },
         .{ 60, 100 },
-        .{ 12 * 3_600_000, 4 * 3_600_000 },
+        .{ 12 * 3_600_000, 2 * 3_600_000 },
     }) |c| try std.testing.expectEqual(c[1], ActionWorker.touchInterval(c[0]));
+}
+
+test "ActionWorker sends a refused await again with its request key, and a new key once one is answered" {
+    var srv = try ScriptServer.listen();
+    // unavailable, leader_unknown, ran unknown: the client doesn't retry it.
+    srv.rules = &.{.{ .op = .action_await, .nth = 0, .action = .{ .reply = .{ .status = 12, .body = "\x05\x00\x02may have been given" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    var waited: u32 = 0;
+    while (srv.countOf(.action_await) < 3 and waited < 5000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+
+    // Each await body ends with its request key: present, 32 bytes.
+    var keys: [3][]const u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        const req = srv.requestOf(.action_await, @intCast(i));
+        try std.testing.expectEqualSlices(u8, "\x01\x20", req[req.len - 34 ..][0..2]);
+        k.* = req[req.len - 32 ..];
+    }
+    try std.testing.expectEqualStrings(keys[0], keys[1]);
+    try std.testing.expect(!std.mem.eql(u8, keys[1], keys[2]));
 }
 
 test "ActionWorker with auto_touch touches a running task on its own connection, and stops before the complete" {

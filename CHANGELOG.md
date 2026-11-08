@@ -14,11 +14,20 @@
   `FloError.StaleReport` (conflict, reason `stale_report`); a resend of one
   that already applied answers ok.
 - **Breaking:** `touch` takes no extend length and returns the lease's
-  expiry; `ctx.touch()` likewise. `auto_touch` paces itself on the task's
-  lease. `fail` takes `abandoned` and `delay_ms`, and `retry` defaults to
-  true, as on the server. `complete`'s outcome defaults to `""` (success).
+  expiry; `ctx.touch()` likewise. `auto_touch` touches every sixth of the
+  task's own lease (at least 100 ms apart), counted from when it arrived. A
+  run is held at most 12 h from its delivery, whatever the touches. `fail`
+  takes `abandoned` and `delay_ms`, and `retry` defaults to true, as on the
+  server. `complete`'s outcome defaults to `""` (success).
 - `awaitTask` takes a `request_key`: a retry with the same key gets the
-  delivery the first try got.
+  delivery the first try got. `ActionWorker` sends one with every poll and
+  keeps it until an await is answered, so a refused or lost poll is sent
+  again with it.
+- **Breaking:** `ActionRegisterOptions.timeout_ms` defaults to 0, the
+  server's 300 s lease, not 30 s.
+- A handler error fails the run with retry; only `error.NonRetryable` fails
+  it for good. A task for an action the worker has no handler for is handed
+  back (abandoned). `stop()` lets running handlers finish and report.
 - `Actions.info` reads an action's definition, run counts and latency;
   `getStatus` carries a completed run's `outcome`.
 - **Breaking:** `listActions` returns each action's definition (`actions`:

@@ -356,9 +356,10 @@ pub const Actions = struct {
     }
 
     /// Keep a task: with half its lease or less left, the lease runs a full
-    /// lease from now (up to 12 h from its delivery); with more left,
-    /// nothing changes. Touch at least every half lease. Returns when the
-    /// lease runs out without another touch, in Unix milliseconds. A touch
+    /// lease from now; with more left, nothing changes. Touch at least
+    /// every half lease. Whatever the touches, a run is held at most 12 h
+    /// from its delivery, then taken back. Returns when the lease runs out
+    /// without another touch, in Unix milliseconds. A touch
     /// for a delivery that has moved on is `FloError.StaleReport`.
     pub fn touch(
         self: *Self,
