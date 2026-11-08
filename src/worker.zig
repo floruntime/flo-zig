@@ -748,9 +748,10 @@ pub const ActionWorker = struct {
 
         // Get handler
         const handler = self.handlers.get(task.action) orelse {
-            // Handed back untried, for a worker that runs it.
-            std.log.err("[flo-worker] No handler for action: {s}", .{task.action});
-            _ = self.report(conn, register, task, .{ .fail = .{ .message = "No handler registered", .abandoned = true } });
+            // A failure, with retry: handed back as abandoned it would count
+            // no attempt and be ready again at once, to come back here.
+            types.logWorkerError("[flo-worker] No handler for action: {s}", .{task.action});
+            _ = self.report(conn, register, task, .{ .fail = .{ .message = "No handler registered" } });
             return;
         };
 
@@ -1153,12 +1154,67 @@ test "ActionWorker fails a run whose handler errs with retry, and only error.Non
         try w.pollAndExecute();
         try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_fail));
         try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_complete));
-        // The body ends [1][retry][1][abandoned][1][delay_ms:u64][1][len:u16][error].
-        const req = srv.requestOf(.action_fail, 0);
-        try std.testing.expect(std.mem.endsWith(u8, req, c[1]));
-        const at = req.len - c[1].len - 15;
-        try std.testing.expectEqualSlices(u8, &.{ 1, c[2], 1, 0 }, req[at - 1 ..][0..4]);
+        try std.testing.expectEqual([2]u8{ c[2], 0 }, try failFlags(srv.requestOf(.action_fail, 0), c[1]));
     }
+}
+
+/// The fail a worker sent: its retry and abandoned flags, from the body's
+/// end, [1][retry][1][abandoned][1][delay_ms:u64][1][len:u16][error].
+fn failFlags(req: []const u8, message: []const u8) ![2]u8 {
+    try std.testing.expect(std.mem.endsWith(u8, req, message));
+    const at = req.len - message.len - 15;
+    try std.testing.expectEqual(@as(u8, 1), req[at - 1]);
+    try std.testing.expectEqual(@as(u8, 1), req[at + 1]);
+    return .{ req[at], req[at + 2] };
+}
+
+test "ActionWorker fails a task it has no handler for with retry, not handed back" {
+    var srv = try ScriptServer.listen();
+    try srv.start();
+    defer srv.deinit();
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100, .concurrency = 1 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    w.running = true;
+    var task: TaskAssignment = .{ .run_id = "t1", .namespace = "default", .deliveries = 1, .term = 1, .index = 7, .action = "other", .created_at = 0, .attempt = 1, .lease_ms = 300, .payload = "", .allocator = std.testing.allocator };
+    w.executeTask(&task, try std.time.Instant.now(), &w.client, true, &w.touch_client);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_fail));
+    // retry, not abandoned: an abandoned run counts no attempt and is ready again at once.
+    try std.testing.expectEqual([2]u8{ 1, 0 }, try failFlags(srv.requestOf(.action_fail, 0), "No handler registered"));
+}
+
+test "ActionWorker registers an action with timeout 0 by default, for the server's lease" {
+    const value_of = @import("test_server.zig").valueOf;
+    var srv = try ScriptServer.listen();
+    try srv.start();
+    defer srv.deinit();
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    // [type:u8][timeout_ms:u32][max_retries:u32]...
+    const value = value_of(srv.requestOf(.action_register, 0));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, value[1..5]);
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, value[5..9], .little));
+}
+
+test "ActionWorker counts touches from when the task arrived, not from when the handler started" {
+    var srv = try ScriptServer.listen();
+    srv.concurrent = true;
+    try srv.start();
+    defer srv.deinit();
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100, .concurrency = 1, .auto_touch = true, .retry = .{ .max_attempts = 1 } });
+    defer w.deinit();
+    try w.registerAction("job", touch_test.sleeps(60), .{});
+    w.running = true;
+    // A 300 ms lease touches every 100 ms. The task arrived 90 ms ago, so
+    // its first touch falls due 10 ms into a 60 ms handler; counted from
+    // the handler's start it wouldn't come before the handler ends.
+    var task: TaskAssignment = .{ .run_id = "t1", .namespace = "default", .deliveries = 1, .term = 1, .index = 7, .action = "job", .created_at = 0, .attempt = 1, .lease_ms = 300, .payload = "", .allocator = std.testing.allocator };
+    const arrived = try std.time.Instant.now();
+    std.Thread.sleep(90 * std.time.ns_per_ms);
+    w.executeTask(&task, arrived, &w.client, true, &w.touch_client);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_touch));
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_complete));
 }
 
 test "ActionWorker resends a complete lost with its connection, unchanged, and never fails the task" {

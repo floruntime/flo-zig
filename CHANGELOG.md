@@ -26,8 +26,8 @@
 - **Breaking:** `ActionRegisterOptions.timeout_ms` defaults to 0, the
   server's 300 s lease, not 30 s.
 - A handler error fails the run with retry; only `error.NonRetryable` fails
-  it for good. A task for an action the worker has no handler for is handed
-  back (abandoned). `stop()` lets running handlers finish and report.
+  it for good. A task for an action the worker has no handler for fails
+  with retry too. `stop()` lets running handlers finish and report.
 - `Actions.info` reads an action's definition, run counts and latency;
   `getStatus` carries a completed run's `outcome`.
 - **Breaking:** `listActions` returns each action's definition (`actions`:
