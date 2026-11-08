@@ -149,8 +149,9 @@ pub const OkServer = struct {
 
 /// A loopback server for worker tests that serves one connection after
 /// another and answers each request as the first matching `Rule` says
-/// (empty OK by default). It keeps every request's op and raw bytes, header
-/// included.
+/// (OK by default). An OK without a body is the op's empty answer: no task
+/// for an action await, an expiry of 0 for a touch, and nothing for the
+/// rest. It keeps every request's op and raw bytes, header included.
 pub const ScriptServer = struct {
     pub const Action = union(enum) {
         reply: Reply,
@@ -306,13 +307,23 @@ pub const ScriptServer = struct {
                         while ((conn.stream.read(&buf) catch 0) > 0) {}
                         break;
                     },
-                    .reply => |r| {
+                    .reply => |given| {
+                        var r = given;
+                        if (r.status == 0 and r.body.len == 0) r.body = emptyAnswer(req.op);
                         if (r.delay_ms > 0) std.Thread.sleep(@as(u64, r.delay_ms) * std.time.ns_per_ms);
                         reply(conn.stream, request_id, r) catch break;
                     },
                 }
             }
         }
+    }
+
+    pub fn emptyAnswer(op: types.OpCode) []const u8 {
+        return switch (op) {
+            .action_await => "\x00",
+            .action_touch => "\x00" ** 8,
+            else => "",
+        };
     }
 
     fn reply(stream: std.net.Stream, request_id: u64, r: Reply) !void {

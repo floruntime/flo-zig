@@ -1,8 +1,8 @@
 //! A loopback server for worker tests. It answers every request with an empty
-//! OK, except that it never answers the first `poll_op` (it waits for the
-//! client to hang up instead), answers the next one with `body`, and refuses
-//! a `poll_op` on a connection that has not sent `join_op`. It serves two
-//! connections, then stops.
+//! OK (a later `poll_op` with `empty_poll`), except that it never answers the
+//! first `poll_op` (it waits for the client to hang up instead), answers the
+//! next one with `body`, and refuses a `poll_op` on a connection that has not
+//! sent `join_op`. It serves two connections, then stops.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -13,6 +13,8 @@ pub const StallServer = struct {
     poll_op: types.OpCode,
     done_op: types.OpCode,
     body: []const u8,
+    /// A poll's answer when it has nothing.
+    empty_poll: []const u8 = "",
     thread: std.Thread = undefined,
     connections: std.atomic.Value(u32) = .init(0),
     /// Requests with `done_op` received.
@@ -92,7 +94,10 @@ pub const StallServer = struct {
                         while ((conn.stream.read(&buf) catch 0) > 0) {}
                         break;
                     }
-                    if (polls == 2) data = self.body else std.Thread.sleep(20 * std.time.ns_per_ms);
+                    if (polls == 2) data = self.body else {
+                        data = self.empty_poll;
+                        std.Thread.sleep(20 * std.time.ns_per_ms);
+                    }
                 }
                 if (op == self.done_op) _ = self.done.fetchAdd(1, .monotonic);
                 reply(conn.stream, request_id, status, data) catch break;

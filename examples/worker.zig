@@ -52,7 +52,7 @@ fn processOrder(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
     });
 
     // Simulate a long-running order processing task
-    // For long tasks, periodically call Touch to extend the lease
+    // For long tasks, touch at least every half lease to keep it
     for (req.items, 0..) |item, i| {
         std.log.info("  Processing item {d}/{d}: {s} (qty: {d})", .{
             i + 1,
@@ -64,13 +64,13 @@ fn processOrder(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
         // Simulate work for each item
         std.Thread.sleep(2 * std.time.ns_per_s);
 
-        // Extend the lease every few items to prevent timeout
-        // This is critical for long-running tasks
+        // Keep the lease every few items, at least every half lease, so
+        // the run isn't taken back while it's still being worked on
         if ((i + 1) % 3 == 0) {
-            ctx.touch(30000) catch |err| {
-                std.log.warn("Warning: failed to extend lease: {}", .{err});
+            _ = ctx.touch() catch |err| {
+                std.log.warn("Warning: failed to keep the lease: {}", .{err});
             };
-            std.log.info("  Extended lease for order {s}", .{req.order_id});
+            std.log.info("  Touched order {s}", .{req.order_id});
         }
     }
 
@@ -78,7 +78,7 @@ fn processOrder(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
     const result = OrderResult{
         .order_id = req.order_id,
         .status = "processed",
-        .processed_by = ctx.task_id,
+        .processed_by = ctx.run_id,
     };
 
     return .{ .bytes = try ctx.toBytes(result) };
@@ -119,11 +119,11 @@ fn generateReport(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
     defer parsed.deinit();
     const req = parsed.value;
 
-    std.log.info("Generating {s} report for {s} (attempt {d}, task {s})", .{
+    std.log.info("Generating {s} report for {s} (attempt {d}, run {s})", .{
         req.type,
         req.date_range,
         ctx.attempt,
-        ctx.task_id,
+        ctx.run_id,
     });
 
     // Simulate report generation with progress
@@ -133,9 +133,9 @@ fn generateReport(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
         std.log.info("  Report generation step {d}/{d}", .{ step + 1, total_steps });
         std.Thread.sleep(1 * std.time.ns_per_s);
 
-        // Extend lease periodically
+        // Keep the lease periodically
         if (step == 2) {
-            try ctx.touch(30000);
+            _ = try ctx.touch();
         }
     }
 
@@ -153,7 +153,7 @@ fn generateReport(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
 fn healthCheck(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
     const result = .{
         .status = "healthy",
-        .worker_id = ctx.task_id,
+        .worker_id = ctx.run_id,
         .timestamp = ctx.created_at,
     };
 

@@ -637,15 +637,15 @@ fn extractYamlField(data: []const u8, field: []const u8) ?[]const u8 {
 }
 
 /// workflow.list_definitions' answer:
-///   [count:u32]([name_len:u16][name][version_len:u16][version][created_at:i64])*
+///   [count:u32]([name_len:u16][name][version_len:u16][version][created_at:i64][enabled:u8])*
 ///   [has_more:u8][cursor_len:u16][cursor]
 fn parseDefinitionList(allocator: Allocator, data: []const u8) !types.WorkflowListDefinitionsResult {
     if (data.len < 4) return error.UnexpectedEndOfData;
     const count = std.mem.readInt(u32, data[0..4], .little);
     var pos: usize = 4;
-    // Each entry is at least its two lengths and created_at: a count the data
-    // can't hold is refused before it sizes an allocation.
-    if (count > (data.len - pos) / (2 + 2 + 8)) return error.UnexpectedEndOfData;
+    // Each entry is at least its two lengths, created_at and enabled: a
+    // count the data can't hold is refused before it sizes an allocation.
+    if (count > (data.len - pos) / (2 + 2 + 8 + 1)) return error.UnexpectedEndOfData;
 
     const entries = try allocator.alloc(types.WorkflowDefinitionEntry, count);
     var i: u32 = 0;
@@ -660,6 +660,13 @@ fn parseDefinitionList(allocator: Allocator, data: []const u8) !types.WorkflowLi
         if (pos + 8 > data.len) return error.UnexpectedEndOfData;
         const created_at = std.mem.readInt(i64, data[pos..][0..8], .little);
         pos += 8;
+        if (pos + 1 > data.len) return error.UnexpectedEndOfData;
+        const enabled = switch (data[pos]) {
+            0 => false,
+            1 => true,
+            else => return error.UnexpectedEndOfData,
+        };
+        pos += 1;
 
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
@@ -667,6 +674,7 @@ fn parseDefinitionList(allocator: Allocator, data: []const u8) !types.WorkflowLi
             .name = name_copy,
             .version = try allocator.dupe(u8, version),
             .created_at = created_at,
+            .enabled = enabled,
         };
     }
 
@@ -760,10 +768,11 @@ test "status short of memory says so, not that the answer is bad" {
     try std.testing.expectError(FloError.OutOfMemory, workflow.status(failing.allocator(), "r", .{}));
 }
 
-// Two definitions: "a" v"1" at 5, "bc" v"" at -1; has_more=1, cursor "\x01\x00z".
+// Two definitions: "a" v"1" at 5, enabled; "bc" v"" at -1, disabled;
+// has_more=1, cursor "\x01\x00z".
 const definitions_page = "\x02\x00\x00\x00" ++
-    "\x01\x00a" ++ "\x01\x001" ++ "\x05\x00\x00\x00\x00\x00\x00\x00" ++
-    "\x02\x00bc" ++ "\x00\x00" ++ "\xff\xff\xff\xff\xff\xff\xff\xff" ++
+    "\x01\x00a" ++ "\x01\x001" ++ "\x05\x00\x00\x00\x00\x00\x00\x00" ++ "\x01" ++
+    "\x02\x00bc" ++ "\x00\x00" ++ "\xff\xff\xff\xff\xff\xff\xff\xff" ++ "\x00" ++
     "\x01" ++ "\x03\x00" ++ "\x01\x00z";
 
 test "a definitions page decodes per the server's layout" {
@@ -773,9 +782,11 @@ test "a definitions page decodes per the server's layout" {
     try std.testing.expectEqualStrings("a", page.definitions[0].name);
     try std.testing.expectEqualStrings("1", page.definitions[0].version);
     try std.testing.expectEqual(@as(i64, 5), page.definitions[0].created_at);
+    try std.testing.expect(page.definitions[0].enabled);
     try std.testing.expectEqualStrings("bc", page.definitions[1].name);
     try std.testing.expectEqualStrings("", page.definitions[1].version);
     try std.testing.expectEqual(@as(i64, -1), page.definitions[1].created_at);
+    try std.testing.expect(!page.definitions[1].enabled);
     try std.testing.expect(page.has_more);
     try std.testing.expectEqualSlices(u8, "\x01\x00z", page.cursor.?);
 }
@@ -807,7 +818,7 @@ test "listDefinitions pages on past a short page until has_more is clear, sendin
         // Two definitions, fewer than the limit, yet has_more=1.
         .{ .status = 0, .body = definitions_page },
         // The last page: one definition, nothing more.
-        .{ .status = 0, .body = "\x01\x00\x00\x00" ++ "\x01\x00d" ++ "\x01\x002" ++ "\x09\x00\x00\x00\x00\x00\x00\x00" ++ "\x00\x00\x00" },
+        .{ .status = 0, .body = "\x01\x00\x00\x00" ++ "\x01\x00d" ++ "\x01\x002" ++ "\x09\x00\x00\x00\x00\x00\x00\x00" ++ "\x01" ++ "\x00\x00\x00" },
     };
     try srv.start();
     defer srv.deinit();

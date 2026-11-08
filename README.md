@@ -227,6 +227,13 @@ try txn.delete("account:42:hold", .{ .cas_version = 3 });
 const committed = try txn.commit(); // commit_index, op_count
 ```
 
+A condition, `cas_version` or `incr` inside a transaction is decided at commit,
+not at the op: a commit that one of them refuses returns `error.Conflict` (or
+`error.BadRequest` for an incr that can't apply) and applies nothing. Outside a
+transaction a refused condition or `cas_version` still costs a commit, since
+it's decided in log order as the write applies. A transaction holds at most 64
+ops and 256 KiB by default; both are operator settings.
+
 ### Queue Operations
 
 ```zig
@@ -255,11 +262,18 @@ defer result.deinit();
 try queue.ack("queue-name", &seqs, .{});
 try queue.nack("queue-name", &seqs, .{});
 
+// The next ready messages, 1 to 100, in dequeue order, without taking them;
+// each shows up to 4 KiB of its payload (`size` is its whole length)
+var next = try queue.peek("queue-name", 20, .{});
+defer next.deinit();
+
 // The DLQ isn't reached in normal use, because dequeued messages are never
-// failed back. dlqList returns a count summary; dlqRequeue is refused by the
-// server as not implemented.
-var dlq = try queue.dlqList("queue-name", .{});
+// failed back. dlqList pages it oldest first, up to 100 at a time: pass the
+// page's last_seq as `after` while has_more is set. dlqRequeue is refused by
+// the server as not implemented.
+var dlq = try queue.dlqList("queue-name", .{ .limit = 50 });
 defer dlq.deinit();
+std.debug.print("{d} dead letters\n", .{dlq.total});
 ```
 
 ### Stream Operations
@@ -342,6 +356,12 @@ for (records.records, 0..) |rec, i| {
     seqs[i] = rec.seq;
 }
 try stream.groupAck("events", "my-group", seqs[0..records.records.len], .{});
+
+// The stream's groups, and a group's members, as the leader sees them
+var groups = try stream.groupList("events", .{});
+defer groups.deinit();
+var members = try stream.groupMembers("events", "my-group", .{});
+defer members.deinit();
 ```
 
 ### Action Operations
@@ -350,15 +370,15 @@ Actions are task types that workers process. `Actions` is the low-level API; for
 handler-based worker that registers, awaits, and heartbeats for you, see `ActionWorker`.
 
 `ActionWorker.registerAction(name, handler, options)` registers the action with exactly
-`options` (`.{}`: the server's defaults, a 30 s timeout and 3 attempts). Registering
-replaces an action's settings, so workers that register one action with different options
-leave it with whichever registered last. A run whose handler goes past the action's
-`timeout_ms` without touching it is taken back and run again; `.auto_touch = true` in
-`WorkerConfig` touches each run every third of its timeout (at most an hour) from a thread
-on its own connection while the handler runs; that thread allocates, so the worker's
-allocator must then be thread-safe. It's off by default; without it, call `ctx.touch`
-from long handlers. An action's `owner` may be up to 1024 bytes here (the wire allows a
-u16 length).
+`options` (`.{}`: a 30 s timeout and 3 attempts). Registering replaces an action's
+settings, so workers that register one action with different options leave it with
+whichever registered last. The timeout is the lease a worker holds each run for: the
+server takes 5000 to 43200000 ms, and 0 for its default, 300000. A run whose handler goes
+past its lease without touching it is taken back and run again; `.auto_touch = true` in
+`WorkerConfig` touches each run every third of its lease from a thread on its own
+connection while the handler runs; that thread allocates, so the worker's allocator must
+then be thread-safe. It's off by default; without it, call `ctx.touch()` from long
+handlers, at least every half lease. An action's `owner` is at most 256 bytes.
 
 `WorkerConfig.concurrency` is how many tasks an `ActionWorker` runs at once. The default,
 1, runs them one after another on the polling loop. Above 1, each runs on a thread and a
@@ -389,6 +409,13 @@ var status = try actions.getStatus(invoked.run_id, .{});
 defer status.deinit();
 std.debug.print("Status: {s}, attempt {d}\n", .{ @tagName(status.status), status.attempt });
 if (status.output) |out| std.debug.print("Output: {s}\n", .{out});
+// The outcome a completed run's worker named; null for success
+if (status.outcome) |o| std.debug.print("Outcome: {s}\n", .{o});
+
+// An action's definition, its runs by status and how long completed ones took
+var info = try actions.info("send-email", .{});
+defer info.deinit();
+std.debug.print("{d} ready, lease {d} ms\n", .{ info.ready, info.timeout_ms });
 ```
 
 Invoke has no priority, delay or idempotency key; see
@@ -404,32 +431,37 @@ try actions.register("worker-1", &[_][]const u8{ "send-email", "process-order" }
 
 // Main worker loop
 while (true) {
-    // Await task (blocks until task available or timeout)
+    // Await task (blocks until task available or timeout). A retry with the
+    // same request_key gets the task the first try got.
     var task = (try actions.awaitTask("worker-1", &[_][]const u8{"send-email"}, .{
         .block_ms = 30000, // Wait up to 30s (0 = don't wait, max 300000)
     })) orelse continue;
     defer task.deinit();
 
-    std.debug.print("Got task: {s}\n", .{task.task_id});
+    std.debug.print("Got run {s}, delivery {d}\n", .{ task.run_id, task.deliveries });
 
     // Process the task...
     const result = processTask(task.payload);
 
+    // Each report echoes the task's delivery. One for a delivery that has
+    // moved on (its lease ran out, it was delivered again) is
+    // error.StaleReport; a resend of one that already applied is ok.
     if (result.success) {
-        // Complete successfully
-        try actions.complete("worker-1", task.task_type, task.task_id, result.output, .{});
+        try actions.complete("worker-1", task.delivery(), result.output, .{});
     } else {
-        // Fail with retry
-        try actions.fail("worker-1", task.task_type, task.task_id, result.error_msg, .{ .retry = true });
+        // Ready again after delay_ms while attempts are left; .abandoned
+        // hands it back without counting a failure
+        try actions.fail("worker-1", task.delivery(), result.error_msg, .{ .delay_ms = 1000 });
     }
 }
 ```
 
-#### Extending Task Lease
+#### Keeping a Task's Lease
 
 ```zig
-// For long-running tasks, extend the lease to prevent timeout
-try actions.touch("worker-1", task.task_type, task.task_id, .{ .extend_ms = 30000 });
+// With half the lease or less left, a touch renews it for a full lease;
+// with more left it changes nothing. Touch at least every half lease.
+const expires_at_ms = try actions.touch("worker-1", task.delivery(), .{});
 ```
 
 #### Inspecting Workers
@@ -515,7 +547,11 @@ defer status.deinit();
 std.debug.print("Job {s}: {s} (processed {d} records)\n", .{
     status.name, status.status, status.records_processed,
 });
-if (status.failure_reason) |reason| std.debug.print("failed: {s}\n", .{reason});
+// Why a failed job failed, or why this node holds a running one
+if (status.reason) |reason| std.debug.print("{s}\n", .{reason});
+
+// A stopped, cancelled or failed job keeps its slot until it is removed
+try processing.remove(job_id, .{});
 
 // List all processing jobs, a page at a time. A page can be short while
 // more remain: stop on has_more, not on the page's size.
@@ -558,6 +594,7 @@ All operations return `flo.FloError` which includes:
 - `InternalError` - Internal server error (not retryable: the write may have committed)
 - `OutcomePending` - The write committed but hasn't applied, because its shard halted (never retried)
 - `StaleNotFound` - `get` or `jsonGet` on a halted shard: the key is missing as of the halt, which isn't the same as missing
+- `StaleReport` - An action complete, fail or touch for a delivery that has moved on (never resent)
 - `UnexpectedResponse` - Unexpected response format
 - `ServerError` - Generic server error, including status codes this SDK doesn't know
 
@@ -616,7 +653,8 @@ for the connection each worker opens.
 
 A worker whose complete, fail, ack or nack is lost with its connection (or
 times out) reconnects and sends the same result again, up to three sends in
-all; a refusal is not resent. Delivery is at-least-once: a handler may see a
+all; a resent complete or fail that already applied answers ok, and a refusal
+is not resent. Delivery is at-least-once: a handler may see a
 task or record again, so make handlers safe to repeat.
 
 ```zig

@@ -93,6 +93,9 @@ pub const StreamAppendResult = types.StreamAppendResult;
 pub const StreamInfo = types.StreamInfo;
 pub const StorageTier = types.StorageTier;
 pub const TaskAssignment = types.TaskAssignment;
+pub const Delivery = types.Delivery;
+pub const ActionInfo = types.ActionInfo;
+pub const ActionListEntry = types.ActionListEntry;
 pub const ActionRunStatus = types.ActionRunStatus;
 pub const ActionInvokeResult = types.ActionInvokeResult;
 pub const ActionType = types.ActionType;
@@ -127,6 +130,11 @@ pub const EnqueueOptions = types.EnqueueOptions;
 pub const DequeueOptions = types.DequeueOptions;
 pub const NackOptions = types.NackOptions;
 pub const DlqListOptions = types.DlqListOptions;
+pub const DlqPage = types.DlqPage;
+pub const DeadLetter = types.DeadLetter;
+pub const PeekOptions = types.PeekOptions;
+pub const PeekResult = types.PeekResult;
+pub const PeekedMessage = types.PeekedMessage;
 
 // Option types - Stream
 pub const StreamID = types.StreamID;
@@ -140,6 +148,12 @@ pub const StreamGroupJoinOptions = types.StreamGroupJoinOptions;
 pub const StreamGroupReadOptions = types.StreamGroupReadOptions;
 pub const StreamGroupAckOptions = types.StreamGroupAckOptions;
 pub const StreamGroupNackOptions = types.StreamGroupNackOptions;
+pub const StreamGroupListOptions = types.StreamGroupListOptions;
+pub const StreamGroupList = types.StreamGroupList;
+pub const StreamGroupSummary = types.StreamGroupSummary;
+pub const StreamGroupMembers = types.StreamGroupMembers;
+pub const StreamGroupMember = types.StreamGroupMember;
+pub const StreamGroupMemberState = types.StreamGroupMemberState;
 
 // Option types - Worker/Action
 pub const ActionRegisterOptions = types.ActionRegisterOptions;
@@ -179,6 +193,7 @@ pub const ProcessingStatusOptions = types.ProcessingStatusOptions;
 pub const ProcessingListOptions = types.ProcessingListOptions;
 pub const ProcessingStopOptions = types.ProcessingStopOptions;
 pub const ProcessingCancelOptions = types.ProcessingCancelOptions;
+pub const ProcessingRemoveOptions = types.ProcessingRemoveOptions;
 pub const ProcessingSyncOptions = types.ProcessingSyncOptions;
 
 // Protocol constants
