@@ -512,6 +512,32 @@ pub const Stream = struct {
             return response.status.toError();
         }
     }
+
+    /// The stream's consumer groups: members, pending entries, settings and
+    /// the last record delivered. Answered by the leader.
+    /// **Caller owns the returned list and must call `list.deinit()`.**
+    pub fn groupList(self: *Stream, stream_name: []const u8, options: types.StreamGroupListOptions) FloError!types.StreamGroupList {
+        var response = try self.client.sendRequest(.stream_group_list, self.client.getNamespace(options.namespace), stream_name, "", "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeGroupList(self.client.allocator, response.data);
+    }
+
+    /// A consumer group's members: each one's state, pending entries, and
+    /// when it joined and was last delivered to. Answered by the leader; a
+    /// group the stream doesn't have is `FloError.NotFound`.
+    /// **Caller owns the returned list and must call `list.deinit()`.**
+    pub fn groupMembers(self: *Stream, stream_name: []const u8, group: []const u8, options: types.StreamGroupListOptions) FloError!types.StreamGroupMembers {
+        if (group.len > max_group_name) return FloError.ValueTooLarge;
+        // A table op: the body is the group, u16-length-prefixed.
+        var body: [2 + max_group_name]u8 = undefined;
+        std.mem.writeInt(u16, body[0..2], @intCast(group.len), .little);
+        @memcpy(body[2..][0..group.len], group);
+        var response = try self.client.sendRequest(.stream_group_members, self.client.getNamespace(options.namespace), stream_name, body[0 .. 2 + group.len], "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeGroupMembers(self.client.allocator, response.data);
+    }
 };
 
 /// Parse stream read response
@@ -823,4 +849,162 @@ test "info of a stream the server doesn't know is not found, not an empty stream
     try std.testing.expectError(FloError.NotFound, stream.info("nope", .{}));
     try std.testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.stream_info)), srv.last_op);
     try std.testing.expectEqualStrings("nope", srv.lastKey());
+}
+
+const Reader = @import("kv.zig").Reader;
+
+/// The longest group name or member id.
+const max_group_name = 4096;
+/// The most groups one answer lists, and members.
+const max_groups = 256;
+const max_members = 1024;
+
+/// A group's smallest encoding: an empty name.
+const min_group = 2 + 4 + 8 + 8 + 4 + 1 + 8 + 8;
+
+/// stream.group.list's answer: groups (u16 count), each {name, members,
+/// pending, created_at_ms, ack_timeout_ms, max_deliver, last_delivered_ms,
+/// last_delivered_seq}, then more.
+fn decodeGroupList(allocator: std.mem.Allocator, data: []const u8) FloError!types.StreamGroupList {
+    var r: Reader = .{ .data = data };
+    const n = try r.int(u16);
+    if (n > max_groups or n > r.remaining() / min_group) return FloError.IncompleteResponse;
+    const groups = try allocator.alloc(types.StreamGroupSummary, n);
+    var got: usize = 0;
+    errdefer {
+        for (groups[0..got]) |g| allocator.free(g.name);
+        allocator.free(groups);
+    }
+    while (got < n) : (got += 1) {
+        const name = try r.lenBytes(u16);
+        if (name.len > max_group_name) return FloError.IncompleteResponse;
+        const members = try r.int(u32);
+        const pending = try r.int(u64);
+        const created_at_ms = try r.int(i64);
+        const ack_timeout_ms = try r.int(u32);
+        const max_deliver = try r.int(u8);
+        const last_delivered_ms = try r.int(u64);
+        const last_delivered_seq = try r.int(u64);
+        groups[got] = .{
+            .name = try allocator.dupe(u8, name),
+            .members = members,
+            .pending = pending,
+            .created_at_ms = created_at_ms,
+            .ack_timeout_ms = ack_timeout_ms,
+            .max_deliver = max_deliver,
+            .last_delivered_ms = last_delivered_ms,
+            .last_delivered_seq = last_delivered_seq,
+        };
+    }
+    const more = try r.boolean();
+    try r.end();
+    return .{ .groups = groups, .more = more, .allocator = allocator };
+}
+
+/// A member's smallest encoding: an empty id, never delivered to.
+const min_member = 2 + 1 + 4 + 8 + 1;
+
+/// stream.group.members' answer: members (u16 count), each {id, state,
+/// pending, joined_at_ms, last_active_ms?}, then more.
+fn decodeGroupMembers(allocator: std.mem.Allocator, data: []const u8) FloError!types.StreamGroupMembers {
+    var r: Reader = .{ .data = data };
+    const n = try r.int(u16);
+    if (n > max_members or n > r.remaining() / min_member) return FloError.IncompleteResponse;
+    const members = try allocator.alloc(types.StreamGroupMember, n);
+    var got: usize = 0;
+    errdefer {
+        for (members[0..got]) |m| allocator.free(m.id);
+        allocator.free(members);
+    }
+    while (got < n) : (got += 1) {
+        const id = try r.lenBytes(u16);
+        if (id.len > max_group_name) return FloError.IncompleteResponse;
+        const state = std.meta.intToEnum(types.StreamGroupMemberState, try r.int(u8)) catch return FloError.IncompleteResponse;
+        const pending = try r.int(u32);
+        const joined_at_ms = try r.int(i64);
+        const last_active_ms = try r.opt(i64);
+        members[got] = .{ .id = try allocator.dupe(u8, id), .state = state, .pending = pending, .joined_at_ms = joined_at_ms, .last_active_ms = last_active_ms };
+    }
+    const more = try r.boolean();
+    try r.end();
+    return .{ .members = members, .more = more, .allocator = allocator };
+}
+
+const le = std.mem.toBytes;
+
+/// Group "g": 2 members, 5 pending, created at 10, 30 s ack timeout, 4
+/// deliveries, last delivered at 20 as seq 9; no more.
+const test_group_list = le(@as(u16, 1)) ++ le(@as(u16, 1)) ++ "g" ++ le(@as(u32, 2)) ++ le(@as(u64, 5)) ++ le(@as(i64, 10)) ++
+    le(@as(u32, 30_000)) ++ "\x04" ++ le(@as(u64, 20)) ++ le(@as(u64, 9)) ++ "\x00";
+
+/// Member "c1", leaving, 3 pending, joined at 7, last delivered to at 8;
+/// member "c2", active, never delivered to; more.
+const test_group_members = le(@as(u16, 2)) ++
+    le(@as(u16, 2)) ++ "c1" ++ "\x01" ++ le(@as(u32, 3)) ++ le(@as(i64, 7)) ++ "\x01" ++ le(@as(i64, 8)) ++
+    le(@as(u16, 2)) ++ "c2" ++ "\x00" ++ le(@as(u32, 0)) ++ le(@as(i64, 7)) ++ "\x00" ++ "\x01";
+
+test "groupList and groupMembers are keyed by the stream and read every field" {
+    const test_server = @import("test_server.zig");
+    const a = std.testing.allocator;
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{ .{ .status = 0, .body = test_group_list }, .{ .status = 0, .body = test_group_members } };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    var groups = try stream.groupList("events", .{});
+    defer groups.deinit();
+    try std.testing.expectEqual(@as(u16, 0x15D), srv.last_op);
+    try std.testing.expectEqualStrings("events", srv.lastKey());
+    try std.testing.expectEqualStrings("", srv.lastBody());
+    try std.testing.expectEqual(@as(usize, 1), groups.groups.len);
+    const g = groups.groups[0];
+    try std.testing.expectEqualStrings("g", g.name);
+    try std.testing.expectEqual(@as(u32, 2), g.members);
+    try std.testing.expectEqual(@as(u64, 5), g.pending);
+    try std.testing.expectEqual(@as(u32, 30_000), g.ack_timeout_ms);
+    try std.testing.expectEqual(@as(u8, 4), g.max_deliver);
+    try std.testing.expectEqual(@as(u64, 9), g.last_delivered_seq);
+    try std.testing.expect(!groups.more);
+
+    var members = try stream.groupMembers("events", "g", .{});
+    defer members.deinit();
+    try std.testing.expectEqual(@as(u16, 0x15E), srv.last_op);
+    try std.testing.expectEqualSlices(u8, "\x01\x00g", srv.lastBody());
+    try std.testing.expectEqual(@as(usize, 2), members.members.len);
+    try std.testing.expectEqualStrings("c1", members.members[0].id);
+    try std.testing.expectEqual(types.StreamGroupMemberState.leaving, members.members[0].state);
+    try std.testing.expectEqual(@as(u32, 3), members.members[0].pending);
+    try std.testing.expectEqual(@as(?i64, 8), members.members[0].last_active_ms);
+    try std.testing.expectEqual(@as(?i64, null), members.members[1].last_active_ms);
+    try std.testing.expect(members.more);
+}
+
+test "group list and member answers cut anywhere, overlong or short of memory are refused and leak nothing" {
+    const a = std.testing.allocator;
+    const Run = struct {
+        fn list(al: std.mem.Allocator, d: []const u8) !void {
+            var l = try decodeGroupList(al, d);
+            l.deinit();
+        }
+        fn members(al: std.mem.Allocator, d: []const u8) !void {
+            var m = try decodeGroupMembers(al, d);
+            m.deinit();
+        }
+    };
+    const list: []const u8 = test_group_list;
+    const members: []const u8 = test_group_members;
+    for (0..list.len) |n| try std.testing.expectError(FloError.IncompleteResponse, Run.list(a, list[0..n]));
+    for (0..members.len) |n| try std.testing.expectError(FloError.IncompleteResponse, Run.members(a, members[0..n]));
+    try std.testing.expectError(FloError.IncompleteResponse, Run.list(a, test_group_list ++ "\x00"));
+    try std.testing.expectError(FloError.IncompleteResponse, Run.members(a, test_group_members ++ "\x00"));
+    // A member state this client doesn't know.
+    var unknown = test_group_members.*;
+    unknown[2 + 2 + 2] = 2;
+    try std.testing.expectError(FloError.IncompleteResponse, Run.members(a, &unknown));
+    try std.testing.checkAllAllocationFailures(a, Run.list, .{list});
+    try std.testing.checkAllAllocationFailures(a, Run.members, .{members});
 }

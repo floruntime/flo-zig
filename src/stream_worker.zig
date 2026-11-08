@@ -671,19 +671,19 @@ pub const StreamWorker = struct {
             };
             const err = if (result) return else |e| e;
             if (!client_mod.isConnectionError(err)) {
-                types.logDropped("[flo-stream-worker] {s} of record {} refused: {}; dropped", .{ @tagName(kind), id, err });
+                types.logWorkerError("[flo-stream-worker] {s} of record {} refused: {}; dropped", .{ @tagName(kind), id, err });
                 return;
             }
             if (sends >= max_result_sends) {
-                types.logDropped("[flo-stream-worker] {s} of record {} not delivered after {d} sends: {}; dropped", .{ @tagName(kind), id, sends, err });
+                types.logWorkerError("[flo-stream-worker] {s} of record {} not delivered after {d} sends: {}; dropped", .{ @tagName(kind), id, sends, err });
                 return;
             }
             conn.disconnect();
             self.reconnectForResult(conn, rejoin) catch |rerr| {
                 if (!@atomicLoad(bool, &self.running, .monotonic)) {
-                    types.logDropped("[flo-stream-worker] {s} of record {} not delivered: worker stopping and reconnect failed: {}; dropped", .{ @tagName(kind), id, rerr });
+                    types.logWorkerError("[flo-stream-worker] {s} of record {} not delivered: worker stopping and reconnect failed: {}; dropped", .{ @tagName(kind), id, rerr });
                 } else {
-                    types.logDropped("[flo-stream-worker] {s} of record {} not delivered: reconnect failed: {}; dropped", .{ @tagName(kind), id, rerr });
+                    types.logWorkerError("[flo-stream-worker] {s} of record {} not delivered: reconnect failed: {}; dropped", .{ @tagName(kind), id, rerr });
                 }
                 return;
             };

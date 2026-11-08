@@ -70,7 +70,7 @@ test "live: the server speaks this SDK's protocol and table" {
     const run = try std.process.Child.run(.{ .allocator = testing.allocator, .argv = &.{ binary, "version", "--verbose" }, .env_map = &env_map });
     defer testing.allocator.free(run.stdout);
     defer testing.allocator.free(run.stderr);
-    // "... (protocol 3, table 0xc751512225a42d04; ..."
+    // "... (protocol 3, table 0x7eb599c24442118b; ..."
     const p = std.mem.indexOf(u8, run.stdout, "protocol ") orelse return error.NoProtocol;
     const t = std.mem.indexOf(u8, run.stdout, "table 0x") orelse return error.NoTable;
     const proto_end = std.mem.indexOfScalarPos(u8, run.stdout, p, ',') orelse return error.NoProtocol;
@@ -317,6 +317,17 @@ test "status codes and refusal reasons are the server's" {
     defer parsed.deinit();
     try expectSameNames(flo.StatusCode, parsed.value, "statuses");
     try expectSameNames(flo.Reason, parsed.value, "reasons");
+
+    // Every op the table codes is one this SDK sends as a table op, under
+    // the same code; ops it doesn't send are skipped.
+    for (parsed.value.object.get("ops").?.array.items) |op| {
+        const code: u16 = @intCast(op.object.get("code").?.integer);
+        const known = std.enums.tagName(flo.OpCode, @enumFromInt(code)) orelse continue;
+        if (!flo.wire.isTableOp(@enumFromInt(code))) {
+            std.debug.print("{s} (0x{x}) is a table op on the server; this SDK sends it as {s} with a value\n", .{ op.object.get("name").?.string, code, known });
+            return error.Drift;
+        }
+    }
 }
 
 test "live: appends to a stream and reads it back in order, with headers" {
@@ -359,6 +370,64 @@ test "live: enqueues, dequeues and acks a message" {
     var again = try queue.peek("jobs", 10, .{});
     defer again.deinit();
     try testing.expectEqual(@as(usize, 0), again.messages.len);
+    try testing.expect(!again.more);
+}
+
+test "live: peek shows the next ready messages in dequeue order without taking them" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var queue = flo.Queue.init(&live.client);
+    const low = try queue.enqueue("peeked", "later", .{ .priority = 9 });
+    const high = try queue.enqueue("peeked", "first", .{ .priority = 1 });
+    var seen = try queue.peek("peeked", 10, .{});
+    defer seen.deinit();
+    try testing.expectEqual(@as(usize, 2), seen.messages.len);
+    try testing.expectEqual(high, seen.messages[0].seq);
+    try testing.expectEqualStrings("first", seen.messages[0].payload);
+    try testing.expectEqual(@as(u32, 1), seen.messages[0].priority);
+    try testing.expectEqual(@as(u32, 5), seen.messages[0].size);
+    try testing.expectEqual(low, seen.messages[1].seq);
+
+    // Nothing was taken: a dequeue gets the first again.
+    var taken = try queue.dequeue("peeked", 1, .{});
+    defer taken.deinit();
+    try testing.expectEqual(high, taken.messages[0].seq);
+}
+
+test "live: a queue's DLQ pages back empty, with its trailer" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var queue = flo.Queue.init(&live.client);
+    _ = try queue.enqueue("nodead", "x", .{});
+    var page = try queue.dlqList("nodead", .{ .limit = 5 });
+    defer page.deinit();
+    try testing.expectEqual(@as(usize, 0), page.letters.len);
+    try testing.expectEqual(@as(u64, 0), page.total);
+    try testing.expect(!page.has_more);
+}
+
+test "live: a stream's group list and a group's members show who joined" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var stream = flo.Stream.init(&live.client);
+    _ = try stream.append("grouped", "x", .{});
+    try stream.groupJoin("grouped", "g", "c1", .{});
+    var groups = try stream.groupList("grouped", .{});
+    defer groups.deinit();
+    try testing.expectEqual(@as(usize, 1), groups.groups.len);
+    try testing.expectEqualStrings("g", groups.groups[0].name);
+    try testing.expectEqual(@as(u32, 1), groups.groups[0].members);
+    try testing.expect(!groups.more);
+
+    var members = try stream.groupMembers("grouped", "g", .{});
+    defer members.deinit();
+    try testing.expectEqual(@as(usize, 1), members.members.len);
+    try testing.expectEqualStrings("c1", members.members[0].id);
+    try testing.expectEqual(flo.StreamGroupMemberState.active, members.members[0].state);
+    try testing.expectError(flo.FloError.NotFound, stream.groupMembers("grouped", "nobody", .{}));
 }
 
 test "live: the status of a run id the server never minted is not found" {
@@ -368,6 +437,98 @@ test "live: the status of a run id the server never minted is not found" {
     try live.createNamespace();
     var actions = flo.Actions.init(&live.client);
     try testing.expectError(flo.FloError.NotFound, actions.getStatus("act-0-0", .{}));
+}
+
+/// Awaits a task as `worker`, failing the test if none comes within 5 s.
+fn awaitOne(actions: *flo.Actions, worker: []const u8, request_key: ?[]const u8) !flo.TaskAssignment {
+    return (try actions.awaitTask(worker, &.{"echo"}, .{ .block_ms = 5000, .request_key = request_key })) orelse error.NoTask;
+}
+
+test "live: action round trip" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var actions = flo.Actions.init(&live.client);
+
+    try actions.registerAction("echo", .user, .{ .timeout_ms = 5000, .max_retries = 3 });
+    var invoked = try actions.invoke("echo", "ping", .{});
+    defer invoked.deinit();
+
+    var task = try awaitOne(&actions, "w1", "rk-1");
+    defer task.deinit();
+    try testing.expectEqualStrings(invoked.run_id, task.run_id);
+    try testing.expectEqualStrings(live.namespace, task.namespace);
+    try testing.expectEqual(@as(u32, 1), task.deliveries);
+    try testing.expectEqualStrings("echo", task.action);
+    try testing.expectEqual(@as(u32, 1), task.attempt);
+    try testing.expectEqual(@as(u64, 5000), task.lease_ms);
+    try testing.expectEqualStrings("ping", task.payload);
+    try testing.expect(task.created_at > 0);
+
+    // The same request key gets the same delivery, not a second one.
+    var again = try awaitOne(&actions, "w1", "rk-1");
+    defer again.deinit();
+    try testing.expectEqualStrings(task.run_id, again.run_id);
+    try testing.expectEqual(task.deliveries, again.deliveries);
+    try testing.expectEqual(task.term, again.term);
+    try testing.expectEqual(task.index, again.index);
+
+    // More than half the lease left: the expiry as it stands.
+    const expires = try actions.touch("w1", task.delivery(), .{});
+    try testing.expect(expires > std.time.milliTimestamp());
+    try testing.expectEqual(expires, try actions.touch("w1", task.delivery(), .{}));
+
+    var stale = task.delivery();
+    stale.deliveries = 2;
+    try testing.expectError(flo.FloError.StaleReport, actions.complete("w1", stale, "pong", .{}));
+    var last = live.client.lastError().?;
+    try testing.expectEqual(@as(u8, @intFromEnum(flo.StatusCode.conflict)), last.code);
+    try testing.expectEqual(flo.Reason.stale_report, last.reason);
+    try testing.expect(std.mem.startsWith(u8, last.message, "stale report:"));
+
+    try actions.complete("w1", task.delivery(), "pong", .{});
+    // A resend of a report that applied is ok.
+    try actions.complete("w1", task.delivery(), "pong", .{});
+    try testing.expectError(flo.FloError.StaleReport, actions.complete("w1", task.delivery(), "other", .{}));
+    last = live.client.lastError().?;
+    try testing.expectEqualStrings("stale report: the run was completed with another result", last.message);
+
+    var st = try actions.getStatus(invoked.run_id, .{});
+    defer st.deinit();
+    try testing.expectEqual(flo.RunStatus.completed, st.status);
+    try testing.expectEqualStrings("pong", st.output.?);
+    try testing.expectEqual(@as(?[]const u8, null), st.outcome);
+
+    // Fail path: a counted failure, then an abandoned delivery that isn't.
+    var second = try actions.invoke("echo", "ping-2", .{});
+    defer second.deinit();
+    var first_try = try awaitOne(&actions, "w1", null);
+    defer first_try.deinit();
+    try testing.expectEqualStrings(second.run_id, first_try.run_id);
+    try actions.fail("w1", first_try.delivery(), "boom", .{ .retry = true, .delay_ms = 0 });
+    var retried = try awaitOne(&actions, "w1", null);
+    defer retried.deinit();
+    try testing.expectEqualStrings(second.run_id, retried.run_id);
+    try testing.expectEqual(@as(u32, 2), retried.deliveries);
+    try testing.expectEqual(@as(u32, 2), retried.attempt);
+    try actions.fail("w1", retried.delivery(), "", .{ .abandoned = true });
+    var handed_back = try awaitOne(&actions, "w1", null);
+    defer handed_back.deinit();
+    try testing.expectEqualStrings(second.run_id, handed_back.run_id);
+    try testing.expectEqual(@as(u32, 3), handed_back.deliveries);
+    try testing.expectEqual(@as(u32, 2), handed_back.attempt);
+    try actions.complete("w1", handed_back.delivery(), "", .{ .outcome = "approved" });
+    var named = try actions.getStatus(second.run_id, .{});
+    defer named.deinit();
+    try testing.expectEqualStrings("approved", named.outcome.?);
+
+    var info = try actions.info("echo", .{});
+    defer info.deinit();
+    try testing.expectEqual(@as(u64, 5000), info.timeout_ms);
+    try testing.expectEqual(@as(u32, 3), info.max_attempts);
+    try testing.expectEqual(@as(u64, 0), info.ready);
+    try testing.expectEqual(@as(?u64, 2), info.completed);
+    try testing.expectError(flo.FloError.NotFound, actions.info("no-such-action", .{}));
 }
 
 const Echo = struct {
@@ -426,13 +587,13 @@ const Slow = struct {
 
     fn handle(ctx: *flo.ActionContext) anyerror!flo.ActionHandlerResult {
         _ = runs.fetchAdd(1, .monotonic);
-        std.Thread.sleep(2500 * std.time.ns_per_ms);
+        std.Thread.sleep(6500 * std.time.ns_per_ms);
         return .{ .bytes = try ctx.allocator.dupe(u8, "ok") };
     }
 };
 
-// A handler past its action's 1 s timeout runs once when its worker
-// touches it: without auto_touch the server would take the run back and a
+// A handler past its action's 5 s lease, the shortest the server takes,
+// runs once when its worker touches it: without auto_touch the server would take the run back and a
 // second worker would run it again. (Two workers, because one runs its
 // tasks one at a time and couldn't take the run back while busy with it.)
 test "live: auto_touch keeps a long handler from running twice" {
@@ -442,7 +603,7 @@ test "live: auto_touch keeps a long handler from running twice" {
     var workers: [2]flo.ActionWorker = undefined;
     for (&workers) |*w| {
         w.* = try flo.ActionWorker.init(std.heap.page_allocator, .{ .endpoint = try endpoint(), .namespace = live.namespace, .block_ms = 500, .auto_touch = true });
-        try w.registerAction("slow", Slow.handle, .{ .timeout_ms = 1000 });
+        try w.registerAction("slow", Slow.handle, .{ .timeout_ms = 5000 });
     }
     defer for (&workers) |*w| w.deinit();
     var threads: [2]std.Thread = undefined;
@@ -720,7 +881,7 @@ test "live: listActions pages every action back exactly once" {
     const n = 30;
     for (0..n) |i| {
         var buf: [16]u8 = undefined;
-        try actions.registerAction(nameOf(&buf, "act-", i), .user, .{});
+        try actions.registerAction(nameOf(&buf, "act-", i), .user, .{ .timeout_ms = 0 });
     }
 
     var seen = Seen.init();
@@ -733,8 +894,11 @@ test "live: listActions pages every action back exactly once" {
         try testing.expect(pages <= 2 * n);
         var page = try actions.listActions(.{ .limit = PAGE, .cursor = cursor.get() });
         defer page.deinit();
-        try testing.expect(page.names.len <= PAGE);
-        for (page.names) |name| try seen.add(name);
+        try testing.expect(page.actions.len <= PAGE);
+        for (page.actions) |a| {
+            try testing.expectEqual(@as(u64, 300_000), a.timeout_ms); // 0 registers the default lease
+            try seen.add(a.name);
+        }
         if (!page.has_more) break;
         try cursor.set(page.cursor orelse return error.MoreWithoutCursor);
     }
@@ -834,9 +998,40 @@ test "live: processing list pages every job back exactly once" {
     try seen.expectExactly("job-", n);
 }
 
+test "live: a running job can't be removed; a cancelled one can, and is then gone" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var processing = flo.Processing.init(&live.client);
+    const yaml =
+        \\kind: Processing
+        \\name: removable
+        \\sources:
+        \\  - stream:
+        \\      name: removable-in
+        \\sinks:
+        \\  - kv:
+        \\      key_prefix: removable-out
+        \\
+    ;
+    const job_id = try processing.submit(testing.allocator, yaml, .{});
+    defer testing.allocator.free(job_id);
+    var st = try processing.status(testing.allocator, job_id, .{});
+    defer st.deinit();
+    try testing.expectEqualStrings("removable", st.name);
+    try testing.expectEqualStrings(yaml, st.yaml);
+
+    try testing.expectError(flo.FloError.Conflict, processing.remove(job_id, .{}));
+    try testing.expectEqual(flo.Reason.job_running, live.client.lastError().?.reason);
+    try processing.cancel(job_id, .{});
+    try processing.remove(job_id, .{});
+    try testing.expectError(flo.FloError.NotFound, processing.status(testing.allocator, job_id, .{}));
+}
+
 /// Creates a workflow whose runs wait for a signal no test sends, so they
 /// stay open for signals and cancels. (A run of an action no one registered
-/// can fail at once, when the action would be on the run's own shard.)
+/// would stay open too, waiting for the action up to the server's
+/// missing_action_wait_ms, but a signal wait doesn't hang on that setting.)
 fn createWaitingWorkflow(workflow: *flo.Workflow, name: []const u8) !void {
     var yaml_buf: [512]u8 = undefined;
     const yaml = try std.fmt.bufPrint(&yaml_buf,

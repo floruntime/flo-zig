@@ -19,7 +19,7 @@ pub const ClientOptions = struct {
     namespace: []const u8 = "default",
     /// The longest a request may go without the socket accepting or
     /// delivering any bytes, in milliseconds, plus its block_ms / wait_ms for
-    /// blocking requests (an action await without block_ms counts as 30 s).
+    /// blocking requests.
     /// It bounds silence, not the whole request. On expiry the call returns
     /// error.Timeout and the client disconnects. It bounds a connect too.
     /// 0 = no timeout. Not applied on Windows.
@@ -426,21 +426,18 @@ pub fn isConnectionError(err: anyerror) bool {
         err == FloError.UnexpectedEof or err == FloError.ConnectionFailed;
 }
 
-/// How long the server may hold a request on purpose: the longest block_ms /
-/// wait_ms in its options, or for an action await without block_ms the
-/// server's 30 s default; 0 if none.
+/// How long the server may hold a request on purpose: a kv.get's wait_ms,
+/// an action await's block_ms, or the longest block_ms in its options; 0 if
+/// none.
 fn blockingWaitMs(op_code: OpCode, value: []const u8, options: []const u8) u64 {
     // kv.get's body opens with wait_ms: [present:u8][u64].
     if (op_code == .kv_get) return if (value.len >= 9 and value[0] == 1) std.mem.readInt(u64, value[1..9], .little) else 0;
+    if (op_code == .action_await) return @import("actions.zig").awaitBodyBlockMs(value);
     var longest: u64 = 0;
-    var has_block_ms = false;
     var it = wire.OptionsIterator.init(options);
     while (it.next()) |opt| {
-        if (opt.tag != .block_ms) continue;
-        has_block_ms = true;
-        longest = @max(longest, opt.asU32() orelse 0);
+        if (opt.tag == .block_ms) longest = @max(longest, opt.asU32() orelse 0);
     }
-    if (op_code == .action_await and !has_block_ms) return types.DEFAULT_WORKER_BLOCK_MS;
     return longest;
 }
 
@@ -603,13 +600,11 @@ test "a blocking request waits timeout_ms plus its block_ms" {
     try std.testing.expect(timer.read() >= 650 * std.time.ns_per_ms);
 }
 
-test "an action await without block_ms is given the server's 30 s on top of timeout_ms" {
-    try std.testing.expectEqual(@as(u64, 30_000), blockingWaitMs(.action_await, "", ""));
-
-    var opts_buf: [8]u8 = undefined;
-    var opts = wire.OptionsBuilder.init(&opts_buf);
-    try opts.addU32(.block_ms, 0);
-    try std.testing.expectEqual(@as(u64, 0), blockingWaitMs(.action_await, "", opts.getOptions()));
+test "an action await's and a kv.get's waits are read from their bodies" {
+    // [actions: u8 count]([len:u16][name])* [block_ms: present, u64] [request_key: none]
+    const await_body = "\x01\x03\x00job" ++ "\x01" ++ std.mem.toBytes(@as(u64, 30_000)) ++ "\x00";
+    try std.testing.expectEqual(@as(u64, 30_000), blockingWaitMs(.action_await, await_body, ""));
+    try std.testing.expectEqual(@as(u64, 0), blockingWaitMs(.action_await, "\x00\x01" ++ std.mem.toBytes(@as(u64, 0)) ++ "\x00", ""));
     try std.testing.expectEqual(@as(u64, 0), blockingWaitMs(.kv_get, "", ""));
     // kv.get's wait is its body's first field.
     var body: [9]u8 = undefined;

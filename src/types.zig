@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0xc751512225a42d04;
+pub const TABLE_HASH: u64 = 0x7eb599c24442118b;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -60,8 +60,10 @@ pub const Reason = enum(u16) {
     wrong_type = 24,
     /// The shard holds as many open transactions as it may.
     too_many_transactions = 25,
-    /// An action complete or fail for a run that has moved on (another worker
-    /// holds it, or it finished). It was dropped; resending it is refused too.
+    /// An action complete, fail or touch for a delivery that has moved on:
+    /// its lease ran out, it was delivered again, another worker holds it,
+    /// or it finished another way. It was dropped. A resend of a report
+    /// that already applied answers ok, not this.
     stale_report = 26,
     /// An action await from a worker that missed its heartbeats: heartbeat,
     /// or register again, before taking work.
@@ -76,6 +78,8 @@ pub const Reason = enum(u16) {
     shard_halted = 29,
     /// The op is served only on the node's admin socket.
     admin_only = 30,
+    /// A processing remove of a job still running: stop or cancel it first.
+    job_running = 31,
 };
 
 /// Whether a refused request took effect: retry logic reads this, not the
@@ -194,10 +198,11 @@ pub fn pauseUnlessHalted(running: *const bool, halt: ?*const bool, ms: u64) void
     }
 }
 
-/// Log a worker result that was given up on. It is an error, but logged as a
-/// warning under test: the test runner fails any test that logs an error,
-/// and the worker tests drop results on purpose.
-pub fn logDropped(comptime format: []const u8, args: anytype) void {
+/// Log a worker error: a result given up on, or a handler that failed. It
+/// is an error, but logged as a warning under test: the test runner fails
+/// any test that logs an error, and the worker tests provoke these on
+/// purpose.
+pub fn logWorkerError(comptime format: []const u8, args: anytype) void {
     if (@import("builtin").is_test) std.log.warn(format, args) else std.log.err(format, args);
 }
 
@@ -267,6 +272,8 @@ pub const OpCode = enum(u16) {
     stream_group_touch = 0x15A,
     stream_group_info = 0x15B,
     stream_group_delete = 0x15C,
+    stream_group_list = 0x15D,
+    stream_group_members = 0x15E,
 
     // ── Queues (0x170 – 0x19F) ──
     queue_enqueue = 0x170,
@@ -277,8 +284,8 @@ pub const OpCode = enum(u16) {
     queue_dlq_delete = 0x177,
     queue_dlq_requeue = 0x178,
     queue_stats = 0x17B,
-    queue_peek = 0x17C,
     queue_purge = 0x17F,
+    queue_peek = 0x180,
     queue_list = 0x198,
 
     // ── Time-Series (0x1A0 – 0x1BF) ──
@@ -297,10 +304,11 @@ pub const OpCode = enum(u16) {
     action_list = 0x303,
     action_list_runs = 0x304,
     action_delete = 0x305,
-    action_await = 0x306,
-    action_complete = 0x307,
-    action_fail = 0x308,
-    action_touch = 0x309,
+    action_await = 0x30A,
+    action_complete = 0x30B,
+    action_fail = 0x30C,
+    action_touch = 0x30D,
+    action_info = 0x30F,
 
     // ── Workers (0x320 – 0x33F) ──
     worker_register = 0x320,
@@ -329,6 +337,7 @@ pub const OpCode = enum(u16) {
     processing_cancel = 0x362,
     processing_status = 0x363,
     processing_list = 0x364,
+    processing_remove = 0x365,
 
     _,
 };
@@ -506,6 +515,10 @@ pub const FloError = error{
     /// A halted shard answered that the key doesn't exist as of the entry it
     /// halted at; it may exist since. Not the same as absent.
     StaleNotFound,
+    /// An action complete, fail or touch for a delivery that has moved on
+    /// (status conflict, reason stale_report); Client.lastError's message
+    /// says how. Not resent: it would be refused again.
+    StaleReport,
     UnexpectedResponse,
 
     // Transaction errors
@@ -783,7 +796,7 @@ pub const KVMGetOptions = struct {
 /// Options for a delete or expire inside a KV transaction
 pub const KVTxnWriteOptions = struct {
     /// The key's version the write requires; another version fails the
-    /// write with `FloError.Conflict`.
+    /// commit with `FloError.Conflict`.
     cas_version: ?u64 = null,
 };
 
@@ -821,10 +834,47 @@ pub const NackOptions = struct {
     namespace: ?[]const u8 = null,
 };
 
+/// The most dead letters one DLQ list page holds.
+pub const MAX_DLQ_PAGE: u32 = 100;
+
 /// Options for DLQ list operations
 pub const DlqListOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+    /// Dead letters per page, 1 to 100.
+    limit: u32 = MAX_DLQ_PAGE,
+    /// The previous page's `last_seq`; null for the first page.
+    after: ?u64 = null,
+};
+
+/// A message moved to a queue's dead letter queue.
+pub const DeadLetter = struct {
+    seq: u64,
+    /// The payload's whole length; `payload` holds at most 4 KiB of it.
+    size: u32,
+    payload: []const u8,
+    enqueued_at_ms: i64,
+    attempts: u32,
+    priority: u8,
+    /// When it was moved to the DLQ, in Unix milliseconds.
+    moved_at_ms: i64,
+};
+
+/// One page of a queue's dead letters, oldest first. Free with `deinit`.
+pub const DlqPage = struct {
+    letters: []DeadLetter,
+    /// Dead letters the queue holds in all.
+    total: u64,
+    /// More follow: ask again with `after` set to `last_seq`.
+    has_more: bool,
+    /// The seq of the page's last dead letter.
+    last_seq: u64,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *DlqPage) void {
+        for (self.letters) |l| self.allocator.free(l.payload);
+        self.allocator.free(self.letters);
+    }
 };
 
 /// Options for DLQ requeue operations
@@ -833,10 +883,39 @@ pub const DlqRequeueOptions = struct {
     namespace: ?[]const u8 = null,
 };
 
+/// The most messages one queue peek shows.
+pub const MAX_PEEK: u32 = 100;
+
 /// Options for queue peek operations
 pub const PeekOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+};
+
+/// A ready message as a peek shows it, without taking it.
+pub const PeekedMessage = struct {
+    seq: u64,
+    priority: u32,
+    attempts: u32,
+    enqueued_at_ms: i64,
+    /// The payload's whole length; `payload` holds at most 4 KiB of it.
+    size: u32,
+    payload: []const u8,
+};
+
+/// A queue's next ready messages, in the order a dequeue takes them. Free
+/// with `deinit`.
+pub const PeekResult = struct {
+    messages: []PeekedMessage,
+    /// More may follow: the limit, the answer's room or a run of taken
+    /// messages stopped it.
+    more: bool,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *PeekResult) void {
+        for (self.messages) |m| self.allocator.free(m.payload);
+        self.allocator.free(self.messages);
+    }
 };
 
 // =============================================================================
@@ -1026,6 +1105,68 @@ pub const StreamGroupNackOptions = struct {
     consumer: []const u8 = "",
 };
 
+/// Options for listing a stream's consumer groups or a group's members
+pub const StreamGroupListOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+};
+
+/// A consumer group as the stream's group list shows it. Members and
+/// pending are the leader's, and a leader change starts them again.
+pub const StreamGroupSummary = struct {
+    name: []const u8,
+    members: u32,
+    pending: u64,
+    created_at_ms: i64,
+    ack_timeout_ms: u32,
+    max_deliver: u8,
+    /// When it was last delivered to, in Unix milliseconds; 0 if never.
+    last_delivered_ms: u64,
+    last_delivered_seq: u64,
+};
+
+/// A stream's consumer groups. Free with `deinit`.
+pub const StreamGroupList = struct {
+    groups: []StreamGroupSummary,
+    /// The stream has more groups than the answer holds.
+    more: bool,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *StreamGroupList) void {
+        for (self.groups) |g| self.allocator.free(g.name);
+        self.allocator.free(self.groups);
+    }
+};
+
+pub const StreamGroupMemberState = enum(u8) {
+    active = 0,
+    leaving = 1,
+};
+
+/// A consumer group's member. All of it is the leader's, and a leader
+/// change starts it again.
+pub const StreamGroupMember = struct {
+    id: []const u8,
+    state: StreamGroupMemberState,
+    pending: u32,
+    joined_at_ms: i64,
+    /// When it was last delivered to; null if never.
+    last_active_ms: ?i64,
+};
+
+/// A consumer group's members. Free with `deinit`.
+pub const StreamGroupMembers = struct {
+    members: []StreamGroupMember,
+    /// The group has more members than the answer holds.
+    more: bool,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *StreamGroupMembers) void {
+        for (self.members) |m| self.allocator.free(m.id);
+        self.allocator.free(self.members);
+    }
+};
+
 // =============================================================================
 // Action/Worker Types
 // =============================================================================
@@ -1046,20 +1187,47 @@ pub const RunStatus = enum(u8) {
     timed_out = 5,
 };
 
-/// Task assignment from worker_await
+/// The delivery a report names: a complete, fail or touch echoes every
+/// field of the task it reports on, and is refused as stale (reason
+/// stale_report) once the run has moved on to another delivery.
+pub const Delivery = struct {
+    run_id: []const u8,
+    action: []const u8,
+    /// The run's deliveries, this one included.
+    deliveries: u32,
+    /// The term and log index the delivery was made at.
+    term: u64,
+    index: u64,
+};
+
+/// A task from action.await: one delivery of a run, held by the worker
+/// that awaited it for `lease_ms` without a touch.
 pub const TaskAssignment = struct {
-    task_id: []const u8,
-    task_type: []const u8,
-    payload: []const u8,
+    run_id: []const u8,
+    namespace: []const u8,
+    deliveries: u32,
+    term: u64,
+    index: u64,
+    action: []const u8,
+    /// When the run was invoked, in Unix milliseconds.
     created_at: i64,
+    /// The run's failures so far, plus one. An abandoned delivery counts no
+    /// failure, so the next one has the same attempt.
     attempt: u32,
+    lease_ms: u64,
     caller_run_id: ?[]const u8 = null,
     caller_workflow_name: ?[]const u8 = null,
+    payload: []const u8,
     allocator: std.mem.Allocator,
 
+    pub fn delivery(self: *const TaskAssignment) Delivery {
+        return .{ .run_id = self.run_id, .action = self.action, .deliveries = self.deliveries, .term = self.term, .index = self.index };
+    }
+
     pub fn deinit(self: *TaskAssignment) void {
-        self.allocator.free(self.task_id);
-        self.allocator.free(self.task_type);
+        self.allocator.free(self.run_id);
+        self.allocator.free(self.namespace);
+        self.allocator.free(self.action);
         self.allocator.free(self.payload);
         if (self.caller_run_id) |v| self.allocator.free(v);
         if (self.caller_workflow_name) |v| self.allocator.free(v);
@@ -1071,7 +1239,8 @@ pub const TaskAssignment = struct {
 /// result, and `error_message` the last failure's message. `worker_id` is
 /// the worker holding the run, or last holding it; null until one takes it.
 /// Only the leader knows a take at once: another node may answer null, or
-/// an earlier worker, until the run's next update reaches it.
+/// an earlier worker, until the run's next update reaches it. `outcome` is
+/// the outcome a completed run's worker named; null for success.
 pub const ActionRunStatus = struct {
     run_id: []const u8,
     status: RunStatus,
@@ -1082,6 +1251,7 @@ pub const ActionRunStatus = struct {
     output: ?[]const u8,
     error_message: ?[]const u8,
     worker_id: ?[]const u8,
+    outcome: ?[]const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ActionRunStatus) void {
@@ -1089,6 +1259,40 @@ pub const ActionRunStatus = struct {
         if (self.output) |o| self.allocator.free(o);
         if (self.error_message) |e| self.allocator.free(e);
         if (self.worker_id) |w| self.allocator.free(w);
+        if (self.outcome) |o| self.allocator.free(o);
+    }
+};
+
+/// An action's definition, its runs by status and how long completed runs
+/// took, from action.info. The counts other than `ready`, and the latency,
+/// are null when `too_many_runs` is set. Free with `deinit`.
+pub const ActionInfo = struct {
+    owner: []const u8,
+    /// Counts registrations.
+    version: u32,
+    /// The lease a worker holds a run for.
+    timeout_ms: u64,
+    max_attempts: u32,
+    created_at_ms: i64,
+    /// Runs waiting for a worker, counted up to 100,000.
+    ready: u64,
+    /// More runs wait than were counted.
+    ready_capped: bool,
+    /// The action's shard holds more than 10,000 of the namespace's runs.
+    too_many_runs: bool,
+    running: ?u64,
+    completed: ?u64,
+    failed: ?u64,
+    timed_out: ?u64,
+    latency_count: ?u64,
+    latency_avg_ms: ?u64,
+    latency_p50_ms: ?u64,
+    latency_p95_ms: ?u64,
+    latency_max_ms: ?u64,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ActionInfo) void {
+        self.allocator.free(self.owner);
     }
 };
 
@@ -1107,13 +1311,14 @@ pub const ActionInvokeResult = struct {
 pub const ActionRegisterOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// How long a run may go without its worker completing, failing or
-    /// touching it before it's taken back; 0 means never.
-    timeout_ms: u32 = 30_000,
+    /// The lease: how long a run may go without its worker completing,
+    /// failing or touching it before it's taken back. The server takes 5000
+    /// to 43200000 ms; 0, the default, is its default of 300000.
+    timeout_ms: u32 = 0,
     /// Attempts in all, counting the first.
     max_retries: u32 = 3,
-    /// Who owns the action. The wire allows 65535 bytes; this SDK sends at
-    /// most 1024 (its encode buffer) and refuses more with ValueTooLarge.
+    /// Who owns the action, at most 256 bytes; more is refused with
+    /// ValueTooLarge before sending.
     owner: []const u8 = "",
 };
 
@@ -1144,9 +1349,21 @@ pub const ActionListOptions = struct {
     limit: u32 = 0,
 };
 
-/// A page of a namespace's registered action names.
+/// A registered action as action.list shows it.
+pub const ActionListEntry = struct {
+    name: []const u8,
+    /// Counts registrations.
+    version: u32,
+    owner: []const u8,
+    /// The lease a worker holds a run for.
+    timeout_ms: u64,
+    max_attempts: u32,
+    created_at_ms: i64,
+};
+
+/// A page of a namespace's registered actions.
 pub const ActionListPage = struct {
-    names: [][]const u8,
+    actions: []ActionListEntry,
     has_more: bool,
     /// Pass as `ActionListOptions.cursor` for the next page; null on the
     /// last page.
@@ -1154,8 +1371,11 @@ pub const ActionListPage = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ActionListPage) void {
-        for (self.names) |n| self.allocator.free(n);
-        self.allocator.free(self.names);
+        for (self.actions) |a| {
+            self.allocator.free(a.name);
+            self.allocator.free(a.owner);
+        }
+        self.allocator.free(self.actions);
         if (self.cursor) |c| self.allocator.free(c);
     }
 };
@@ -1307,36 +1527,54 @@ pub const WorkerDrainOptions = struct {
     namespace: ?[]const u8 = null,
 };
 
+/// The most actions one await names.
+pub const MAX_AWAIT_ACTIONS: usize = 64;
+/// The longest action name a task or report carries.
+pub const MAX_ACTION_NAME: usize = 256;
+/// The longest await request key.
+pub const MAX_REQUEST_KEY: usize = 64;
+/// The longest result a complete carries, and error a fail carries.
+pub const MAX_REPORT_TEXT: usize = 65_535;
+/// The longest delay a fail may ask for: a day.
+pub const MAX_FAIL_DELAY_MS: u64 = 86_400_000;
+
 /// Options for worker await task
 pub const WorkerAwaitOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Block waiting for task (null = 30000, 0 = don't wait, max 300000)
-    block_ms: ?u32 = null,
+    /// Block waiting for task (0 = don't wait, max 300000)
+    block_ms: u32 = DEFAULT_WORKER_BLOCK_MS,
+    /// Retrying with the same key gets the task the first try got, so an
+    /// await whose answer was lost can be sent again without leaving a run
+    /// held by no one. At most 64 bytes.
+    request_key: ?[]const u8 = null,
 };
 
 /// Options for worker complete task
 pub const WorkerCompleteOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Named outcome for workflow routing (default: "success")
-    outcome: []const u8 = "success",
+    /// Named outcome for workflow routing; "" is success.
+    outcome: []const u8 = "",
 };
 
 /// Options for worker fail task
 pub const WorkerFailOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Whether to retry the task
-    retry: bool = false,
+    /// Run it again while attempts are left; false fails the run now.
+    retry: bool = true,
+    /// Hand it back untried: no failure is counted, so the next delivery
+    /// has the same attempt.
+    abandoned: bool = false,
+    /// How long before it is ready again, at most a day.
+    delay_ms: u64 = 0,
 };
 
-/// Options for worker touch (extend lease)
+/// Options for worker touch (keep a task's lease)
 pub const WorkerTouchOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Lease extension time in ms
-    extend_ms: ?u32 = null,
 };
 
 // =============================================================================
@@ -1468,6 +1706,8 @@ pub const WorkflowDefinitionEntry = struct {
     name: []const u8,
     version: []const u8,
     created_at: i64,
+    /// Whether new runs may start; false once disabled.
+    enabled: bool,
 
     pub fn deinit(self: *WorkflowDefinitionEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -1529,11 +1769,17 @@ pub const ProcessingCancelOptions = struct {
     namespace: ?[]const u8 = null,
 };
 
+pub const ProcessingRemoveOptions = struct {
+    namespace: ?[]const u8 = null,
+};
+
 pub const ProcessingSyncOptions = struct {
     namespace: ?[]const u8 = null,
 };
 
-/// Result of a processing status query.
+/// Result of a processing status query. The runtime fields are the
+/// answering node's own: none of it is replicated, so it starts again with
+/// the node or a new leader.
 pub const ProcessingStatusResult = struct {
     job_id: []const u8,
     name: []const u8,
@@ -1541,15 +1787,28 @@ pub const ProcessingStatusResult = struct {
     batch_size: u32,
     records_processed: u64,
     created_at: i64,
-    /// Why the job failed; null unless `status` is "failed".
-    failure_reason: ?[]const u8,
+    /// Why a failed job failed, or for a running job this node holds,
+    /// "held here: " and why; null otherwise.
+    reason: ?[]const u8,
+    /// Whether this node runs any of the job's pipelines.
+    running: bool,
+    records_in: u64,
+    records_out: u64,
+    watermark_ms: i64,
+    tick_avg_us: u64,
+    tick_max_us: u64,
+    /// Since the earliest of this node's pipelines started.
+    uptime_ms: u64,
+    /// The definition as submitted.
+    yaml: []const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ProcessingStatusResult) void {
         self.allocator.free(self.job_id);
         self.allocator.free(self.name);
         self.allocator.free(self.status);
-        if (self.failure_reason) |r| self.allocator.free(r);
+        if (self.reason) |r| self.allocator.free(r);
+        self.allocator.free(self.yaml);
     }
 };
 
@@ -1559,6 +1818,8 @@ pub const ProcessingListEntry = struct {
     job_id: []const u8,
     status: []const u8,
     created_at: i64,
+    batch_size: u32,
+    records_processed: u64,
 
     pub fn deinit(self: *ProcessingListEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -1671,8 +1932,13 @@ test "the op codes match the server's: namespace settings retired, ensure and re
     try std.testing.expectEqual(@as(u16, 0x032), @intFromEnum(OpCode.cluster_promote));
     try std.testing.expectEqual(@as(u16, 0x033), @intFromEnum(OpCode.cluster_remove));
     try std.testing.expectEqual(@as(u16, 0x034), @intFromEnum(OpCode.cluster_repair_skip));
-    // A retired code is no longer a name.
-    try std.testing.expect(std.enums.tagName(OpCode, @enumFromInt(0x014)) == null);
+    // A retired code is no longer a name: the old action reports and peek.
+    for ([_]u16{ 0x014, 0x306, 0x307, 0x308, 0x309, 0x17C }) |code| {
+        try std.testing.expect(std.enums.tagName(OpCode, @enumFromInt(code)) == null);
+    }
+    try std.testing.expectEqual(@as(u16, 0x30A), @intFromEnum(OpCode.action_await));
+    try std.testing.expectEqual(@as(u16, 0x30D), @intFromEnum(OpCode.action_touch));
+    try std.testing.expectEqual(@as(u16, 0x180), @intFromEnum(OpCode.queue_peek));
 }
 
 test "unavailable is retryable, internal_error is not, unknown codes are a server error" {

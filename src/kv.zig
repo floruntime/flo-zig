@@ -31,7 +31,9 @@ pub const KV = struct {
     /// The returned `version` may be passed to `PutOptions.cas_version` on the
     /// next write to enforce optimistic concurrency. A `cas_version` that
     /// isn't the key's, or a `condition` that doesn't hold, returns
-    /// `FloError.Conflict`; `client.lastError()` says which.
+    /// `FloError.Conflict`; `client.lastError()` says which. Both are decided
+    /// in log order as the write applies, so a refused write still costs a
+    /// commit.
     pub fn put(
         self: *KV,
         key: []const u8,
@@ -283,7 +285,13 @@ pub const KV = struct {
 ///
 /// Operations are buffered on the server's pinned shard until `commit()` or
 /// `rollback()` is called. Each op is routed by the transaction's routing
-/// key. Writes inside a transaction have no version or result until commit.
+/// key. Writes inside a transaction have no version or result until commit,
+/// and a condition, `cas_version` or `incr` that doesn't hold is refused at
+/// commit, not at the op: the commit returns `FloError.Conflict` (or
+/// `FloError.BadRequest` for an incr that can't apply) and nothing applies.
+/// A transaction holds at most 64 ops and 256 KiB by default; both are
+/// operator settings, and past them an op is refused (reason
+/// `txn_too_large`).
 ///
 /// The following operations are NOT supported inside a transaction and
 /// return `FloError.TxnUnsupportedOp` without a server round-trip:
