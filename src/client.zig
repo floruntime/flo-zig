@@ -427,12 +427,13 @@ pub fn isConnectionError(err: anyerror) bool {
 }
 
 /// How long the server may hold a request on purpose: a kv.get's wait_ms,
-/// an action await's block_ms, or the longest block_ms in its options; 0 if
-/// none.
+/// an action await's or queue dequeue's block_ms, or the longest block_ms in
+/// its options; 0 if none.
 fn blockingWaitMs(op_code: OpCode, value: []const u8, options: []const u8) u64 {
     // kv.get's body opens with wait_ms: [present:u8][u64].
     if (op_code == .kv_get) return if (value.len >= 9 and value[0] == 1) std.mem.readInt(u64, value[1..9], .little) else 0;
     if (op_code == .action_await) return @import("actions.zig").awaitBodyBlockMs(value);
+    if (op_code == .queue_dequeue) return @import("queue.zig").dequeueBodyBlockMs(value);
     var longest: u64 = 0;
     var it = wire.OptionsIterator.init(options);
     while (it.next()) |opt| {
@@ -596,7 +597,7 @@ test "a blocking request waits timeout_ms plus its block_ms" {
     try opts.addU32(.block_ms, 600);
 
     var timer = try std.time.Timer.start();
-    try std.testing.expectError(FloError.Timeout, client.sendRequest(.queue_dequeue, "default", "k", "", opts.getOptions()));
+    try std.testing.expectError(FloError.Timeout, client.sendRequest(.stream_read, "default", "k", "", opts.getOptions()));
     try std.testing.expect(timer.read() >= 650 * std.time.ns_per_ms);
 }
 
@@ -822,7 +823,7 @@ test "timeout_ms 0 never times out, even with a block_ms" {
 
     // The call ends only when the server hangs up.
     var timer = try std.time.Timer.start();
-    try std.testing.expectError(FloError.UnexpectedEof, client.sendRequest(.queue_dequeue, "default", "k", "", opts.getOptions()));
+    try std.testing.expectError(FloError.UnexpectedEof, client.sendRequest(.stream_read, "default", "k", "", opts.getOptions()));
     try std.testing.expect(timer.read() >= 500 * std.time.ns_per_ms);
 }
 

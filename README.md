@@ -67,7 +67,12 @@ pub fn main() !void {
         std.debug.print("Message: {s}\n", .{msg.payload});
     }
 
-    // No ack needed: dequeue already acknowledged these messages (see Queue Operations).
+    // Leased, not consumed: complete them within the lease, or they're
+    // delivered again (see Queue Operations).
+    if (result.messages.len > 0) {
+        var done = try queue.complete("tasks", result.lease, result.messages, .{});
+        done.deinit();
+    }
 }
 ```
 
@@ -247,28 +252,48 @@ const seq = try queue.enqueue("queue-name", "payload", .{
 // Enqueue to different namespace
 const seq = try queue.enqueue("queue-name", "payload", .{ .namespace = "other-ns" });
 
-// Dequeue messages. Queues are at-most-once today: dequeue acknowledges each
-// message as it hands it out, so a message is not redelivered if the consumer
-// fails, and ack/nack have no effect on it.
-var result = try queue.dequeue("queue-name", 10, .{});
+// Ready after a delay, at most a day
+_ = try queue.enqueue("queue-name", "later", .{ .delay_ms = 60_000 });
+
+// Dequeue up to 10 messages, waiting up to 5 s for one. They are leased to
+// the consumer, not consumed: delivery is at least once. Complete each within
+// its lease (30 s unless `lease_ms` says otherwise, 5 s to 12 h) or touch it;
+// one whose lease runs out is ready again, with `deliveries` one higher.
+var result = try queue.dequeue("queue-name", 10, .{ .consumer = "c1", .block_ms = 5000 });
 defer result.deinit();
 
-// Block waiting for messages (long polling)
-var result = try queue.dequeue("queue-name", 10, .{ .block_ms = 5000 });
-defer result.deinit();
+// Reports name the dequeue's lease, the messages (seq and deliveries) and the
+// same consumer. Each message is applied or refused on its own, inside an ok
+// answer; for a complete, a message refused `.gone` was completed already.
+var done = try queue.complete("queue-name", result.lease, result.messages, .{ .consumer = "c1" });
+defer done.deinit();
+for (done.refused) |r| std.debug.print("{d}: {s} ({s})\n", .{ r.seq, @tagName(r.why), r.reason });
 
-// ack / nack exist on the wire but have no effect on a dequeued message,
-// since dequeue already acknowledged it. Don't rely on them for retries.
-try queue.ack("queue-name", &seqs, .{});
-try queue.nack("queue-name", &seqs, .{});
+// Fail them back: ready again after delay_ms, or dead once their attempts are
+// spent (`.dead = true` now). Touch keeps the lease; it renews with half of it
+// or less left, up to 12 h from the dequeue.
+var failed = try queue.fail("queue-name", result.lease, result.messages, .{ .consumer = "c1", .delay_ms = 1000 });
+defer failed.deinit();
+
+// At most once instead: completed as they're taken
+var taken = try queue.dequeue("queue-name", 10, .{ .ack = true });
+defer taken.deinit();
+
+// Remove every message, ready, leased and dead; returns how many
+const removed = try queue.purge("queue-name", .{});
+
+// A queue holds at most its cap of messages and bytes (server settings). Past
+// one, an enqueue is refused `overloaded` without running; the client retries
+// it like any such refusal (about 350 ms), then returns error.Overloaded, and
+// `client.lastError()` names the cap.
 
 // The next ready messages, 1 to 100, in dequeue order, without taking them;
 // each shows up to 4 KiB of its payload (`size` is its whole length)
 var next = try queue.peek("queue-name", 20, .{});
 defer next.deinit();
 
-// The DLQ isn't reached in normal use, because dequeued messages are never
-// failed back. dlqList pages it oldest first, up to 100 at a time: pass the
+// Dead messages wait in the DLQ until the queue is purged. dlqList pages it
+// oldest first, up to 100 at a time: pass the
 // page's last_seq as `after` while has_more is set. dlqRequeue is refused by
 // the server as not implemented.
 var dlq = try queue.dlqList("queue-name", .{ .limit = 50 });
@@ -598,7 +623,7 @@ All operations return `flo.FloError` which includes:
 - `Unauthorized` - Authentication required
 - `Overloaded` - Server overloaded, and the client's retries ran out
 - `RateLimited` - Request rate limit exceeded
-- `Unavailable` - No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (an offline shard needs an operator)
+- `Unavailable` - No leader yet, records still being read from disk, or the shard isn't taking writes or is offline, and the client's retries ran out (an offline shard needs an operator)
 - `InternalError` - Internal server error (not retryable: the write may have committed)
 - `OutcomePending` - The write committed but hasn't applied, because its shard halted (never retried)
 - `StaleNotFound` - `get` or `jsonGet` on a halted shard: the key is missing as of the halt, which isn't the same as missing
@@ -634,11 +659,12 @@ resending it could halt the shard again, and a complete, fail or ack refused
 either way is not sent again.
 
 A halted shard still answers reads, from its state just before the entry it
-halted at. Such a read succeeds with `stale` set on its result (`GetResult`,
+halted at, and so does a node whose log reads are blocked, from its state as last
+applied. Such a read succeeds with `stale` set on its result (`GetResult`,
 `MGetEntry`, `ScanResult`, `HistoryResult`, `ExistsResult`): it is not an error,
-but it doesn't hold anything written since. A key missing from such an answer is
-missing as of the halt, so `get` and `jsonGet` return `error.StaleNotFound`
-rather than null. Only the KV reads carry the flag for now: other reads (streams,
+but it doesn't hold anything written since. A key missing from such an answer
+may exist since, so `get` and `jsonGet` return `error.StaleNotFound` rather than
+null. Only the KV reads carry the flag for now: other reads (streams,
 queues, actions, workers) drop it.
 
 | `RetryPolicy` field | Default | |
@@ -656,7 +682,9 @@ afresh.
 The action and stream workers wait the same way between failed polls, from
 100 ms up to 5 s, starting again from 100 ms after a poll that succeeds; `stop()`
 ends a wait within about 10 ms. A stream worker retries a group join refused
-this way instead of stopping. `WorkerConfig` and `StreamWorkerConfig` take a `retry` field
+this way instead of stopping, and a group read refused `unavailable` without
+running (its records are still being read from disk, say) is read again with
+the same group and consumer: it claimed nothing. `WorkerConfig` and `StreamWorkerConfig` take a `retry` field
 for the connection each worker opens.
 
 A worker whose complete, fail, ack or nack is lost with its connection (or
