@@ -293,9 +293,8 @@ var next = try queue.peek("queue-name", 20, .{});
 defer next.deinit();
 
 // Dead messages wait in the DLQ until the queue is purged. dlqList pages it
-// oldest first, up to 100 at a time: pass the
-// page's last_seq as `after` while has_more is set. dlqRequeue is refused by
-// the server as not implemented.
+// oldest first, up to 100 at a time: pass the page's last_seq as `after`
+// while has_more is set.
 var dlq = try queue.dlqList("queue-name", .{ .limit = 50 });
 defer dlq.deinit();
 std.debug.print("{d} dead letters\n", .{dlq.total});

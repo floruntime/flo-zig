@@ -206,33 +206,6 @@ pub const Queue = struct {
         return decodeDlqPage(self.client.allocator, response.data);
     }
 
-    /// Requeue messages from DLQ back to main queue. The server refuses this
-    /// as not implemented.
-    pub fn dlqRequeue(
-        self: *Queue,
-        queue_name: []const u8,
-        seqs: []const u64,
-        options: types.DlqRequeueOptions,
-    ) FloError!void {
-        const ns = self.client.getNamespace(options.namespace);
-
-        var value_buf: [4096]u8 = undefined;
-        const value = try wire.serializeSeqs(&value_buf, seqs);
-
-        var response = try self.client.sendRequest(
-            .queue_dlq_requeue,
-            ns,
-            queue_name,
-            value,
-            "",
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
-    }
-
     /// The queue's next ready messages, 1 to 100 of them, in the order a
     /// dequeue takes them, without taking them. Each shows up to 4 KiB of
     /// its payload.

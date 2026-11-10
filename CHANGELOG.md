@@ -14,6 +14,9 @@
   `QueueReport` of what applied and each message refused, with why (`gone`
   means completed already). `dequeue` with `.ack = true` is at most once.
   The old codes `0x171`, `0x172` and `0x174` are gone.
+- **Breaking:** `Queue.dlqRequeue` and `DlqRequeueOptions` are removed: the
+  server refuses a requeue as not implemented. The DLQ requeue and delete op
+  codes go with them.
 - `EnqueueOptions.delay_ms` holds a message back, at most a day.
   `Queue.purge` removes a queue's messages and says how many.
 - A full queue (past its cap of messages or bytes, or its shard's of

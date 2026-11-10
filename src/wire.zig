@@ -401,24 +401,6 @@ pub fn parseListTrailer(data: []const u8, offset: usize) FloError!ListTrailer {
     };
 }
 
-/// Serialize sequence numbers for a DLQ requeue
-/// Format: [count:u32][seq:u64]*
-pub fn serializeSeqs(buffer: []u8, seqs: []const u64) FloError![]const u8 {
-    const needed = 4 + seqs.len * 8;
-    if (buffer.len < needed) return FloError.BufferTooSmall;
-
-    var offset: usize = 0;
-    std.mem.writeInt(u32, buffer[offset..][0..4], @intCast(seqs.len), .little);
-    offset += 4;
-
-    for (seqs) |seq| {
-        std.mem.writeInt(u64, buffer[offset..][0..8], seq, .little);
-        offset += 8;
-    }
-
-    return buffer[0..offset];
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -491,18 +473,6 @@ test "a table op's frame is the envelope and its body: no value length, no optio
     const frame = try serializeRequest(&buffer, 1, .worker_list, "ns", "", body, "");
     try std.testing.expectEqualSlices(u8, "\x02\x00ns" ++ "\x00\x00" ++ body, frame[32..]);
     try std.testing.expectError(FloError.IncompleteRequest, serializeRequest(&buffer, 1, .worker_list, "ns", "", body, "x"));
-}
-
-test "serializeSeqs" {
-    var buffer: [64]u8 = undefined;
-    const seqs = [_]u64{ 1, 2, 3 };
-
-    const serialized = try serializeSeqs(&buffer, &seqs);
-
-    try std.testing.expectEqual(@as(usize, 28), serialized.len);
-
-    const count = std.mem.readInt(u32, serialized[0..4], .little);
-    try std.testing.expectEqual(@as(u32, 3), count);
 }
 
 test "OptionsBuilder refuses a blocking wait over 300000 ms" {

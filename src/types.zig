@@ -278,8 +278,6 @@ pub const OpCode = enum(u16) {
     // ── Queues (0x170 – 0x19F) ──
     queue_enqueue = 0x170,
     queue_dlq_list = 0x176,
-    queue_dlq_delete = 0x177,
-    queue_dlq_requeue = 0x178,
     queue_stats = 0x17B,
     queue_purge = 0x17F,
     queue_peek = 0x180,
@@ -961,12 +959,6 @@ pub const DlqPage = struct {
         for (self.letters) |l| self.allocator.free(l.payload);
         self.allocator.free(self.letters);
     }
-};
-
-/// Options for DLQ requeue operations
-pub const DlqRequeueOptions = struct {
-    /// Override client's default namespace
-    namespace: ?[]const u8 = null,
 };
 
 /// The most messages one queue peek shows.
