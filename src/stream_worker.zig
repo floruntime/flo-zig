@@ -325,7 +325,12 @@ pub const StreamWorker = struct {
                     self.client.disconnect();
                 } else if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-stream-worker]", "group read")) {
                     const ms = failed.next(self.client.prng.random());
-                    std.log.err("[flo-stream-worker] GroupRead error: {}, retrying in {d}ms...", .{ err, ms });
+                    // Refused without running (records still being read
+                    // from disk, no leader yet): the read claimed nothing,
+                    // so the same group and consumer read again.
+                    if (self.client.refusedUnrun(err)) {
+                        std.log.warn("[flo-stream-worker] GroupRead refused, not run: {s}; retrying in {d}ms", .{ self.client.lastError().?.message, ms });
+                    } else std.log.err("[flo-stream-worker] GroupRead error: {}, retrying in {d}ms...", .{ err, ms });
                     types.pauseUnlessHalted(&self.running, &self.draining, ms);
                 }
             }
@@ -1272,6 +1277,45 @@ test "StreamWorker waits out a halted shard at its join, registration and reads,
     try std.testing.expectEqual(@as(u32, 4), srv.countOf(.stream_group_join));
     try std.testing.expectEqual(@as(u32, 3), srv.countOf(.worker_register));
     try std.testing.expect(srv.countOf(.stream_group_read) >= 5);
+}
+
+test "StreamWorker reads again when a group read is refused unavailable without running, logging no error" {
+    const counting = struct {
+        var handled = std.atomic.Value(u32).init(0);
+        fn handle(_: *StreamContext) anyerror!void {
+            _ = handled.fetchAdd(1, .monotonic);
+        }
+    };
+    const record = "\x00" ** 8 ++ "\x02" ++ "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4; // tier 2: disk
+    const records = "\x01\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ record;
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    // unavailable, reason unclassified, ran no: the records are being read from disk.
+    const cold: @import("test_server.zig").Reply = .{ .status = 12, .body = "\x0c\x00\x00unavailable: too many reads are waiting on this shard's disk; retry" };
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = cold } },
+        .{ .op = .stream_group_read, .nth = 1, .action = .{ .reply = cold } },
+        .{ .op = .stream_group_read, .nth = 2, .action = .{ .reply = .{ .status = 0, .body = records } } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    counting.handled.store(0, .monotonic);
+    // One try per read, so the worker sees each refusal itself.
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100, .retry = .{ .max_attempts = 1 } }, counting.handle);
+    defer w.deinit();
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    var waited: u32 = 0;
+    while (srv.countOf(.stream_group_ack) < 1 and waited < 5000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+
+    try std.testing.expectEqual(@as(u32, 1), counting.handled.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_ack));
+    // The same group and consumer each time.
+    const first = srv.requestOf(.stream_group_read, 0);
+    const third = srv.requestOf(.stream_group_read, 2);
+    try std.testing.expectEqualSlices(u8, first[32..], third[32..]);
 }
 
 const halted_start_test = struct {

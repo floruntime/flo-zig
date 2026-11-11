@@ -116,10 +116,19 @@ pub fn main() !void {
     };
     defer dequeue_result.deinit();
 
-    // No ack: queues are at-most-once today, and dequeue already acknowledged
-    // each message it handed out. Lower priority comes out first.
+    // The messages are leased, not consumed: complete them within the
+    // lease (30 s by default), or they are delivered again. Lower priority
+    // comes out first.
     for (dequeue_result.messages) |msg| {
-        std.debug.print("  Message seq={d}: '{s}'\n", .{ msg.seq, msg.payload });
+        std.debug.print("  Message seq={d} (delivery {d}): '{s}'\n", .{ msg.seq, msg.deliveries, msg.payload });
+    }
+    if (dequeue_result.messages.len > 0) {
+        var done = queue.complete("tasks", dequeue_result.lease, dequeue_result.messages, .{}) catch |err| {
+            std.debug.print("COMPLETE failed: {}\n", .{err});
+            return;
+        };
+        defer done.deinit();
+        std.debug.print("COMPLETE applied to {d}\n", .{done.applied});
     }
 
     std.debug.print("\nDone!\n", .{});

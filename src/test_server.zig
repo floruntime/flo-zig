@@ -119,6 +119,15 @@ pub const OkServer = struct {
         return p[off..][0..value_len];
     }
 
+    /// The options of the last request, which must not be a table op's.
+    pub fn lastOptions(self: *OkServer) []const u8 {
+        const value = self.lastValue();
+        const p = self.last_payload_buf[0..self.last_payload_len];
+        const off = @intFromPtr(value.ptr) - @intFromPtr(p.ptr) + value.len;
+        const len = std.mem.readInt(u16, p[off..][0..2], .little);
+        return p[off + 2 ..][0..len];
+    }
+
     /// The key of the last request: [ns_len:u16][ns][key_len:u16][key]...
     pub fn lastKey(self: *OkServer) []const u8 {
         _ = self.requests.load(.acquire);

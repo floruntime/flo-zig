@@ -355,22 +355,73 @@ test "live: appends to a stream and reads it back in order, with headers" {
     for (res.records, ids) |r, id| try testing.expectEqual(id, r.id);
 }
 
-test "live: enqueues, dequeues and acks a message" {
+test "live: a dequeued message is leased until completed, and an expired lease is delivered again" {
     var live: Live = .{ .client = undefined };
     try live.init();
     defer live.deinit();
     var queue = flo.Queue.init(&live.client);
     const seq = try queue.enqueue("jobs", "job-1", .{});
-    var res = try queue.dequeue("jobs", 1, .{});
+    var res = try queue.dequeue("jobs", 1, .{ .consumer = "c1" });
     defer res.deinit();
     try testing.expectEqual(@as(usize, 1), res.messages.len);
     try testing.expectEqualStrings("job-1", res.messages[0].payload);
     try testing.expectEqual(seq, res.messages[0].seq);
-    try queue.ack("jobs", &.{res.messages[0].seq}, .{});
-    var again = try queue.peek("jobs", 10, .{});
-    defer again.deinit();
-    try testing.expectEqual(@as(usize, 0), again.messages.len);
-    try testing.expect(!again.more);
+    try testing.expectEqual(@as(u32, 1), res.messages[0].deliveries);
+    try testing.expect(res.expires_at_ms > std.time.milliTimestamp());
+
+    // Leased: nothing is ready while it's held.
+    var held = try queue.dequeue("jobs", 1, .{ .consumer = "c1" });
+    defer held.deinit();
+    try testing.expectEqual(@as(usize, 0), held.messages.len);
+
+    var done = try queue.complete("jobs", res.lease, res.messages, .{ .consumer = "c1" });
+    defer done.deinit();
+    try testing.expectEqual(@as(u32, 1), done.applied);
+    try testing.expectEqual(@as(usize, 0), done.refused.len);
+    // A second complete: done already.
+    var again_done = try queue.complete("jobs", res.lease, res.messages, .{ .consumer = "c1" });
+    defer again_done.deinit();
+    try testing.expectEqual(@as(u32, 0), again_done.applied);
+    try testing.expectEqual(flo.QueueRefusalWhy.gone, again_done.refused[0].why);
+
+    var after = try queue.dequeue("jobs", 1, .{ .consumer = "c1" });
+    defer after.deinit();
+    try testing.expectEqual(@as(usize, 0), after.messages.len);
+    var none = try queue.peek("jobs", 10, .{});
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.messages.len);
+
+    // The shortest lease runs out unreported: the message comes back.
+    const lost = try queue.enqueue("jobs", "job-2", .{});
+    var first = try queue.dequeue("jobs", 1, .{ .consumer = "c1", .lease_ms = 5000 });
+    defer first.deinit();
+    try testing.expectEqual(lost, first.messages[0].seq);
+    var second = try queue.dequeue("jobs", 1, .{ .consumer = "c1", .block_ms = 15_000 });
+    defer second.deinit();
+    try testing.expectEqual(@as(usize, 1), second.messages.len);
+    try testing.expectEqual(lost, second.messages[0].seq);
+    try testing.expectEqual(@as(u32, 2), second.messages[0].deliveries);
+    // The first delivery's report is refused; the second's applies.
+    var stale = try queue.complete("jobs", first.lease, first.messages, .{ .consumer = "c1" });
+    defer stale.deinit();
+    try testing.expectEqual(@as(u32, 0), stale.applied);
+    try testing.expectEqual(@as(usize, 1), stale.refused.len);
+    try testing.expectEqual(flo.QueueRefusalWhy.delivered_again, stale.refused[0].why);
+    var fresh = try queue.complete("jobs", second.lease, second.messages, .{ .consumer = "c1" });
+    defer fresh.deinit();
+    try testing.expectEqual(@as(u32, 1), fresh.applied);
+}
+
+test "live: enqueue's delay holds a message back, and purge removes what's left" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var queue = flo.Queue.init(&live.client);
+    _ = try queue.enqueue("delayed", "later", .{ .delay_ms = 60_000 });
+    var none = try queue.dequeue("delayed", 1, .{});
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.messages.len);
+    try testing.expectEqual(@as(u32, 1), try queue.purge("delayed", .{}));
 }
 
 test "live: peek shows the next ready messages in dequeue order without taking them" {

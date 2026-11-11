@@ -102,7 +102,7 @@ pub const Stream = struct {
         var opts_buf: [64]u8 = undefined;
         var builder = wire.OptionsBuilder.init(&opts_buf);
 
-        // Start StreamID for reads (inclusive)
+        // Read records after this StreamID (exclusive)
         if (options.start) |start| {
             const bytes = start.toBytes();
             try builder.addBytes(.stream_start, &bytes);
@@ -583,7 +583,7 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
         if (pos + 1 > data.len) return FloError.IncompleteResponse;
         const tier_byte = data[pos];
         pos += 1;
-        const tier = std.meta.intToEnum(types.StorageTier, tier_byte) catch return FloError.IncompleteResponse;
+        const tier: types.StorageTier = @enumFromInt(tier_byte);
 
         // Skip partition
         if (pos + 4 > data.len) return FloError.IncompleteResponse;
@@ -682,18 +682,16 @@ test "Stream init" {
     _ = stream;
 }
 
-test "a record's tier byte reads as the server sends it: 0 hot, 1 warm, anything else refused" {
+test "a record's tier byte reads as the server sends it: 0 hot, 1 warm, 2 disk, and one this SDK predates as its number" {
     // [count=1][seq][ts][tier][partition][key_present=0][payload_len=0][header_count=0]
     var buf = [_]u8{0} ** (4 + 8 + 8 + 1 + 4 + 1 + 4 + 4);
     std.mem.writeInt(u32, buf[0..4], 1, .little);
-    for ([_]struct { u8, types.StorageTier }{ .{ 0, .hot }, .{ 1, .warm } }) |c| {
+    for ([_]struct { u8, types.StorageTier }{ .{ 0, .hot }, .{ 1, .warm }, .{ 2, .disk }, .{ 9, @enumFromInt(9) } }) |c| {
         buf[20] = c[0];
         var result = try parseStreamReadResponse(std.testing.allocator, &buf);
         defer result.deinit();
         try std.testing.expectEqual(c[1], result.records[0].tier);
     }
-    buf[20] = 2;
-    try std.testing.expectError(FloError.IncompleteResponse, parseStreamReadResponse(std.testing.allocator, &buf));
 }
 
 /// A read answer of `n` records, each with a stream name, payload and one header.

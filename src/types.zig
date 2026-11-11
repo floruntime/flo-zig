@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0x7eb599c24442118b;
+pub const TABLE_HASH: u64 = 0x19075df8e1ed5f75;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -277,15 +277,14 @@ pub const OpCode = enum(u16) {
 
     // ── Queues (0x170 – 0x19F) ──
     queue_enqueue = 0x170,
-    queue_dequeue = 0x171,
-    queue_complete = 0x172,
-    queue_fail = 0x174,
     queue_dlq_list = 0x176,
-    queue_dlq_delete = 0x177,
-    queue_dlq_requeue = 0x178,
     queue_stats = 0x17B,
     queue_purge = 0x17F,
     queue_peek = 0x180,
+    queue_dequeue = 0x181,
+    queue_complete = 0x182,
+    queue_fail = 0x183,
+    queue_touch = 0x184,
     queue_list = 0x198,
 
     // ── Time-Series (0x1A0 – 0x1BF) ──
@@ -419,12 +418,13 @@ pub const OptionTag = enum(u8) {
 
     // Queue Options (0x10 - 0x1F)
     priority = 0x10, // u8: Message priority (0-255, lower is dequeued first)
-    count = 0x15, // u32: Number of messages to dequeue
+    delay_ms = 0x11, // u64: How long before an enqueued message is ready (at most a day)
+    count = 0x15, // u32: Number of records to read
     block_ms = 0x17, // u32: Blocking wait for data (0=don't wait, max 300000)
 
     // Stream Options (0x20 - 0x2F) - StreamID-native ONLY
     // 0x20 reserved
-    stream_start = 0x21, // [16]u8: Start StreamID for reads (inclusive)
+    stream_start = 0x21, // [16]u8: Read records after this StreamID (exclusive)
     stream_end = 0x22, // [16]u8: End StreamID for reads (inclusive)
     stream_tail = 0x23, // void: Flag indicating tail read (start from end of stream)
     partition = 0x24, // u32: Explicit partition index
@@ -503,8 +503,8 @@ pub const FloError = error{
     /// Not retryable: the write may have committed without being applied,
     /// so resending can apply it twice.
     InternalError,
-    /// Retryable: the write reached no leader, or the shard stopped taking
-    /// writes or is offline. An offline shard stays so until an operator
+    /// Retryable: the request reached no leader, its records are still being
+    /// read from disk, or the shard stopped taking writes or is offline. An offline shard stays so until an operator
     /// acts; Client.lastError has the server's reason. With reason
     /// shard_halted it isn't retried: the shard waits on a repair.
     Unavailable,
@@ -512,8 +512,8 @@ pub const FloError = error{
     /// (status outcome_pending). Never retried: resending would write it
     /// twice. Client.lastError has the reason, ran and message.
     OutcomePending,
-    /// A halted shard answered that the key doesn't exist as of the entry it
-    /// halted at; it may exist since. Not the same as absent.
+    /// A stale read (see `GetResult.stale`) found no such key; it may exist
+    /// since. Not the same as absent.
     StaleNotFound,
     /// An action complete, fail or touch for a delivery that has moved on
     /// (status conflict, reason stale_report); Client.lastError's message
@@ -539,7 +539,7 @@ pub const ScanResult = struct {
     keys: [][]const u8,
     cursor: ?[]const u8,
     allocator: std.mem.Allocator,
-    /// Read from a halted shard (see `GetResult.stale`).
+    /// A stale read (see `GetResult.stale`).
     stale: bool = false,
 
     pub fn deinit(self: *ScanResult) void {
@@ -555,7 +555,7 @@ pub const HistoryResult = struct {
     /// Older kept versions follow: ask again with `before_version` set to
     /// the last version here.
     more: bool,
-    /// Read from a halted shard (see `GetResult.stale`); a missing key is
+    /// A stale read (see `GetResult.stale`); a missing key is
     /// missing as of the halt.
     stale: bool = false,
     allocator: std.mem.Allocator,
@@ -569,7 +569,7 @@ pub const HistoryResult = struct {
 /// Whether a key exists, from `KV.exists`.
 pub const ExistsResult = struct {
     exists: bool,
-    /// Read from a halted shard (see `GetResult.stale`).
+    /// A stale read (see `GetResult.stale`).
     stale: bool = false,
 };
 
@@ -620,9 +620,10 @@ pub const GetResult = struct {
     /// When the key's TTL runs out, in Unix milliseconds; null when it has
     /// none. Always null from `KV.jsonGet`.
     expires_at_ms: ?i64 = null,
-    /// Read from a halted shard: its state just before the entry it halted
-    /// at, without anything written since. The read succeeded; it is not an
-    /// error.
+    /// A stale read: from a halted shard, its state just before the entry it
+    /// halted at, or from a node whose log reads are blocked, its state as
+    /// last applied. Either way it lacks what was written since. The read
+    /// succeeded; it is not an error.
     stale: bool = false,
 
     pub fn deinit(self: *GetResult, allocator: std.mem.Allocator) void {
@@ -638,7 +639,7 @@ pub const MGetEntry = struct {
     value: []const u8,
     version: u64,
     found: bool,
-    /// Answered by a halted shard (see `GetResult.stale`); a missing key is
+    /// A stale read (see `GetResult.stale`); a missing key is
     /// missing as of the halt.
     stale: bool = false,
 };
@@ -658,29 +659,75 @@ pub const MGetResult = struct {
     }
 };
 
-/// Queue message
+/// A dequeued message, leased to its consumer until a complete, a fail or
+/// the lease running out.
 pub const Message = struct {
     seq: u64,
+    /// Lower is taken first.
+    priority: u32,
+    /// The message's deliveries, this one included. A report names it back.
+    deliveries: u32,
+    enqueued_at_ms: i64,
     payload: []const u8,
-    enqueued_at_ms: i64 = 0,
-    delivery_count: u32 = 0,
-    priority: u8 = 0,
-
-    pub fn deinit(self: *Message, allocator: std.mem.Allocator) void {
-        allocator.free(self.payload);
-    }
 };
 
-/// Result of a queue dequeue operation
+/// The delivery a dequeue made: a complete, fail or touch names it back.
+pub const QueueLease = struct {
+    term: u64,
+    index: u64,
+};
+
+/// One dequeue's messages and their lease. Free with `deinit`.
 pub const DequeueResult = struct {
     messages: []Message,
+    lease: QueueLease,
+    /// When the lease runs out without a touch, in Unix milliseconds.
+    expires_at_ms: i64,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *DequeueResult) void {
-        for (self.messages) |*msg| {
-            msg.deinit(self.allocator);
-        }
+        for (self.messages) |m| self.allocator.free(m.payload);
         self.allocator.free(self.messages);
+    }
+};
+
+/// Why a complete, fail or touch left a message as it was.
+pub const QueueRefusalWhy = enum(u8) {
+    /// Completed already, or not in this queue. For a complete, it's done.
+    gone = 0,
+    /// Delivered again since this delivery.
+    delivered_again = 1,
+    /// Another consumer holds it.
+    other_holder = 2,
+    /// Its lease ran out; it is ready again.
+    expired = 3,
+    /// Failed back since.
+    released = 4,
+    /// Nobody holds it.
+    not_held = 5,
+    _,
+};
+
+/// A message a report left as it was.
+pub const QueueRefusal = struct {
+    seq: u64,
+    why: QueueRefusalWhy,
+    reason: []const u8,
+};
+
+/// What a complete, fail or touch did: how many messages it applied to,
+/// and those it didn't, each with why. Free with `deinit`.
+pub const QueueReport = struct {
+    applied: u32,
+    refused: []QueueRefusal,
+    /// For a touch: when the lease runs out without another, in Unix
+    /// milliseconds. 0 for a complete or fail.
+    expires_at_ms: i64 = 0,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *QueueReport) void {
+        for (self.refused) |r| self.allocator.free(r.reason);
+        self.allocator.free(self.refused);
     }
 };
 
@@ -810,26 +857,64 @@ pub const KVBeginOptions = struct {
 pub const EnqueueOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Lower is dequeued first; equal priorities go in enqueue order.
+    /// Lower is dequeued first; equal priorities go in the order they
+    /// became ready.
     priority: u8 = 0,
+    /// How long before the message is ready, at most a day.
+    delay_ms: u64 = 0,
 };
+
+/// The most messages one dequeue takes, and one report names.
+pub const MAX_QUEUE_BATCH: usize = 100;
+/// The longest queue consumer name.
+pub const MAX_QUEUE_CONSUMER: usize = 4082;
+/// The shortest and longest lease a dequeue may ask for.
+pub const MIN_QUEUE_LEASE_MS: u64 = 5_000;
+pub const MAX_QUEUE_LEASE_MS: u64 = 43_200_000;
+/// The longest error a queue fail carries.
+pub const MAX_QUEUE_ERROR: usize = 1024;
 
 /// Options for queue dequeue operations
 pub const DequeueOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Block waiting for messages, in ms (null or 0 = don't wait, max 300000)
-    block_ms: ?u32 = null,
+    /// Who holds the messages; reports must name the same consumer.
+    consumer: []const u8 = "",
+    /// How long the messages are held without a touch, 5000 to 43200000
+    /// ms; null for the server's 30000.
+    lease_ms: ?u64 = null,
+    /// Block waiting for messages, in ms (0 = don't wait, max 300000)
+    block_ms: u32 = 0,
+    /// Complete them as they're taken, a one-shot consume; if the leader
+    /// fails in between, they come back once their lease runs out. The
+    /// answer comes once the complete applies. Off, they are leased.
+    ack: bool = false,
 };
 
-/// Options for queue ack operations
-pub const AckOptions = struct {
+/// Options for queue complete and touch
+pub const QueueReportOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+    /// The consumer the messages were dequeued as.
+    consumer: []const u8 = "",
 };
 
-/// Options for queue nack operations
-pub const NackOptions = struct {
+/// Options for queue fail
+pub const QueueFailOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// The consumer the messages were dequeued as.
+    consumer: []const u8 = "",
+    /// How long before they are ready again, at most a day.
+    delay_ms: u64 = 0,
+    /// Move them to the DLQ now, attempts left or not.
+    dead: bool = false,
+    /// Why they failed, at most 1024 bytes.
+    error_message: []const u8 = "",
+};
+
+/// Options for queue purge
+pub const PurgeOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
 };
@@ -875,12 +960,6 @@ pub const DlqPage = struct {
         for (self.letters) |l| self.allocator.free(l.payload);
         self.allocator.free(self.letters);
     }
-};
-
-/// Options for DLQ requeue operations
-pub const DlqRequeueOptions = struct {
-    /// Override client's default namespace
-    namespace: ?[]const u8 = null,
 };
 
 /// The most messages one queue peek shows.
@@ -951,11 +1030,16 @@ pub const StreamID = struct {
     }
 };
 
-/// The tier a stream record was served from: the in-memory log, or the warm
-/// store after it left the log. These are the only two the server sends.
+/// Where a stream record was read from, as the server's op table has it. A
+/// tier this SDK predates is kept as its number (`_`), not refused.
 pub const StorageTier = enum(u8) {
+    /// The hot ring of recent appends.
     hot = 0,
+    /// The warm store of payload copies.
     warm = 1,
+    /// The durable log: a sealed segment, or the segment writer's buffer.
+    disk = 2,
+    _,
 };
 
 /// A single stream record
@@ -1023,7 +1107,7 @@ pub const StreamAppendOptions = struct {
 pub const StreamReadOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Start StreamID for reads (inclusive)
+    /// Read records after this StreamID (exclusive)
     start: ?StreamID = null,
     /// End StreamID for reads (inclusive)
     end: ?StreamID = null,

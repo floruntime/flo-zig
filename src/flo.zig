@@ -28,6 +28,11 @@
 //!     _ = try queue.enqueue("tasks", "payload", .{});
 //!     var result = try queue.dequeue("tasks", 10, .{});
 //!     defer result.deinit();
+//!     // Leased, not consumed: complete them within the lease.
+//!     if (result.messages.len > 0) {
+//!         var done = try queue.complete("tasks", result.lease, result.messages, .{});
+//!         done.deinit();
+//!     }
 //! }
 //! ```
 
@@ -128,7 +133,13 @@ pub const HistoryOptions = types.HistoryOptions;
 // Option types - Queue
 pub const EnqueueOptions = types.EnqueueOptions;
 pub const DequeueOptions = types.DequeueOptions;
-pub const NackOptions = types.NackOptions;
+pub const QueueLease = types.QueueLease;
+pub const QueueReport = types.QueueReport;
+pub const QueueRefusal = types.QueueRefusal;
+pub const QueueRefusalWhy = types.QueueRefusalWhy;
+pub const QueueReportOptions = types.QueueReportOptions;
+pub const QueueFailOptions = types.QueueFailOptions;
+pub const PurgeOptions = types.PurgeOptions;
 pub const DlqListOptions = types.DlqListOptions;
 pub const DlqPage = types.DlqPage;
 pub const DeadLetter = types.DeadLetter;

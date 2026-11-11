@@ -234,7 +234,7 @@ pub fn isTableOp(op: OpCode) bool {
     return switch (op) {
         .namespace_create, .namespace_delete, .namespace_list, .namespace_info => true,
         .kv_put, .kv_get, .kv_mget, .kv_delete, .kv_scan, .kv_history, .kv_incr, .kv_json_get, .kv_json_set, .kv_json_del, .kv_txn_begin, .kv_txn_commit, .kv_txn_rollback, .kv_expire, .kv_exists => true,
-        .stream_group_list, .stream_group_members, .queue_peek => true,
+        .stream_group_list, .stream_group_members, .queue_peek, .queue_dequeue, .queue_complete, .queue_fail, .queue_touch => true,
         .action_status, .action_await, .action_complete, .action_fail, .action_touch, .action_info => true,
         .worker_list, .worker_info, .processing_remove => true,
         else => false,
@@ -340,14 +340,14 @@ pub fn serializeRequest(
 // =============================================================================
 
 /// Raw response from server
-/// Response flag: the answer reads a halted shard's state from just before
-/// the entry it halted at, and nothing written since.
+/// Response flag: the answer reads state that lacks what was written since:
+/// a halted shard's, or a node's whose log reads are blocked.
 pub const RESPONSE_STALE: u8 = 0x01;
 
 pub const RawResponse = struct {
     status: StatusCode,
     /// The answer carries RESPONSE_STALE: a successful read (or not-found)
-    /// from a halted shard.
+    /// from a halted shard or a read-blocked node.
     stale: bool = false,
     data: []const u8,
     allocator: Allocator,
@@ -399,79 +399,6 @@ pub fn parseListTrailer(data: []const u8, offset: usize) FloError!ListTrailer {
         .has_more = has_more,
         .cursor = if (cursor_len > 0) data[start..][0..cursor_len] else null,
     };
-}
-
-/// Parse a dequeue response
-/// Format: [count:u32][messages...]
-/// Message format: [seq:u64][payload_len:u32][payload][enqueued_at_ms:i64][delivery_count:u32][priority:u8]
-pub fn parseDequeueResponse(allocator: Allocator, data: []const u8) !types.DequeueResult {
-    if (data.len < 4) return FloError.IncompleteResponse;
-
-    var offset: usize = 0;
-
-    const count = std.mem.readInt(u32, data[offset..][0..4], .little);
-    offset += 4;
-    // Each message: [seq:u64][payload_len:u32][payload]
-    //               [enqueued_at_ms:i64][delivery_count:u32][priority:u8]
-    // A count the data can't hold is refused before it sizes an allocation.
-    const min_message = 8 + 4 + 8 + 4 + 1;
-    if (count > (data.len - offset) / min_message) return FloError.IncompleteResponse;
-
-    var messages = try allocator.alloc(types.Message, count);
-    var i: usize = 0;
-    errdefer {
-        for (messages[0..i]) |*m| m.deinit(allocator);
-        allocator.free(messages);
-    }
-
-    while (i < count) : (i += 1) {
-        if (data.len < offset + 12) return FloError.IncompleteResponse;
-
-        const seq = std.mem.readInt(u64, data[offset..][0..8], .little);
-        offset += 8;
-
-        const payload_len = std.mem.readInt(u32, data[offset..][0..4], .little);
-        offset += 4;
-
-        if (data.len < offset + payload_len + 13) return FloError.IncompleteResponse;
-        const payload_bytes = data[offset..][0..payload_len];
-        offset += payload_len;
-        const enqueued_at_ms = std.mem.readInt(i64, data[offset..][0..8], .little);
-        const delivery_count = std.mem.readInt(u32, data[offset + 8 ..][0..4], .little);
-        const priority = data[offset + 12];
-        offset += 13;
-
-        messages[i] = .{
-            .seq = seq,
-            .payload = try allocator.dupe(u8, payload_bytes),
-            .enqueued_at_ms = enqueued_at_ms,
-            .delivery_count = delivery_count,
-            .priority = priority,
-        };
-    }
-
-    return types.DequeueResult{
-        .messages = messages,
-        .allocator = allocator,
-    };
-}
-
-/// Serialize sequence numbers for ack/nack
-/// Format: [count:u32][seq:u64]*
-pub fn serializeSeqs(buffer: []u8, seqs: []const u64) FloError![]const u8 {
-    const needed = 4 + seqs.len * 8;
-    if (buffer.len < needed) return FloError.BufferTooSmall;
-
-    var offset: usize = 0;
-    std.mem.writeInt(u32, buffer[offset..][0..4], @intCast(seqs.len), .little);
-    offset += 4;
-
-    for (seqs) |seq| {
-        std.mem.writeInt(u64, buffer[offset..][0..8], seq, .little);
-        offset += 8;
-    }
-
-    return buffer[0..offset];
 }
 
 // =============================================================================
@@ -535,7 +462,7 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
-    try std.testing.expectEqual(@as(u64, 0x7eb599c24442118b), header.table_hash);
+    try std.testing.expectEqual(@as(u64, 0x19075df8e1ed5f75), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
 }
 
@@ -546,18 +473,6 @@ test "a table op's frame is the envelope and its body: no value length, no optio
     const frame = try serializeRequest(&buffer, 1, .worker_list, "ns", "", body, "");
     try std.testing.expectEqualSlices(u8, "\x02\x00ns" ++ "\x00\x00" ++ body, frame[32..]);
     try std.testing.expectError(FloError.IncompleteRequest, serializeRequest(&buffer, 1, .worker_list, "ns", "", body, "x"));
-}
-
-test "serializeSeqs" {
-    var buffer: [64]u8 = undefined;
-    const seqs = [_]u64{ 1, 2, 3 };
-
-    const serialized = try serializeSeqs(&buffer, &seqs);
-
-    try std.testing.expectEqual(@as(usize, 28), serialized.len);
-
-    const count = std.mem.readInt(u32, serialized[0..4], .little);
-    try std.testing.expectEqual(@as(u32, 3), count);
 }
 
 test "OptionsBuilder refuses a blocking wait over 300000 ms" {
@@ -590,55 +505,4 @@ test "parseListTrailer refuses a cursor that contradicts has_more" {
     try std.testing.expectError(FloError.UnexpectedResponse, parseListTrailer(&.{ 0, 1, 0, 'c' }, 0));
     // has_more=1 with no cursor.
     try std.testing.expectError(FloError.UnexpectedResponse, parseListTrailer(&.{ 1, 0, 0 }, 0));
-}
-
-test "parseDequeueResponse reads every message as the server writes it" {
-    const Want = struct { seq: u64, payload: []const u8, at: i64, deliveries: u32, priority: u8 };
-    const want = [_]Want{
-        .{ .seq = 100, .payload = "task1", .at = 1_700_000_000_000, .deliveries = 1, .priority = 0 },
-        .{ .seq = 101, .payload = "t2", .at = 1_700_000_000_005, .deliveries = 2, .priority = 7 },
-        .{ .seq = 102, .payload = "", .at = 1_700_000_000_009, .deliveries = 3, .priority = 255 },
-    };
-    var buf: [256]u8 = undefined;
-    std.mem.writeInt(u32, buf[0..4], want.len, .little);
-    var at: usize = 4;
-    for (want) |m| {
-        std.mem.writeInt(u64, buf[at..][0..8], m.seq, .little);
-        std.mem.writeInt(u32, buf[at + 8 ..][0..4], @intCast(m.payload.len), .little);
-        @memcpy(buf[at + 12 ..][0..m.payload.len], m.payload);
-        at += 12 + m.payload.len;
-        std.mem.writeInt(i64, buf[at..][0..8], m.at, .little);
-        std.mem.writeInt(u32, buf[at + 8 ..][0..4], m.deliveries, .little);
-        buf[at + 12] = m.priority;
-        at += 13;
-    }
-
-    var result = try parseDequeueResponse(std.testing.allocator, buf[0..at]);
-    defer result.deinit();
-    try std.testing.expectEqual(want.len, result.messages.len);
-    for (want, result.messages) |w, got| {
-        try std.testing.expectEqual(w.seq, got.seq);
-        try std.testing.expectEqualStrings(w.payload, got.payload);
-        try std.testing.expectEqual(w.at, got.enqueued_at_ms);
-        try std.testing.expectEqual(w.deliveries, got.delivery_count);
-        try std.testing.expectEqual(w.priority, got.priority);
-    }
-}
-
-test "parseDequeueResponse refuses a cut trailer and a count its data can't hold, freeing only what it parsed" {
-    var huge: [4]u8 = undefined;
-    std.mem.writeInt(u32, &huge, std.math.maxInt(u32), .little);
-    try std.testing.expectError(FloError.IncompleteResponse, parseDequeueResponse(std.testing.allocator, &huge));
-
-    // Two messages claimed; the second's trailer is cut short.
-    var data: [4 + 26 + 25]u8 = undefined;
-    std.mem.writeInt(u32, data[0..4], 2, .little);
-    std.mem.writeInt(u64, data[4..12], 1, .little);
-    std.mem.writeInt(u32, data[12..16], 1, .little);
-    data[16] = 'a';
-    @memset(data[17..30], 0);
-    std.mem.writeInt(u64, data[30..38], 2, .little);
-    std.mem.writeInt(u32, data[38..42], 1, .little);
-    @memset(data[42..], 0);
-    try std.testing.expectError(FloError.IncompleteResponse, parseDequeueResponse(std.testing.allocator, &data));
 }

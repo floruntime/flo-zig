@@ -137,7 +137,7 @@ pub const KV = struct {
         const body = try encodeHistoryBody(&buf, options.limit, options.before_version, options.routing_key);
         var response = try self.client.sendRequest(.kv_history, self.client.getNamespace(options.namespace), key, body, "");
         defer response.deinit();
-        // A missing key has no versions; a halted shard's answer keeps its mark.
+        // A missing key has no versions; a stale answer keeps its mark.
         if (response.status == .not_found and self.client.last_error_reason == .not_found) {
             return .{ .versions = try self.client.allocator.alloc(types.VersionEntry, 0), .more = false, .stale = response.stale, .allocator = self.client.allocator };
         }

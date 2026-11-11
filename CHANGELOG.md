@@ -2,8 +2,38 @@
 
 ## Unreleased
 
-- **Breaking:** pinned to the table hash of flo `e63add5` (`0x7eb599c24442118b`);
+- **Breaking:** pinned to the table hash of flo `5213836` (`0x19075df8e1ed5f75`);
   this SDK and older servers refuse each other.
+- **Breaking:** queues are leased until completed: delivery is at least
+  once. `Queue.dequeue` (`0x181`) leases its messages to `options.consumer`
+  for `lease_ms` (the server's 30 s by default) and returns their `lease`
+  (term, index) and `expires_at_ms`; each `Message` carries `deliveries`.
+  `Queue.ack` and `Queue.nack` are gone: `complete` (`0x182`), `fail`
+  (`0x183`, with `delay_ms`, `dead` and an error) and the new `touch`
+  (`0x184`) name the lease, the messages and the same consumer, and return a
+  `QueueReport` of what applied and each message refused, with why (`gone`
+  means completed already). `dequeue` with `.ack = true` completes them as they're taken, a one-shot
+  consume; if the leader fails in between, they come back once their lease
+  runs out.
+  The old codes `0x171`, `0x172` and `0x174` are gone.
+- **Breaking:** `Queue.dlqRequeue` and `DlqRequeueOptions` are removed: the
+  server refuses a requeue as not implemented. The DLQ requeue and delete op
+  codes go with them.
+- **Breaking:** `Message.priority` is a u32, as the server sends it, and
+  `delivery_count` is `deliveries`. `DequeueOptions.block_ms` is a u32
+  defaulting to 0, no longer optional.
+- `EnqueueOptions.delay_ms` holds a message back, at most a day.
+  `Queue.purge` removes a queue's messages and says how many.
+- A full queue (past its cap of messages or bytes, or its shard's of
+  bytes) refuses an enqueue as `overloaded` without running it; the client
+  retries it like any such refusal, then returns `FloError.Overloaded`.
+- **Breaking:** `StorageTier` follows the server: hot 0, warm 1, disk 2. A
+  tier this SDK predates is kept as its number instead of refusing the read.
+- A stream worker reads again, logging a warning, when a group read is
+  refused `unavailable` without running (its records are still being read
+  from disk): the read claimed nothing.
+- Docs: `stale` also marks reads from a node whose log reads are blocked,
+  not only a halted shard.
 - **Breaking:** the action reports follow the server's new ops (await
   `0x30A`, complete `0x30B`, fail `0x30C`, touch `0x30D`), with typed bodies;
   the old codes are gone. A task carries its delivery (`namespace`,
