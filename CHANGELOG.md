@@ -12,11 +12,16 @@
   (`0x183`, with `delay_ms`, `dead` and an error) and the new `touch`
   (`0x184`) name the lease, the messages and the same consumer, and return a
   `QueueReport` of what applied and each message refused, with why (`gone`
-  means completed already). `dequeue` with `.ack = true` is at most once.
+  means completed already). `dequeue` with `.ack = true` completes them as they're taken, a one-shot
+  consume; if the leader fails in between, they come back once their lease
+  runs out.
   The old codes `0x171`, `0x172` and `0x174` are gone.
 - **Breaking:** `Queue.dlqRequeue` and `DlqRequeueOptions` are removed: the
   server refuses a requeue as not implemented. The DLQ requeue and delete op
   codes go with them.
+- **Breaking:** `Message.priority` is a u32, as the server sends it, and
+  `delivery_count` is `deliveries`. `DequeueOptions.block_ms` is a u32
+  defaulting to 0, no longer optional.
 - `EnqueueOptions.delay_ms` holds a message back, at most a day.
   `Queue.purge` removes a queue's messages and says how many.
 - A full queue (past its cap of messages or bytes, or its shard's of

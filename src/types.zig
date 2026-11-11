@@ -424,7 +424,7 @@ pub const OptionTag = enum(u8) {
 
     // Stream Options (0x20 - 0x2F) - StreamID-native ONLY
     // 0x20 reserved
-    stream_start = 0x21, // [16]u8: Start StreamID for reads (inclusive)
+    stream_start = 0x21, // [16]u8: Read records after this StreamID (exclusive)
     stream_end = 0x22, // [16]u8: End StreamID for reads (inclusive)
     stream_tail = 0x23, // void: Flag indicating tail read (start from end of stream)
     partition = 0x24, // u32: Explicit partition index
@@ -885,8 +885,9 @@ pub const DequeueOptions = struct {
     lease_ms: ?u64 = null,
     /// Block waiting for messages, in ms (0 = don't wait, max 300000)
     block_ms: u32 = 0,
-    /// Complete the messages as they're taken: at most once, and the answer
-    /// comes once the complete applies. Off, they are leased.
+    /// Complete them as they're taken, a one-shot consume; if the leader
+    /// fails in between, they come back once their lease runs out. The
+    /// answer comes once the complete applies. Off, they are leased.
     ack: bool = false,
 };
 
@@ -1106,7 +1107,7 @@ pub const StreamAppendOptions = struct {
 pub const StreamReadOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Start StreamID for reads (inclusive)
+    /// Read records after this StreamID (exclusive)
     start: ?StreamID = null,
     /// End StreamID for reads (inclusive)
     end: ?StreamID = null,

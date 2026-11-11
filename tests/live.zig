@@ -405,6 +405,8 @@ test "live: a dequeued message is leased until completed, and an expired lease i
     var stale = try queue.complete("jobs", first.lease, first.messages, .{ .consumer = "c1" });
     defer stale.deinit();
     try testing.expectEqual(@as(u32, 0), stale.applied);
+    try testing.expectEqual(@as(usize, 1), stale.refused.len);
+    try testing.expectEqual(flo.QueueRefusalWhy.delivered_again, stale.refused[0].why);
     var fresh = try queue.complete("jobs", second.lease, second.messages, .{ .consumer = "c1" });
     defer fresh.deinit();
     try testing.expectEqual(@as(u32, 1), fresh.applied);

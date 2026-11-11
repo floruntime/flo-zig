@@ -263,7 +263,8 @@ var result = try queue.dequeue("queue-name", 10, .{ .consumer = "c1", .block_ms 
 defer result.deinit();
 
 // Reports name the dequeue's lease, the messages (seq and deliveries) and the
-// same consumer. Each message is applied or refused on its own, inside an ok
+// same consumer: pass `.consumer` in every complete, fail and touch, or each
+// message is refused `.other_holder`. Each message is applied or refused on its own, inside an ok
 // answer; for a complete, a message refused `.gone` was completed already.
 var done = try queue.complete("queue-name", result.lease, result.messages, .{ .consumer = "c1" });
 defer done.deinit();
@@ -275,7 +276,8 @@ for (done.refused) |r| std.debug.print("{d}: {s} ({s})\n", .{ r.seq, @tagName(r.
 var failed = try queue.fail("queue-name", result.lease, result.messages, .{ .consumer = "c1", .delay_ms = 1000 });
 defer failed.deinit();
 
-// At most once instead: completed as they're taken
+// A one-shot consume: completed as they're taken. If the leader fails in
+// between, they come back once their lease runs out.
 var taken = try queue.dequeue("queue-name", 10, .{ .ack = true });
 defer taken.deinit();
 

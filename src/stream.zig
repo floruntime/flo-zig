@@ -102,7 +102,7 @@ pub const Stream = struct {
         var opts_buf: [64]u8 = undefined;
         var builder = wire.OptionsBuilder.init(&opts_buf);
 
-        // Start StreamID for reads (inclusive)
+        // Read records after this StreamID (exclusive)
         if (options.start) |start| {
             const bytes = start.toBytes();
             try builder.addBytes(.stream_start, &bytes);
