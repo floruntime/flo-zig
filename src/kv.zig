@@ -246,9 +246,11 @@ pub const KV = struct {
     /// Open a per-shard KV transaction on the shard that owns `key`, pinned
     /// to its `{tag}`, or to the whole key when it has none. Every key the
     /// transaction touches must route with it: give them all the same
-    /// `{tag}` (`{user:1}:balance`, `{user:1}:history`). An op on a key
-    /// that routes elsewhere is refused bad_request, reason
-    /// `keys_not_colocated`, without running.
+    /// `{tag}` (`{user:1}:balance`, `{user:1}:history`). The tag is what
+    /// lies between the first `{` and the next `}`: an empty `{}` routes
+    /// every key that has one together, and a `{` with no `}` after it
+    /// routes by the whole key. An op on a key that routes elsewhere is
+    /// refused bad_request, reason `keys_not_colocated`, without running.
     ///
     /// **Caller must call `txn.commit()` or `txn.rollback()`, then
     /// `txn.deinit()` to release the namespace copy.**

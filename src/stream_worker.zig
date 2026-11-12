@@ -70,8 +70,8 @@ pub const StreamWorkerConfig = struct {
     /// once.
     concurrency: u32 = 1,
     /// Records to lease per read, 1 to 100 (default: 10). The group's lease
-    /// runs for the whole batch from its read: with concurrency 1 they are
-    /// handled in turn, so keep a batch's handling within it, or touch.
+    /// runs for the whole batch from its read, records waiting their turn
+    /// included: handle the batch within it, or set auto_touch.
     batch_size: u32 = 10,
     /// Long-poll wait per read in ms. 0 means DEFAULT_WORKER_BLOCK_MS; over
     /// MAX_BLOCK_MS, StreamWorker.init returns error.BlockTooLong.
@@ -84,14 +84,15 @@ pub const StreamWorkerConfig = struct {
     machine_id: ?[]const u8 = null,
     /// How its connection retries refused-but-not-run requests.
     retry: retry_mod.RetryPolicy = .{},
-    /// Touch each record every sixth of its lease (at least 100 ms apart,
-    /// counted from when its batch arrived) while the handler runs, from a
-    /// thread on a connection of its own; a record is still held at most
-    /// 12 h from its read. The lease is read off the batch's expiry against
-    /// this host's clock. Off by default: a handler that runs past the lease
-    /// without calling ctx.touch has its record read again, by this
-    /// consumer or another. That thread allocates, so with auto_touch on
-    /// the allocator given to init must be thread-safe.
+    /// Touch every record of a batch not yet acked or nacked, the ones
+    /// waiting their turn included, every sixth of the lease (at least
+    /// 100 ms apart, counted from the batch's arrival), from a thread on a
+    /// connection of its own; a record is still held at most 12 h from its
+    /// read. The lease is read off the batch's expiry against this host's
+    /// clock, and again off each touch's answer. Off by default: a batch
+    /// handled past its lease without ctx.touch has its records read again,
+    /// by this consumer or another. That thread allocates, so with
+    /// auto_touch on the allocator given to init must be thread-safe.
     auto_touch: bool = false,
 
     /// Get the list of streams to consume from.
@@ -178,7 +179,7 @@ pub const StreamWorker = struct {
     last_heartbeat_ns: i128 = 0,
     messages_processed: std.atomic.Value(u64) = .init(0),
     messages_failed: std.atomic.Value(u64) = .init(0),
-    /// auto_touch's connection for records handled inline (concurrency 1).
+    /// auto_touch's connection, opened on first use.
     touch_client: ?Client = null,
     /// The limit refusal last logged, so a run of them logs once.
     limit_notice: types.LimitNotice = .{},
@@ -192,14 +193,13 @@ pub const StreamWorker = struct {
 
     const Self = @This();
 
-    /// A record as a group read leased it: the read's lease, and when the
-    /// batch arrived.
+    /// A record as a group read leased it, with the read's lease and, under
+    /// auto_touch, the batch's toucher.
     const Leased = struct {
         stream_name: []const u8,
         lease: GroupLease,
-        lease_ms: u64,
-        arrived: std.time.Instant,
         record: StreamRecord,
+        toucher: ?*Toucher = null,
     };
 
     /// One record handled on a thread of its own, its ack or nack sent on
@@ -208,14 +208,13 @@ pub const StreamWorker = struct {
     const Slot = struct {
         worker: *Self,
         client: ?Client = null,
-        touch_client: ?Client = null,
         item: Leased = undefined,
         thread: ?std.Thread = null,
         busy: bool = false,
 
         fn run(slot: *Slot) void {
             const w = slot.worker;
-            w.processRecord(w.slotClient(slot), &slot.item, &slot.touch_client);
+            w.processRecord(w.slotClient(slot), &slot.item);
             w.pool_mutex.lock();
             defer w.pool_mutex.unlock();
             slot.busy = false;
@@ -451,7 +450,10 @@ pub const StreamWorker = struct {
         );
     }
 
-    /// Stop the worker immediately.
+    /// Stop the worker: it reads nothing more. Records of the batch in hand
+    /// that have started run to the end and are acked or nacked; those not
+    /// started are handed back at once with a nack, which spends one of
+    /// their attempts (`max_deliver`), so the next read takes them.
     pub fn stop(self: *Self) void {
         std.log.info("[flo-stream-worker] Stopping...", .{});
         @atomicStore(bool, &self.running, false, .monotonic);
@@ -534,7 +536,15 @@ pub const StreamWorker = struct {
             types.pauseWhileRunning(&self.running, pause_ms);
             return;
         }
-        const lease_ms = leaseMsOf(result.expires_at_ms, std.time.milliTimestamp());
+        // Every record of the batch is touched from its arrival until it is
+        // acked or nacked, those still waiting their turn included.
+        var toucher: Toucher = undefined;
+        const touching = self.startTouching(&toucher, stream_name, &result, arrived);
+        defer if (touching) |thread| {
+            toucher.stop.set();
+            thread.join();
+        };
+        const batch_toucher: ?*Toucher = if (touching != null) &toucher else null;
 
         // A result resent on a new connection still names the read's lease:
         // a lease is the consumer's, not the connection's.
@@ -548,17 +558,26 @@ pub const StreamWorker = struct {
                     self.busy_count -= 1;
                     self.pool_mutex.unlock();
                 }
-                var item: Leased = .{ .stream_name = stream_name, .lease = result.lease, .lease_ms = lease_ms, .arrived = arrived, .record = record };
-                self.processRecord(&self.client, &item, &self.touch_client);
+                var item: Leased = .{ .stream_name = stream_name, .lease = result.lease, .record = record, .toucher = batch_toucher };
+                if (!@atomicLoad(bool, &self.running, .monotonic)) {
+                    self.handBack(&self.client, &item);
+                    continue;
+                }
+                self.processRecord(&self.client, &item);
             }
             return;
         }
         try self.ensureSlots();
         for (result.records) |record| {
+            if (!@atomicLoad(bool, &self.running, .monotonic)) {
+                var item: Leased = .{ .stream_name = stream_name, .lease = result.lease, .record = record, .toucher = batch_toucher };
+                self.handBack(&self.client, &item);
+                continue;
+            }
             const slot = self.waitFreeSlot();
             if (slot.thread) |t| t.join();
             slot.thread = null;
-            slot.item = .{ .stream_name = stream_name, .lease = result.lease, .lease_ms = lease_ms, .arrived = arrived, .record = record };
+            slot.item = .{ .stream_name = stream_name, .lease = result.lease, .record = record, .toucher = batch_toucher };
             self.pool_mutex.lock();
             slot.busy = true;
             self.busy_count += 1;
@@ -630,17 +649,14 @@ pub const StreamWorker = struct {
 
     fn releaseSlots(self: *Self) void {
         self.waitIdle();
-        for (self.slots) |*slot| {
-            if (slot.client) |*c| c.deinit();
-            if (slot.touch_client) |*c| c.deinit();
-        }
+        for (self.slots) |*slot| if (slot.client) |*c| c.deinit();
         if (self.slots.len > 0) self.allocator.free(self.slots);
         self.slots = &.{};
     }
 
     /// Process a single record with auto-ack/nack, sent on `conn`: the poll
-    /// connection or a slot's. auto_touch touches it on `touch_conn`.
-    fn processRecord(self: *Self, conn: *Client, item: *const Leased, touch_conn: *?Client) void {
+    /// connection or a slot's.
+    fn processRecord(self: *Self, conn: *Client, item: *const Leased) void {
         var ctx = StreamContext{
             .record = item.record,
             .namespace = self.config.namespace,
@@ -652,16 +668,11 @@ pub const StreamWorker = struct {
             .client = conn,
         };
 
-        var toucher: Toucher = undefined;
-        const touching = self.startTouching(&toucher, item, touch_conn);
         // The handler's outcome alone decides ack or nack: an ack that can't
         // be delivered is never turned into a nack.
         const outcome = self.handler(&ctx);
-        // A touch in flight finishes before the outcome is sent.
-        if (touching) |thread| {
-            toucher.stop.set();
-            thread.join();
-        }
+        // Reported now: later touches don't name it.
+        if (item.toucher) |t| t.drop(item.record.id);
         if (outcome) {
             _ = self.messages_processed.fetchAdd(1, .monotonic);
             self.report(conn, item, .ack);
@@ -670,6 +681,14 @@ pub const StreamWorker = struct {
             std.log.err("[flo-stream-worker] Record {} failed: {}", .{ item.record.id, err });
             self.report(conn, item, .nack);
         }
+    }
+
+    /// Nack a record a stop came before, so it is ready for the next read
+    /// at once rather than when its lease runs out. It spends an attempt.
+    fn handBack(self: *Self, conn: *Client, item: *const Leased) void {
+        if (item.toucher) |t| t.drop(item.record.id);
+        std.log.info("[flo-stream-worker] Stopping: record {} handed back unstarted", .{item.record.id});
+        self.report(conn, item, .nack);
     }
 
     /// auto_touch never touches more often, whatever the lease.
@@ -683,86 +702,143 @@ pub const StreamWorker = struct {
         return @max(lease_ms / 6, min_touch_interval_ms);
     }
 
-    /// The lease a batch was read under, from its expiry and this host's
-    /// clock when it arrived, held to the server's bounds: a clock ahead
-    /// of the server's only makes the touches come sooner.
+    /// A lease's length (or what is left of it) from its expiry and this
+    /// host's clock, held to the server's bounds: a clock ahead of the
+    /// server's only makes the touches come sooner.
     fn leaseMsOf(expires_at_ms: i64, now_ms: i64) u64 {
         const left = std.math.clamp(expires_at_ms -| now_ms, types.MIN_GROUP_LEASE_MS, types.MAX_GROUP_LEASE_MS);
         return @intCast(left);
     }
 
-    /// One record's touching thread and the event that stops it. Touches
-    /// fall due every interval from when its batch arrived, not from when
-    /// the last one returned, so a slow touch doesn't push the rest later.
+    /// One batch's touching thread: it touches the batch's records not yet
+    /// reported, in one touch naming the read's lease, every interval from
+    /// the batch's arrival, so a slow touch doesn't push the rest later.
+    /// Each touch's answer re-reads the lease off its expiry, and the next
+    /// touch comes no later than halfway to that expiry. A record the
+    /// server refuses has moved on and is dropped; a refused touch stops
+    /// it; a lost or retryable one is tried again with back-off.
     const Toucher = struct {
         worker: *Self,
-        item: *const Leased,
-        client: *?Client,
+        stream_name: []const u8,
+        lease: GroupLease,
+        arrived: std.time.Instant,
         interval_ns: u64,
+        mutex: std.Thread.Mutex = .{},
+        /// The records not yet reported, `held[0..held_len]`.
+        held: [types.MAX_GROUP_BATCH]StreamRecord = undefined,
+        held_len: usize = 0,
         stop: std.Thread.ResetEvent = .{},
+
+        /// Stop naming `id`: it is being acked or nacked.
+        fn drop(t: *Toucher, id: StreamID) void {
+            t.mutex.lock();
+            defer t.mutex.unlock();
+            var i: usize = 0;
+            while (i < t.held_len) {
+                if (t.held[i].id.timestamp_ms == id.timestamp_ms and t.held[i].id.sequence == id.sequence) {
+                    t.held_len -= 1;
+                    t.held[i] = t.held[t.held_len];
+                } else i += 1;
+            }
+        }
 
         fn run(t: *Toucher) void {
             var due: u64 = t.interval_ns;
+            var failed = retry_mod.workerBackoff();
             while (!t.stop.isSet()) {
                 const since = t.sinceArrival(due);
                 if (since < due) {
                     t.stop.timedWait(due - since) catch {};
                     continue;
                 }
-                if (!t.worker.touchOnce(t.client, t.item)) return;
-                // The next due time after the touch: those missed while it
-                // ran are skipped.
-                due = (t.sinceArrival(due) / t.interval_ns + 1) *| t.interval_ns;
+                var records: [types.MAX_GROUP_BATCH]StreamRecord = undefined;
+                const n = blk: {
+                    t.mutex.lock();
+                    defer t.mutex.unlock();
+                    @memcpy(records[0..t.held_len], t.held[0..t.held_len]);
+                    break :blk t.held_len;
+                };
+                if (n == 0) return;
+                switch (t.worker.touchOnce(t, records[0..n])) {
+                    .stop => return,
+                    .retry => {
+                        // Sooner than the next interval, backing off.
+                        const wait_ns = @min(failed.next(t.worker.client.prng.random()) *| std.time.ns_per_ms, t.interval_ns);
+                        due = t.sinceArrival(due) +| @max(wait_ns, min_touch_interval_ms * std.time.ns_per_ms);
+                    },
+                    .touched => |expires_at_ms| {
+                        failed.reset();
+                        const now_ns = t.sinceArrival(due);
+                        // The answer's expiry, against this host's clock: a
+                        // lease that renewed paces the touches again, and
+                        // the next comes by halfway to it.
+                        const now_ms = std.time.milliTimestamp();
+                        t.interval_ns = @min(t.interval_ns, touchInterval(leaseMsOf(expires_at_ms, now_ms)) *| std.time.ns_per_ms);
+                        const next = (now_ns / t.interval_ns + 1) *| t.interval_ns;
+                        // An expiry already past by this clock is skew, not
+                        // news: the interval alone paces it.
+                        const left_ms: u64 = @intCast(@max(expires_at_ms -| now_ms, 0));
+                        const by_half = if (left_ms > 0) now_ns +| (left_ms / 2) *| std.time.ns_per_ms else next;
+                        due = @max(@min(next, by_half), now_ns +| min_touch_interval_ms * std.time.ns_per_ms);
+                    },
+                }
             }
         }
 
         fn sinceArrival(t: *const Toucher, fallback: u64) u64 {
-            return if (std.time.Instant.now()) |now| now.since(t.item.arrived) else |_| fallback;
+            return if (std.time.Instant.now()) |now| now.since(t.arrived) else |_| fallback;
         }
     };
 
-    /// Start touching `item` on a thread, when auto_touch is on; null
-    /// otherwise, or when the thread can't start.
-    fn startTouching(self: *Self, toucher: *Toucher, item: *const Leased, touch_conn: *?Client) ?std.Thread {
-        if (!self.config.auto_touch) return null;
-        toucher.* = .{ .worker = self, .item = item, .client = touch_conn, .interval_ns = touchInterval(item.lease_ms) *| std.time.ns_per_ms };
+    /// Start touching a batch's records on a thread, when auto_touch is on;
+    /// null otherwise, or when the thread can't start.
+    fn startTouching(self: *Self, toucher: *Toucher, stream_name: []const u8, result: *const types.GroupReadResult, arrived: std.time.Instant) ?std.Thread {
+        if (!self.config.auto_touch or result.records.len == 0) return null;
+        const lease_ms = leaseMsOf(result.expires_at_ms, std.time.milliTimestamp());
+        toucher.* = .{ .worker = self, .stream_name = stream_name, .lease = result.lease, .arrived = arrived, .interval_ns = touchInterval(lease_ms) *| std.time.ns_per_ms };
+        @memcpy(toucher.held[0..result.records.len], result.records);
+        toucher.held_len = result.records.len;
         return std.Thread.spawn(.{}, Toucher.run, .{toucher}) catch |err| {
-            std.log.err("[flo-stream-worker] Can't start touching record {}: {}", .{ item.record.id, err });
+            std.log.err("[flo-stream-worker] Can't start touching a batch: {}", .{err});
             return null;
         };
     }
 
-    /// Touch `item` once on the touch connection; false when touching
-    /// should stop: the record moved on, or the server refused the touch. A
-    /// lost touch is tried again next interval.
-    fn touchOnce(self: *Self, touch_conn: *?Client, item: *const Leased) bool {
-        if (touch_conn.* == null) {
-            touch_conn.* = Client.init(self.allocator, self.config.endpoint, .{
+    const TouchOutcome = union(enum) { touched: i64, retry, stop };
+
+    /// Touch `records` once on the touch connection, dropping any the server
+    /// refuses: they moved on. A refusal saying the touch itself is stale or
+    /// wrong stops touching; any other failure is tried again.
+    fn touchOnce(self: *Self, t: *Toucher, records: []const StreamRecord) TouchOutcome {
+        if (self.touch_client == null) {
+            self.touch_client = Client.init(self.allocator, self.config.endpoint, .{
                 .namespace = self.config.namespace,
                 .retry = self.config.retry,
             });
         }
-        const client = &touch_conn.*.?;
+        const client = &self.touch_client.?;
         if (!client.isConnected()) client.connect() catch |err| {
-            std.log.warn("[flo-stream-worker] Touch for record {}: can't connect: {}", .{ item.record.id, err });
-            return true;
+            std.log.warn("[flo-stream-worker] Touch: can't connect: {}; trying again", .{err});
+            return .retry;
         };
         var stream = Stream.init(client);
-        var touched = stream.groupTouch(item.stream_name, self.config.group, item.lease, &.{item.record}, .{ .namespace = self.config.namespace, .consumer = self.consumer_name }) catch |err| {
-            if (client_mod.isConnectionError(err)) {
-                std.log.warn("[flo-stream-worker] Touch for record {} failed: {}; trying again", .{ item.record.id, err });
-                client.disconnect();
-                return true;
-            }
-            std.log.warn("[flo-stream-worker] Touch for record {} was refused, stopping: {}", .{ item.record.id, err });
-            return false;
+        var touched = stream.groupTouch(t.stream_name, self.config.group, t.lease, records, .{ .namespace = self.config.namespace, .consumer = self.consumer_name }) catch |err| switch (err) {
+            FloError.StaleReport, FloError.Conflict, FloError.NotFound, FloError.BadRequest => {
+                std.log.warn("[flo-stream-worker] Touch was refused, stopping: {}", .{err});
+                return .stop;
+            },
+            else => {
+                std.log.warn("[flo-stream-worker] Touch failed: {}; trying again", .{err});
+                if (client_mod.isConnectionError(err)) client.disconnect();
+                return .retry;
+            },
         };
         defer touched.deinit();
-        if (touched.refused.len > 0) {
-            std.log.warn("[flo-stream-worker] Touch for record {} applied nothing ({s}), stopping", .{ item.record.id, std.enums.tagName(types.GroupRefusalWhy, touched.refused[0].why) orelse "unknown" });
-            return false;
+        for (touched.refused) |r| {
+            std.log.warn("[flo-stream-worker] Touch for record {} applied nothing ({s}); no longer touching it", .{ r.id, std.enums.tagName(types.GroupRefusalWhy, r.why) orelse "unknown" });
+            t.drop(r.id);
         }
-        return true;
+        return .{ .touched = touched.expires_at_ms };
     }
 
     /// Deliver a record's ack or nack. A send lost to a dropped connection or
@@ -1550,10 +1626,10 @@ test "StreamWorker backs off a group read refused at a limit, logging it once, a
     // Backing off from 100 ms, doubling: a handful of reads, not a spin.
     const reads = srv.countOf(.stream_group_read);
     try std.testing.expect(reads >= 2 and reads <= 8);
-    try std.testing.expectEqual(@as(?types.Reason, .too_many_actions), w.limit_notice.last);
+    try std.testing.expect(w.limit_notice.logged(.too_many_actions));
 }
 
-test "a limit notice logs a reason once until cleared, and a new reason at once" {
+test "a limit notice logs each reason once until cleared, even when reasons alternate" {
     const Fake = struct {
         reason: types.Reason,
         pub fn lastError(f: *const @This()) ?Client.LastError {
@@ -1562,13 +1638,16 @@ test "a limit notice logs a reason once until cleared, and a new reason at once"
     };
     var n: types.LimitNotice = .{};
     var f: Fake = .{ .reason = .too_many_actions };
-    n.note(&f, "test");
-    try std.testing.expectEqual(@as(?types.Reason, .too_many_actions), n.last);
-    f.reason = .memory_budget;
-    n.note(&f, "test");
-    try std.testing.expectEqual(@as(?types.Reason, .memory_budget), n.last);
+    for (0..3) |_| {
+        f.reason = .too_many_actions;
+        n.note(&f, "test");
+        f.reason = .memory_budget;
+        n.note(&f, "test");
+    }
+    try std.testing.expectEqual(@as(usize, 2), n.seen_len);
+    try std.testing.expect(n.logged(.too_many_actions) and n.logged(.memory_budget));
     n.clear();
-    try std.testing.expectEqual(@as(?types.Reason, null), n.last);
+    try std.testing.expect(!n.logged(.too_many_actions));
 }
 
 test "StreamWorker touch intervals: a sixth of the lease, at least 100 ms; the lease read off the expiry within the server's bounds" {
@@ -1673,4 +1752,103 @@ test "StreamWorker start waits out a registration refused overloaded without run
     thread.join();
     try std.testing.expectEqual(@as(u32, 3), srv.countOf(.worker_register));
     try std.testing.expect(srv.countOf(.stream_group_read) >= 1);
+}
+
+/// How many records a group touch request names.
+fn touchCount(req: []const u8) u32 {
+    const v = @import("test_server.zig").valueOf(req);
+    var off: usize = 2 + std.mem.readInt(u16, v[0..2], .little);
+    off += 2 + std.mem.readInt(u16, v[off..][0..2], .little);
+    return std.mem.readInt(u32, v[off + 16 ..][0..4], .little);
+}
+
+const queued_touch_test = struct {
+    fn slow(_: *StreamContext) anyerror!void {
+        std.Thread.sleep(1_000 * std.time.ns_per_ms);
+    }
+};
+
+test "StreamWorker with auto_touch touches the records waiting their turn too, dropping each once reported" {
+    // Three records leased for 5 s from now, handled one at a time, a second each.
+    var answer = comptime group_test.answer(&.{ 7, 8, 9 })[0..].*;
+    std.mem.writeInt(i64, answer[16..24], std.time.milliTimestamp() + 5_000, .little);
+    var touched: [16]u8 = undefined;
+    std.mem.writeInt(i64, touched[0..8], std.time.milliTimestamp() + 5_000, .little);
+    @memset(touched[8..], 0);
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.concurrent = true;
+    srv.rules = &.{
+        .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = &answer } } },
+        .{ .op = .stream_group_touch, .action = .{ .reply = .{ .status = 0, .body = &touched } } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100, .auto_touch = true }, queued_touch_test.slow);
+    defer w.deinit();
+    w.running = true;
+    try w.pollAndProcess("events");
+    try std.testing.expectEqual(@as(u32, 3), srv.countOf(.stream_group_ack));
+    // At 833 ms all three are held, the two waiting included; later ones
+    // name only those not yet acked.
+    const touches = srv.countOf(.stream_group_touch);
+    try std.testing.expect(touches >= 2);
+    try std.testing.expectEqual(@as(u32, 3), touchCount(srv.requestOf(.stream_group_touch, 0)));
+    try std.testing.expect(touchCount(srv.requestOf(.stream_group_touch, touches - 1)) < 3);
+}
+
+test "StreamWorker with auto_touch tries a touch refused overloaded again, sooner than the next interval" {
+    var answer = comptime group_test.answer(&.{7})[0..].*;
+    std.mem.writeInt(i64, answer[16..24], std.time.milliTimestamp() + 5_000, .little);
+    const slow = struct {
+        fn handle(_: *StreamContext) anyerror!void {
+            std.Thread.sleep(1_300 * std.time.ns_per_ms);
+        }
+    };
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.concurrent = true;
+    srv.rules = &.{
+        .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = &answer } } },
+        .{ .op = .stream_group_touch, .nth = 0, .action = .{ .reply = .{ .status = 10, .body = "\x06\x00\x00overloaded: shard busy" } } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100, .auto_touch = true, .retry = .{ .max_attempts = 1 } }, slow.handle);
+    defer w.deinit();
+    w.running = true;
+    try w.pollAndProcess("events");
+    // Refused at 833 ms, tried again within the next 100 ms to 833 ms.
+    try std.testing.expect(srv.countOf(.stream_group_touch) >= 2);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_ack));
+}
+
+test "StreamWorker stopped mid-batch finishes the record it started and hands the rest back with a nack" {
+    const stopping = struct {
+        var worker: ?*StreamWorker = null;
+        var handled = std.atomic.Value(u32).init(0);
+        fn handle(_: *StreamContext) anyerror!void {
+            _ = handled.fetchAdd(1, .monotonic);
+            worker.?.stop();
+        }
+    };
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = comptime group_test.answer(&.{ 7, 8, 9 }) } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, stopping.handle);
+    defer w.deinit();
+    stopping.worker = &w;
+    stopping.handled.store(0, .monotonic);
+    w.running = true;
+    try w.pollAndProcess("events");
+    try std.testing.expectEqual(@as(u32, 1), stopping.handled.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_ack));
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.stream_group_nack));
+    try std.testing.expect(group_test.reportNames(srv.requestOf(.stream_group_nack, 0), 8));
+    try std.testing.expect(group_test.reportNames(srv.requestOf(.stream_group_nack, 1), 9));
 }

@@ -203,7 +203,8 @@ _ = try kv.jsonDel("user:1", "$.name", .{});
 A key routes to its shard by its `{tag}`, the part between the first `{`
 and the next `}`, or by the whole key when it has none: keys stored
 together, as a transaction needs them, share a tag (`{user:1}:balance`,
-`{user:1}:history`). `mget` takes keys on any shards; the server gathers
+`{user:1}:history`). An empty tag `{}` routes every key that has one
+together, and a `{` with no `}` after it routes by the whole key. `mget` takes keys on any shards; the server gathers
 them.
 
 A request frame is at most 256 KiB (`Client.max_request_size`), enough for
@@ -384,10 +385,13 @@ for (batch.records) |rec| {
     _ = rec;
 }
 
-// Ack them all, naming the read's lease
-var report = try stream.groupAck("events", "my-group", batch.lease, batch.records, .{ .consumer = "worker-1" });
-defer report.deinit();
-for (report.refused) |r| std.debug.print("{} not acked: {s}\n", .{ r.id, @tagName(r.why) });
+// Ack them all, naming the read's lease; a read that leased nothing has
+// nothing to ack (a report takes 1 to 100 records)
+if (batch.records.len > 0) {
+    var report = try stream.groupAck("events", "my-group", batch.lease, batch.records, .{ .consumer = "worker-1" });
+    defer report.deinit();
+    for (report.refused) |r| std.debug.print("{} not acked: {s}\n", .{ r.id, @tagName(r.why) });
+}
 
 // Or: nack (ready again after delay_ms, or dead), or touch to keep holding
 // var n = try stream.groupNack("events", "my-group", batch.lease, batch.records, .{ .consumer = "worker-1", .delay_ms = 1000 });
@@ -728,10 +732,15 @@ whole batch. `drain()` and `stop()` are safe to call from any thread.
 
 A stream worker acks a record whose handler returns, and nacks one whose handler
 fails, naming the read's lease. The group's lease runs for the whole batch from its
-read, so handle it within the lease, call `ctx.touch()`, or set `.auto_touch = true`
-in `StreamWorkerConfig`, which touches each record every sixth of its lease (at
-least 100 ms apart, counted from the batch's arrival) while its handler runs. A
-record left past its lease is read again, by this consumer or another.
+read, records waiting their turn included, so handle it within the lease, call
+`ctx.touch()`, or set `.auto_touch = true` in `StreamWorkerConfig`. That touches
+every record of the batch not yet acked or nacked, in one touch, every sixth of the
+lease (at least 100 ms apart, counted from the batch's arrival), re-pacing off each
+touch answer's expiry. A touch refused conflict, not_found or bad_request stops the
+touching; any other failure is tried again with back-off, and a record the server
+refuses is dropped from it. A record left past its lease is read again, by this
+consumer or another. `stop()` lets started records finish and hands the unstarted
+ones back at once with a nack, which spends one of their attempts.
 
 A worker polls and tells the server of its own `drain()` on one connection, so the
 drain goes out once the held poll returns, up to `block_ms`. A drain sent from

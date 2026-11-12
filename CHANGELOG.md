@@ -20,13 +20,18 @@
   `StreamGroupJoinOptions`, `StreamGroupAckOptions` and the join, leave, claim
   and configure-sweeper op codes: the server refuses them. The stream worker
   no longer joins or leaves; it acks and nacks naming its read's lease, and
-  `StreamWorkerConfig.auto_touch` touches each record every sixth of its lease
-  (at least 100 ms apart, from the batch's arrival) while its handler runs.
+  `StreamWorkerConfig.auto_touch` touches every record of a batch not yet
+  reported, waiting ones included, every sixth of the lease (at least 100 ms
+  apart, from the batch's arrival), re-paced off each touch answer's expiry;
+  it stops only on a stale report, conflict, not_found or bad_request and
+  retries anything else with back-off. `stop()` hands unstarted records back
+  with a nack (spending an attempt).
   `StreamContext` carries the `lease`, `deliveries()` and `touch()`.
   `groupList` and `groupMembers` now count the consumers holding records.
 - **Breaking:** `routing_key` is gone from every KV option type. A key routes
   by its `{tag}`, or the whole key without one: keys stored together share a
-  tag. `KV.begin` takes a key and pins the transaction to its tag;
+  tag. `{}` routes every key with it together; a lone `{` routes by the whole
+  key. `KV.begin` takes a key and pins the transaction to its tag;
   `Transaction.routing_key` is gone. Reason 18 is `keys_not_colocated`: a key
   in a transaction that routes elsewhere, refused bad_request without running.
   The largest value is 257,916 bytes and the largest JSON document 256,918.

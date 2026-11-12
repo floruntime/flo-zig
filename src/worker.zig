@@ -2158,7 +2158,7 @@ test "ActionWorker backs off an await refused at a limit, logging it once, witho
     // and none of them retried by the client.
     const awaits = srv.countOf(.action_await);
     try std.testing.expect(awaits >= 2 and awaits <= 8);
-    try std.testing.expectEqual(@as(?types.Reason, .memory_budget), w.limit_notice.last);
+    try std.testing.expect(w.limit_notice.logged(.memory_budget));
 }
 
 test "ActionWorker start fails with the limit error after one registration, awaiting nothing" {

@@ -206,23 +206,32 @@ pub fn pauseUnlessHalted(running: *const bool, halt: ?*const bool, ms: u64) void
     }
 }
 
-/// A loop backing off from limit refusals logs one per distinct reason,
-/// not one per tick. `clear` after a call that succeeds, so a limit hit
-/// again later is logged again.
+/// A loop backing off from limit refusals logs each distinct reason once,
+/// not once per tick, even when reasons alternate. `clear` after a call
+/// that succeeds, so a limit hit again later is logged again.
 pub const LimitNotice = struct {
-    last: ?Reason = null,
+    /// The reasons logged since the last clear; the server has four.
+    seen: [8]Reason = undefined,
+    seen_len: usize = 0,
 
-    /// Log the limit refusal `client.lastError()` holds, unless it is the
-    /// one logged last.
+    /// Log the limit refusal `client.lastError()` holds, unless its reason
+    /// was logged already.
     pub fn note(self: *LimitNotice, client: anytype, comptime what: []const u8) void {
         const last = client.lastError() orelse return;
-        if (self.last == last.reason) return;
-        self.last = last.reason;
+        if (self.logged(last.reason)) return;
+        if (self.seen_len < self.seen.len) {
+            self.seen[self.seen_len] = last.reason;
+            self.seen_len += 1;
+        }
         std.log.warn(what ++ " refused at a limit ({s}): {s}; backing off, not retrying it until it passes", .{ std.enums.tagName(Reason, last.reason) orelse "unknown", last.message });
     }
 
+    pub fn logged(self: *const LimitNotice, reason: Reason) bool {
+        return std.mem.indexOfScalar(Reason, self.seen[0..self.seen_len], reason) != null;
+    }
+
     pub fn clear(self: *LimitNotice) void {
-        self.last = null;
+        self.seen_len = 0;
     }
 };
 
