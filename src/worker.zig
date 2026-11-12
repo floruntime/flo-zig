@@ -330,10 +330,14 @@ pub const ActionWorker = struct {
     /// Start the worker and begin processing actions.
     /// This function blocks until stop() is called or drain completes, then
     /// waits, without a limit, for running handlers to return and send their
-    /// results: a handler that never returns blocks it. A registration
-    /// refused at a limit returns `error.Limit`, with the reason and message
-    /// in `client.lastError()`: start fails with the limit error; a limit
-    /// hit while running is logged and backed off.
+    /// results: a handler that never returns blocks it. Registration waits
+    /// out a halted shard, and an overloaded or unavailable refusal that
+    /// didn't run, backing off until it clears or a stop or drain ends the
+    /// wait. Any other failure is returned (for a refusal, its typed error,
+    /// such as `error.Limit` or `error.BadRequest`, with the reason and
+    /// message in `client.lastError()`), so the worker never serves
+    /// unregistered: start fails with the limit error; a limit hit while
+    /// running is logged and backed off.
     pub fn start(self: *Self) !void {
         if (self.handlers.count() == 0) {
             return error.NoActionsRegistered;
@@ -355,13 +359,21 @@ pub const ActionWorker = struct {
             self.drain_sent = false;
         }
         self.drain_retry_ns = 0;
-        // A halted shard holds the start until it's repaired, or a stop or
-        // drain ends the wait. A registration that committed but hasn't
-        // applied (outcome_pending) is returned, not resent.
+        // A halted shard, or a refusal that didn't run and may pass
+        // (overloaded, unavailable), holds the start until it clears, or a
+        // stop or drain ends the wait. Any other failure is returned: a
+        // registration that committed but hasn't applied (outcome_pending)
+        // isn't resent, and the worker never serves unregistered.
         var halted = retry_mod.haltedBackoff();
+        var refused = retry_mod.workerBackoff();
         while (true) {
             self.registerWorker() catch |err| {
-                if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-worker]", "worker registration")) return err;
+                if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-worker]", "worker registration")) {
+                    if (!self.client.refusedUnrun(err)) return err;
+                    const ms = refused.next(self.client.prng.random());
+                    std.log.warn("[flo-worker] Worker registration refused, not run: {s}; retrying in {d}ms", .{ self.client.lastError().?.message, ms });
+                    types.pauseUnlessHalted(&self.running, &self.draining, ms);
+                }
                 if (types.goingOn(&self.running, &self.draining)) continue;
                 std.log.info("[flo-worker] Worker stopped before registering", .{});
                 @atomicStore(bool, &self.running, false, .monotonic);
@@ -2183,4 +2195,46 @@ test "ActionWorker.registerAction refused at the action limit returns the limit 
     try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_register));
     try std.testing.expectEqual(types.Reason.too_many_actions, w.client.lastError().?.reason);
     try std.testing.expect(!w.handlers.contains("job"));
+}
+
+test "ActionWorker start fails with a terminal refusal of its registration after one request, awaiting nothing" {
+    var srv = try ScriptServer.listen();
+    // bad_request, reason unclassified, ran no.
+    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 3, .body = "\x0c\x00\x00bad request: too many processes" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try start_test.begin(&w);
+    const prompt = start_test.returnedWithin(&w, 1000);
+    thread.join();
+    try std.testing.expect(prompt);
+    try std.testing.expectError(FloError.BadRequest, start_test.result);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_await));
+    try std.testing.expectEqualStrings("bad request: too many processes", w.client.lastError().?.message);
+}
+
+test "ActionWorker start waits out a registration refused overloaded without running, then awaits" {
+    var srv = try ScriptServer.listen();
+    const busy: @import("test_server.zig").Reply = .{ .status = 10, .body = "\x06\x00\x00overloaded: shard busy" };
+    srv.rules = &.{
+        .{ .op = .worker_register, .nth = 0, .action = .{ .reply = busy } },
+        .{ .op = .worker_register, .nth = 1, .action = .{ .reply = busy } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100, .retry = .{ .max_attempts = 1 } });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    var waited: u32 = 0;
+    while (srv.countOf(.action_await) < 1 and waited < 5000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+    try std.testing.expectEqual(@as(u32, 3), srv.countOf(.worker_register));
+    try std.testing.expect(srv.countOf(.action_await) >= 1);
 }

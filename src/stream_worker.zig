@@ -285,9 +285,14 @@ pub const StreamWorker = struct {
 
     /// Start consuming stream records.
     /// This function blocks until stop() is called or drain completes.
-    /// A registration refused at a limit returns `error.Limit`, with the
-    /// reason and message in `client.lastError()`: start fails with the
-    /// limit error; a limit hit while running is logged and backed off.
+    /// Registration waits out a halted shard, and an overloaded or
+    /// unavailable refusal that didn't run, backing off until it clears or
+    /// a stop or drain ends the wait. Any other failure is returned (for a
+    /// refusal, its typed error, such as `error.Limit` or
+    /// `error.BadRequest`, with the reason and message in
+    /// `client.lastError()`), so the worker never serves unregistered:
+    /// start fails with the limit error; a limit hit while running is
+    /// logged and backed off.
     pub fn start(self: *Self) !void {
         const stream_list = self.config.getStreams();
 
@@ -307,16 +312,20 @@ pub const StreamWorker = struct {
             self.drain_sent = false;
         }
 
-        // A halted shard holds the start until it's repaired, or a stop or
-        // drain ends the wait. A registration that committed but hasn't
-        // applied ends the start, so it isn't resent, and so does one at a
-        // limit, which waiting won't clear; any other failure only warns.
+        // A halted shard, or a refusal that didn't run and may pass
+        // (overloaded, unavailable), holds the start until it clears, or a
+        // stop or drain ends the wait. Any other failure ends the start:
+        // the worker never serves unregistered.
         var halted = retry_mod.haltedBackoff();
+        var refused = retry_mod.workerBackoff();
         while (types.goingOn(&self.running, &self.draining)) {
             self.registerWorker() catch |err| {
                 if (self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-stream-worker]", "worker registration")) continue;
-                if (err == FloError.OutcomePending or err == FloError.Limit) return err;
-                std.log.warn("[flo-stream-worker] Failed to register in worker registry: {}", .{err});
+                if (!self.client.refusedUnrun(err)) return err;
+                const ms = refused.next(self.client.prng.random());
+                std.log.warn("[flo-stream-worker] Worker registration refused, not run: {s}; retrying in {d}ms", .{ self.client.lastError().?.message, ms });
+                types.pauseUnlessHalted(&self.running, &self.draining, ms);
+                continue;
             };
             break;
         }
@@ -1622,4 +1631,46 @@ test "StreamWorker start fails with the limit error after one registration, read
     try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_read));
     try std.testing.expectEqual(types.Reason.too_many_actions, w.client.lastError().?.reason);
     try std.testing.expectEqualStrings("limit: this node holds 10000 actions", w.client.lastError().?.message);
+}
+
+test "StreamWorker start fails with a terminal refusal of its registration after one request, reading nothing" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    // bad_request, reason unclassified, ran no.
+    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 3, .body = "\x0c\x00\x00bad request: too many processes" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, halted_start_test.handle);
+    defer w.deinit();
+    const thread = try halted_start_test.begin(&w);
+    const prompt = halted_start_test.returnedWithin(&w, 1000);
+    thread.join();
+    try std.testing.expect(prompt);
+    try std.testing.expectError(FloError.BadRequest, halted_start_test.result);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_read));
+    try std.testing.expectEqualStrings("bad request: too many processes", w.client.lastError().?.message);
+}
+
+test "StreamWorker start waits out a registration refused overloaded without running, then reads" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    const busy: @import("test_server.zig").Reply = .{ .status = 10, .body = "\x06\x00\x00overloaded: shard busy" };
+    srv.rules = &.{
+        .{ .op = .worker_register, .nth = 0, .action = .{ .reply = busy } },
+        .{ .op = .worker_register, .nth = 1, .action = .{ .reply = busy } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100, .retry = .{ .max_attempts = 1 } }, halted_start_test.handle);
+    defer w.deinit();
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    var waited: u32 = 0;
+    while (srv.countOf(.stream_group_read) < 1 and waited < 5000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+    try std.testing.expectEqual(@as(u32, 3), srv.countOf(.worker_register));
+    try std.testing.expect(srv.countOf(.stream_group_read) >= 1);
 }
