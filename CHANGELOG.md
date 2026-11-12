@@ -34,8 +34,8 @@
   `too_many_actions`, `too_many_workflow_definitions` or
   `too_many_workflow_runs` in `lastError()`. Terminal: retrying won't clear it
   until something is deleted, the node gets more room, or a setting is raised,
-  so nothing retries it. The workers back off a poll refused this way and log
-  it once per reason.
+  so nothing retries it. For the workers, start fails with the limit error; a
+  limit hit while running is logged and backed off (once per reason).
 - **Breaking:** queues are leased until completed: delivery is at least
   once. `Queue.dequeue` (`0x181`) leases its messages to `options.consumer`
   for `lease_ms` (the server's 30 s by default) and returns their `lease`

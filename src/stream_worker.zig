@@ -285,6 +285,9 @@ pub const StreamWorker = struct {
 
     /// Start consuming stream records.
     /// This function blocks until stop() is called or drain completes.
+    /// A registration refused at a limit returns `error.Limit`, with the
+    /// reason and message in `client.lastError()`: start fails with the
+    /// limit error; a limit hit while running is logged and backed off.
     pub fn start(self: *Self) !void {
         const stream_list = self.config.getStreams();
 
@@ -306,13 +309,13 @@ pub const StreamWorker = struct {
 
         // A halted shard holds the start until it's repaired, or a stop or
         // drain ends the wait. A registration that committed but hasn't
-        // applied ends the start, so it isn't resent; any other failure only
-        // warns.
+        // applied ends the start, so it isn't resent, and so does one at a
+        // limit, which waiting won't clear; any other failure only warns.
         var halted = retry_mod.haltedBackoff();
         while (types.goingOn(&self.running, &self.draining)) {
             self.registerWorker() catch |err| {
                 if (self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-stream-worker]", "worker registration")) continue;
-                if (err == FloError.OutcomePending) return err;
+                if (err == FloError.OutcomePending or err == FloError.Limit) return err;
                 std.log.warn("[flo-stream-worker] Failed to register in worker registry: {}", .{err});
             };
             break;
@@ -1598,4 +1601,25 @@ test "StreamWorker with auto_touch touches a record on its own connection while 
     try std.testing.expect(group_test.reportNames(srv.requestOf(.stream_group_touch, 0), 7));
     try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_ack));
     try std.testing.expectEqual(@as(u32, 2), srv.connections.load(.monotonic));
+}
+
+test "StreamWorker start fails with the limit error after one registration, reading nothing" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    // limit, reason too_many_actions, ran no.
+    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, halted_start_test.handle);
+    defer w.deinit();
+    const thread = try halted_start_test.begin(&w);
+    const prompt = halted_start_test.returnedWithin(&w, 1000);
+    thread.join();
+    try std.testing.expect(prompt);
+    try std.testing.expectError(FloError.Limit, halted_start_test.result);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_read));
+    try std.testing.expectEqual(types.Reason.too_many_actions, w.client.lastError().?.reason);
+    try std.testing.expectEqualStrings("limit: this node holds 10000 actions", w.client.lastError().?.message);
 }

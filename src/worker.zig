@@ -304,7 +304,8 @@ pub const ActionWorker = struct {
     /// Registering replaces the action's settings, so workers
     /// that register one action with different options leave it with
     /// whichever registered last. `options.namespace` is ignored: the action
-    /// goes in the worker's.
+    /// goes in the worker's. A node at its action limit returns
+    /// `error.Limit` after one request, registering nothing.
     pub fn registerAction(self: *Self, action_name: []const u8, handler: ActionHandler, options: types.ActionRegisterOptions) !void {
         if (self.handlers.contains(action_name)) {
             return error.ActionAlreadyRegistered;
@@ -329,7 +330,10 @@ pub const ActionWorker = struct {
     /// Start the worker and begin processing actions.
     /// This function blocks until stop() is called or drain completes, then
     /// waits, without a limit, for running handlers to return and send their
-    /// results: a handler that never returns blocks it.
+    /// results: a handler that never returns blocks it. A registration
+    /// refused at a limit returns `error.Limit`, with the reason and message
+    /// in `client.lastError()`: start fails with the limit error; a limit
+    /// hit while running is logged and backed off.
     pub fn start(self: *Self) !void {
         if (self.handlers.count() == 0) {
             return error.NoActionsRegistered;
@@ -2143,4 +2147,40 @@ test "ActionWorker backs off an await refused at a limit, logging it once, witho
     const awaits = srv.countOf(.action_await);
     try std.testing.expect(awaits >= 2 and awaits <= 8);
     try std.testing.expectEqual(@as(?types.Reason, .memory_budget), w.limit_notice.last);
+}
+
+test "ActionWorker start fails with the limit error after one registration, awaiting nothing" {
+    var srv = try ScriptServer.listen();
+    // limit, reason too_many_actions, ran no.
+    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try start_test.begin(&w);
+    const prompt = start_test.returnedWithin(&w, 1000);
+    thread.join();
+    try std.testing.expect(prompt);
+    try std.testing.expectError(FloError.Limit, start_test.result);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_await));
+    const last = w.client.lastError().?;
+    try std.testing.expectEqual(types.Reason.too_many_actions, last.reason);
+    try std.testing.expectEqualStrings("limit: this node holds 10000 actions", last.message);
+}
+
+test "ActionWorker.registerAction refused at the action limit returns the limit error after one request, keeping no handler" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .action_register, .action = .{ .reply = .{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try std.testing.expectError(FloError.Limit, w.registerAction("job", test_handlers.ok, .{}));
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_register));
+    try std.testing.expectEqual(types.Reason.too_many_actions, w.client.lastError().?.reason);
+    try std.testing.expect(!w.handlers.contains("job"));
 }

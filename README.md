@@ -697,9 +697,11 @@ The action and stream workers wait the same way between failed polls, from
 100 ms up to 5 s, starting again from 100 ms after a poll that succeeds; `stop()`
 ends a wait within about 10 ms. A group read refused `unavailable` without
 running (its records are still being read from disk, say) is read again with
-the same group and consumer: it leased nothing. A poll refused `limit` is
-backed off the same way, never spun on, and logged once per reason until a
-poll succeeds. `WorkerConfig` and `StreamWorkerConfig` take a `retry` field
+the same group and consumer: it leased nothing. For `limit`, start fails with the limit error; a limit hit while running is
+logged and backed off: a registration refused `limit` makes `start()` return
+`error.Limit` after one request, with the reason and message in
+`lastError()`, and a poll refused `limit` is backed off the same way as any
+other, never spun on, and logged once per reason until a poll succeeds. `WorkerConfig` and `StreamWorkerConfig` take a `retry` field
 for the connection each worker opens.
 
 A worker whose complete, fail, ack or nack is lost with its connection (or
