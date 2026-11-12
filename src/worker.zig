@@ -197,6 +197,8 @@ pub const ActionWorker = struct {
     /// auto_touch's connection for tasks run inline (concurrency 1), opened
     /// on first use; a slot has its own.
     touch_client: ?Client = null,
+    /// The limit refusal last logged, so a run of them logs once.
+    limit_notice: types.LimitNotice = .{},
     /// The next await's request key, and its length; 0 until one is made.
     /// The poll loop's alone.
     poll_key: [32]u8 = undefined,
@@ -411,8 +413,11 @@ pub const ActionWorker = struct {
                     .other => if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-worker]", "await")) {
                         const ms = failed.next(self.client.prng.random());
                         // A refusal that may pass is a warning: the poll goes
-                        // again with its request key.
-                        if (err == FloError.Unavailable or err == FloError.Overloaded) {
+                        // again with its request key. A limit is logged once
+                        // per reason while it lasts.
+                        if (err == FloError.Limit) {
+                            self.limit_notice.note(&self.client, "[flo-worker] await");
+                        } else if (err == FloError.Unavailable or err == FloError.Overloaded) {
                             std.log.warn("[flo-worker] Await refused: {}, retrying in {d}ms...", .{ err, ms });
                         } else std.log.err("[flo-worker] Await error: {}, retrying in {d}ms...", .{ err, ms });
                         types.pauseUnlessHalted(&self.running, &self.draining, ms);
@@ -422,6 +427,7 @@ pub const ActionWorker = struct {
             };
             failed.reset();
             halted.reset();
+            self.limit_notice.clear();
         }
 
         // Tasks still running finish and send their results.
@@ -2116,4 +2122,25 @@ test "ActionWorker never resends a complete or fail a halted shard refused" {
             try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
         }
     }
+}
+
+test "ActionWorker backs off an await refused at a limit, logging it once, without the client retrying it" {
+    var srv = try ScriptServer.listen();
+    // limit, reason memory_budget, ran no.
+    srv.rules = &.{.{ .op = .action_await, .action = .{ .reply = .{ .status = 15, .body = "\x20\x00\x00limit: node 1's memory budget is spent" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    std.Thread.sleep(700 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+    // Backing off from 100 ms, doubling: a handful of awaits, not a spin,
+    // and none of them retried by the client.
+    const awaits = srv.countOf(.action_await);
+    try std.testing.expect(awaits >= 2 and awaits <= 8);
+    try std.testing.expectEqual(@as(?types.Reason, .memory_budget), w.limit_notice.last);
 }

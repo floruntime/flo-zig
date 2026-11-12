@@ -2,8 +2,40 @@
 
 ## Unreleased
 
-- **Breaking:** pinned to the table hash of flo `5213836` (`0x19075df8e1ed5f75`);
+- **Breaking:** pinned to the table hash of flo `723fd758` (`0xc688167b51fcc846`);
   this SDK and older servers refuse each other.
+- **Breaking:** consumer groups lease records until acked, as queues do.
+  `Stream.groupRead` returns a `GroupReadResult`: the records, each with its
+  `deliveries`, the read's `lease` (term, index) and `expires_at_ms`.
+  `groupAck`, `groupNack` (with `delay_ms`, `dead` and an error) and the new
+  `groupTouch` take the lease and the records, name the consumer, and return
+  a `GroupReport` of what applied and each record refused, with why; a report
+  for a delivery that has moved on applies nothing and says so, without an
+  error. A record left past its lease is ready for the next read; one nacked
+  or expired `max_deliver` times (5 by default) is dead. New:
+  `groupCreate` (a lease of 5 s to 12 h, 30 s by default; 1 to 255 attempts;
+  creating again with other settings is `error.Conflict`), `groupDelete` and
+  `groupInfo`. A group name is at most 256 bytes.
+- **Breaking:** `groupJoin` and `groupLeave` are gone, with
+  `StreamGroupJoinOptions`, `StreamGroupAckOptions` and the join, leave, claim
+  and configure-sweeper op codes: the server refuses them. The stream worker
+  no longer joins or leaves; it acks and nacks naming its read's lease, and
+  `StreamWorkerConfig.auto_touch` touches each record every sixth of its lease
+  (at least 100 ms apart, from the batch's arrival) while its handler runs.
+  `StreamContext` carries the `lease`, `deliveries()` and `touch()`.
+  `groupList` and `groupMembers` now count the consumers holding records.
+- **Breaking:** `routing_key` is gone from every KV option type. A key routes
+  by its `{tag}`, or the whole key without one: keys stored together share a
+  tag. `KV.begin` takes a key and pins the transaction to its tag;
+  `Transaction.routing_key` is gone. Reason 18 is `keys_not_colocated`: a key
+  in a transaction that routes elsewhere, refused bad_request without running.
+  The largest value is 257,916 bytes and the largest JSON document 256,918.
+- New status `limit` (15): `error.Limit`, with reason `memory_budget`,
+  `too_many_actions`, `too_many_workflow_definitions` or
+  `too_many_workflow_runs` in `lastError()`. Terminal: retrying won't clear it
+  until something is deleted, the node gets more room, or a setting is raised,
+  so nothing retries it. The workers back off a poll refused this way and log
+  it once per reason.
 - **Breaking:** queues are leased until completed: delivery is at least
   once. `Queue.dequeue` (`0x181`) leases its messages to `options.consumer`
   for `lease_ms` (the server's 30 s by default) and returns their `lease`

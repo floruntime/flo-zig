@@ -38,6 +38,7 @@ const retry_mod = @import("retry.zig");
 const FloError = types.FloError;
 const StreamRecord = types.StreamRecord;
 const StreamID = types.StreamID;
+const GroupLease = types.GroupLease;
 const Allocator = std.mem.Allocator;
 
 /// Configuration for the StreamWorker.
@@ -50,9 +51,12 @@ pub const StreamWorkerConfig = struct {
     stream: []const u8 = "",
     /// Multiple streams to consume from (alternative to `stream`)
     streams: ?[]const []const u8 = null,
-    /// Consumer group name
+    /// Consumer group name. The first read of a group that doesn't exist
+    /// creates it at the server's defaults (a 30 s lease, 5 attempts); create
+    /// it first with `Stream.groupCreate` for others.
     group: []const u8 = "default",
-    /// Consumer name within the group (defaults to worker_id)
+    /// Consumer name within the group (defaults to worker_id). Acks and
+    /// nacks name it: a record is held by the consumer that read it.
     consumer: ?[]const u8 = null,
     /// Unique worker ID (auto-generated if null)
     worker_id: ?[]const u8 = null,
@@ -65,7 +69,9 @@ pub const StreamWorkerConfig = struct {
     /// for the whole batch, so at most min(concurrency, batch_size) run at
     /// once.
     concurrency: u32 = 1,
-    /// Number of messages to read per poll (default: 10)
+    /// Records to lease per read, 1 to 100 (default: 10). The group's lease
+    /// runs for the whole batch from its read: with concurrency 1 they are
+    /// handled in turn, so keep a batch's handling within it, or touch.
     batch_size: u32 = 10,
     /// Long-poll wait per read in ms. 0 means DEFAULT_WORKER_BLOCK_MS; over
     /// MAX_BLOCK_MS, StreamWorker.init returns error.BlockTooLong.
@@ -78,6 +84,15 @@ pub const StreamWorkerConfig = struct {
     machine_id: ?[]const u8 = null,
     /// How its connection retries refused-but-not-run requests.
     retry: retry_mod.RetryPolicy = .{},
+    /// Touch each record every sixth of its lease (at least 100 ms apart,
+    /// counted from when its batch arrived) while the handler runs, from a
+    /// thread on a connection of its own; a record is still held at most
+    /// 12 h from its read. The lease is read off the batch's expiry against
+    /// this host's clock. Off by default: a handler that runs past the lease
+    /// without calling ctx.touch has its record read again, by this
+    /// consumer or another. That thread allocates, so with auto_touch on
+    /// the allocator given to init must be thread-safe.
+    auto_touch: bool = false,
 
     /// Get the list of streams to consume from.
     pub fn getStreams(self: *const StreamWorkerConfig) []const []const u8 {
@@ -94,7 +109,11 @@ pub const StreamContext = struct {
     stream_name: []const u8,
     group: []const u8,
     consumer: []const u8,
+    /// The read that leased the record: an ack, nack or touch names it.
+    lease: GroupLease = .{ .term = 0, .index = 0 },
     allocator: Allocator,
+    /// The connection the record's ack or nack goes on.
+    client: ?*Client = null,
 
     /// Get the raw record payload.
     pub fn payload(self: *const StreamContext) []const u8 {
@@ -109,6 +128,25 @@ pub const StreamContext = struct {
     /// Get the record's headers.
     pub fn headers(self: *const StreamContext) []const types.Header {
         return self.record.headers;
+    }
+
+    /// The record's deliveries, this one included: above 1, a lease ran
+    /// out or a nack sent it round again.
+    pub fn deliveries(self: *const StreamContext) u32 {
+        return self.record.deliveries;
+    }
+
+    /// Keep the record: with half its lease or less left it runs a full
+    /// lease from now, up to 12 h from its read. Returns when the lease runs
+    /// out, in Unix milliseconds; `FloError.StaleReport` if the record has
+    /// moved on (its lease ran out and it was read again, say).
+    pub fn touch(self: *StreamContext) FloError!i64 {
+        const client = self.client orelse return FloError.NotConnected;
+        var stream = Stream.init(client);
+        var report = try stream.groupTouch(self.stream_name, self.group, self.lease, &.{self.record}, .{ .namespace = self.namespace, .consumer = self.consumer });
+        defer report.deinit();
+        if (report.applied == 0) return FloError.StaleReport;
+        return report.expires_at_ms;
     }
 
     /// Parse the payload as JSON into the given type.
@@ -140,6 +178,10 @@ pub const StreamWorker = struct {
     last_heartbeat_ns: i128 = 0,
     messages_processed: std.atomic.Value(u64) = .init(0),
     messages_failed: std.atomic.Value(u64) = .init(0),
+    /// auto_touch's connection for records handled inline (concurrency 1).
+    touch_client: ?Client = null,
+    /// The limit refusal last logged, so a run of them logs once.
+    limit_notice: types.LimitNotice = .{},
     /// With concurrency above 1, one slot per record handled at once,
     /// allocated on the first batch. `pool_mutex` guards `busy` and
     /// `busy_count`; `pool_free` signals a slot coming free.
@@ -150,20 +192,30 @@ pub const StreamWorker = struct {
 
     const Self = @This();
 
+    /// A record as a group read leased it: the read's lease, and when the
+    /// batch arrived.
+    const Leased = struct {
+        stream_name: []const u8,
+        lease: GroupLease,
+        lease_ms: u64,
+        arrived: std.time.Instant,
+        record: StreamRecord,
+    };
+
     /// One record handled on a thread of its own, its ack or nack sent on
     /// the slot's connection: the poll connection belongs to the poll loop.
     /// The connection outlives the record, for the next one.
     const Slot = struct {
         worker: *Self,
         client: ?Client = null,
-        record: StreamRecord = undefined,
-        stream_name: []const u8 = "",
+        touch_client: ?Client = null,
+        item: Leased = undefined,
         thread: ?std.Thread = null,
         busy: bool = false,
 
         fn run(slot: *Slot) void {
             const w = slot.worker;
-            w.processRecord(w.slotClient(slot), false, slot.stream_name, slot.record);
+            w.processRecord(w.slotClient(slot), &slot.item, &slot.touch_client);
             w.pool_mutex.lock();
             defer w.pool_mutex.unlock();
             slot.busy = false;
@@ -176,6 +228,7 @@ pub const StreamWorker = struct {
     pub fn init(allocator: Allocator, config_in: StreamWorkerConfig, handler: StreamRecordHandler) !Self {
         var config = config_in;
         config.block_ms = try types.workerBlockMs(config.block_ms);
+        if (config.batch_size < 1 or config.batch_size > types.MAX_GROUP_BATCH) return FloError.BadRequest;
 
         var client = Client.init(allocator, config.endpoint, .{
             .namespace = config.namespace,
@@ -215,26 +268,16 @@ pub const StreamWorker = struct {
         return Actions.init(&self.client);
     }
 
-    /// Deinitialize the stream worker and free resources.
+    /// Deinitialize the stream worker and free resources. Records this
+    /// consumer still holds are read again once their lease runs out.
     pub fn deinit(self: *Self) void {
-        // Best-effort leave group and deregister for all streams
-        var stream = self.streamApi();
         var actions = self.actionsApi();
-        const stream_list = self.config.getStreams();
-        for (stream_list) |stream_name| {
-            stream.groupLeave(
-                stream_name,
-                self.config.group,
-                self.consumer_name,
-                .{ .namespace = self.config.namespace },
-            ) catch {};
-        }
-
         actions.deregister(self.worker_id, .{
             .namespace = self.config.namespace,
         }) catch {};
 
         self.releaseSlots();
+        if (self.touch_client) |*c| c.deinit();
         self.allocator.free(self.consumer_name);
         self.allocator.free(self.worker_id);
         self.client.deinit();
@@ -252,8 +295,7 @@ pub const StreamWorker = struct {
             self.consumer_name,
         });
 
-        // Set before the join, so stop() ends a join that is backing off. A
-        // drain is cleared when the run ends, not here, so a drain() before
+        // A drain is cleared when the run ends, not here, so a drain() before
         // or during startup still ends it; a later start begins a fresh one.
         @atomicStore(bool, &self.running, true, .monotonic);
         errdefer @atomicStore(bool, &self.running, false, .monotonic);
@@ -261,20 +303,15 @@ pub const StreamWorker = struct {
             @atomicStore(bool, &self.draining, false, .monotonic);
             self.drain_sent = false;
         }
-        try self.joinGroups();
-        if (!@atomicLoad(bool, &self.running, .monotonic)) return;
 
         // A halted shard holds the start until it's repaired, or a stop or
         // drain ends the wait. A registration that committed but hasn't
         // applied ends the start, so it isn't resent; any other failure only
         // warns.
         var halted = retry_mod.haltedBackoff();
-        while (true) {
+        while (types.goingOn(&self.running, &self.draining)) {
             self.registerWorker() catch |err| {
-                if (self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-stream-worker]", "worker registration")) {
-                    if (types.goingOn(&self.running, &self.draining)) continue;
-                    break;
-                }
+                if (self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-stream-worker]", "worker registration")) continue;
                 if (err == FloError.OutcomePending) return err;
                 std.log.warn("[flo-stream-worker] Failed to register in worker registry: {}", .{err});
             };
@@ -306,7 +343,7 @@ pub const StreamWorker = struct {
             }
 
             if (!self.client.isConnected()) {
-                self.reconnect() catch |err| {
+                self.client.reconnectWhile(&self.running, &self.draining) catch |err| {
                     std.log.warn("[flo-stream-worker] Reconnect failed: {}, retrying...", .{err});
                     types.pauseUnlessHalted(&self.running, &self.draining, 1_000);
                     continue;
@@ -319,6 +356,7 @@ pub const StreamWorker = struct {
             if (self.pollAndProcess(stream_list[stream_idx])) {
                 failed.reset();
                 halted.reset();
+                self.limit_notice.clear();
             } else |err| {
                 if (client_mod.isConnectionError(err)) {
                     std.log.warn("[flo-stream-worker] Connection lost: {}, reconnecting...", .{err});
@@ -326,9 +364,11 @@ pub const StreamWorker = struct {
                 } else if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-stream-worker]", "group read")) {
                     const ms = failed.next(self.client.prng.random());
                     // Refused without running (records still being read
-                    // from disk, no leader yet): the read claimed nothing,
+                    // from disk, no leader yet): the read leased nothing,
                     // so the same group and consumer read again.
-                    if (self.client.refusedUnrun(err)) {
+                    if (err == FloError.Limit) {
+                        self.limit_notice.note(&self.client, "[flo-stream-worker] group read");
+                    } else if (self.client.refusedUnrun(err)) {
                         std.log.warn("[flo-stream-worker] GroupRead refused, not run: {s}; retrying in {d}ms", .{ self.client.lastError().?.message, ms });
                     } else std.log.err("[flo-stream-worker] GroupRead error: {}, retrying in {d}ms...", .{ err, ms });
                     types.pauseUnlessHalted(&self.running, &self.draining, ms);
@@ -345,66 +385,16 @@ pub const StreamWorker = struct {
         });
     }
 
-    /// Open a fresh connection and join the groups on it again. Gives up
-    /// once the worker is stopped or draining: a drain finishes without the
-    /// server.
-    fn reconnect(self: *Self) !void {
-        try self.client.reconnectWhile(&self.running, &self.draining);
-        errdefer self.client.disconnect();
-        try self.joinGroups();
-    }
-
     /// Reconnect to resend a lost result. A stopping worker still tries,
     /// for about stopping_reconnect_ms, so a result produced as it stops
     /// isn't lost to a brief drop, yet stop isn't held up for long.
-    /// `rejoin`: `conn` is the poll connection, so the groups are joined
-    /// again on the fresh one; a slot's connection only carries results.
-    fn reconnectForResult(self: *Self, conn: *Client, rejoin: bool) !void {
+    fn reconnectForResult(self: *Self, conn: *Client) !void {
         if (@atomicLoad(bool, &self.running, .monotonic)) {
-            if (conn.reconnectWhile(&self.running, null)) {
-                errdefer conn.disconnect();
-                if (rejoin) try self.joinGroups();
-                return;
-            } else |err| {
+            if (conn.reconnectWhile(&self.running, null)) return else |err| {
                 if (@atomicLoad(bool, &self.running, .monotonic)) return err;
             }
         }
         try conn.reconnectFor(stopping_reconnect_ms);
-        errdefer conn.disconnect();
-        if (rejoin) try self.joinGroups();
-    }
-
-    /// Join the group on every stream. A join the server refused without
-    /// running it (overloaded or unavailable, past the client's own retries)
-    /// is tried again with the worker backoff, and one a halted shard
-    /// refused with the halted backoff, until it succeeds or the worker
-    /// stops or drains; any other error is returned.
-    fn joinGroups(self: *Self) !void {
-        var stream = self.streamApi();
-        for (self.config.getStreams()) |stream_name| {
-            var failed = retry_mod.workerBackoff();
-            var halted = retry_mod.haltedBackoff();
-            while (true) {
-                stream.groupJoin(
-                    stream_name,
-                    self.config.group,
-                    self.consumer_name,
-                    .{ .namespace = self.config.namespace },
-                ) catch |err| {
-                    if (self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-stream-worker]", "group join")) {
-                        if (!types.goingOn(&self.running, &self.draining)) return;
-                        continue;
-                    }
-                    if (!self.client.refusedUnrun(err)) return err;
-                    const ms = failed.next(self.client.prng.random());
-                    std.log.warn("[flo-stream-worker] [{s}] Group join refused: {}, retrying in {d}ms...", .{ stream_name, err, ms });
-                    types.pauseUnlessHalted(&self.running, &self.draining, ms);
-                    if (!types.goingOn(&self.running, &self.draining)) return;
-                    continue;
-                };
-                break;
-            }
-        }
     }
 
     /// Register in the worker registry, each stream's group as a process.
@@ -526,17 +516,16 @@ pub const StreamWorker = struct {
         );
         defer result.deinit();
 
-        const elapsed = (try std.time.Instant.now()).since(polled);
-        const pause_ms = self.backoff.afterPoll(result.records.len == 0, elapsed, self.config.block_ms);
+        const arrived = try std.time.Instant.now();
+        const pause_ms = self.backoff.afterPoll(result.records.len == 0, arrived.since(polled), self.config.block_ms);
         if (result.records.len == 0) {
             types.pauseWhileRunning(&self.running, pause_ms);
             return;
         }
+        const lease_ms = leaseMsOf(result.expires_at_ms, std.time.milliTimestamp());
 
-        // A result resent on a new connection doesn't end the batch: the
-        // pending list is keyed by consumer name, not connection, so the
-        // rest is still this consumer's to ack, and group reads never serve
-        // pending records again.
+        // A result resent on a new connection still names the read's lease:
+        // a lease is the consumer's, not the connection's.
         if (self.config.concurrency <= 1) {
             for (result.records) |record| {
                 self.pool_mutex.lock();
@@ -547,7 +536,8 @@ pub const StreamWorker = struct {
                     self.busy_count -= 1;
                     self.pool_mutex.unlock();
                 }
-                self.processRecord(&self.client, true, stream_name, record);
+                var item: Leased = .{ .stream_name = stream_name, .lease = result.lease, .lease_ms = lease_ms, .arrived = arrived, .record = record };
+                self.processRecord(&self.client, &item, &self.touch_client);
             }
             return;
         }
@@ -556,8 +546,7 @@ pub const StreamWorker = struct {
             const slot = self.waitFreeSlot();
             if (slot.thread) |t| t.join();
             slot.thread = null;
-            slot.record = record;
-            slot.stream_name = stream_name;
+            slot.item = .{ .stream_name = stream_name, .lease = result.lease, .lease_ms = lease_ms, .arrived = arrived, .record = record };
             self.pool_mutex.lock();
             slot.busy = true;
             self.busy_count += 1;
@@ -629,70 +618,185 @@ pub const StreamWorker = struct {
 
     fn releaseSlots(self: *Self) void {
         self.waitIdle();
-        for (self.slots) |*slot| if (slot.client) |*c| c.deinit();
+        for (self.slots) |*slot| {
+            if (slot.client) |*c| c.deinit();
+            if (slot.touch_client) |*c| c.deinit();
+        }
         if (self.slots.len > 0) self.allocator.free(self.slots);
         self.slots = &.{};
     }
 
     /// Process a single record with auto-ack/nack, sent on `conn`: the poll
-    /// connection (`rejoin`: join the groups again on a fresh one) or a
-    /// slot's.
-    fn processRecord(self: *Self, conn: *Client, rejoin: bool, stream_name: []const u8, record: StreamRecord) void {
+    /// connection or a slot's. auto_touch touches it on `touch_conn`.
+    fn processRecord(self: *Self, conn: *Client, item: *const Leased, touch_conn: *?Client) void {
         var ctx = StreamContext{
-            .record = record,
+            .record = item.record,
             .namespace = self.config.namespace,
-            .stream_name = stream_name,
+            .stream_name = item.stream_name,
             .group = self.config.group,
             .consumer = self.consumer_name,
+            .lease = item.lease,
             .allocator = self.allocator,
+            .client = conn,
         };
 
+        var toucher: Toucher = undefined;
+        const touching = self.startTouching(&toucher, item, touch_conn);
         // The handler's outcome alone decides ack or nack: an ack that can't
         // be delivered is never turned into a nack.
-        if (self.handler(&ctx)) {
+        const outcome = self.handler(&ctx);
+        // A touch in flight finishes before the outcome is sent.
+        if (touching) |thread| {
+            toucher.stop.set();
+            thread.join();
+        }
+        if (outcome) {
             _ = self.messages_processed.fetchAdd(1, .monotonic);
-            self.report(conn, rejoin, stream_name, record.id, .ack);
+            self.report(conn, item, .ack);
         } else |err| {
             _ = self.messages_failed.fetchAdd(1, .monotonic);
-            std.log.err("[flo-stream-worker] Record {} failed: {}", .{ record.id, err });
-            self.report(conn, rejoin, stream_name, record.id, .nack);
+            std.log.err("[flo-stream-worker] Record {} failed: {}", .{ item.record.id, err });
+            self.report(conn, item, .nack);
         }
     }
 
+    /// auto_touch never touches more often, whatever the lease.
+    const min_touch_interval_ms: u64 = 100;
+
+    /// How often to touch a record held for `lease_ms`: every sixth of it,
+    /// at least min_touch_interval_ms apart. A touch renews the lease only
+    /// once half of it or less is left, so the touch at half the lease
+    /// renews it, and if that one fails two more come before it runs out.
+    fn touchInterval(lease_ms: u64) u64 {
+        return @max(lease_ms / 6, min_touch_interval_ms);
+    }
+
+    /// The lease a batch was read under, from its expiry and this host's
+    /// clock when it arrived, held to the server's bounds: a clock ahead
+    /// of the server's only makes the touches come sooner.
+    fn leaseMsOf(expires_at_ms: i64, now_ms: i64) u64 {
+        const left = std.math.clamp(expires_at_ms -| now_ms, types.MIN_GROUP_LEASE_MS, types.MAX_GROUP_LEASE_MS);
+        return @intCast(left);
+    }
+
+    /// One record's touching thread and the event that stops it. Touches
+    /// fall due every interval from when its batch arrived, not from when
+    /// the last one returned, so a slow touch doesn't push the rest later.
+    const Toucher = struct {
+        worker: *Self,
+        item: *const Leased,
+        client: *?Client,
+        interval_ns: u64,
+        stop: std.Thread.ResetEvent = .{},
+
+        fn run(t: *Toucher) void {
+            var due: u64 = t.interval_ns;
+            while (!t.stop.isSet()) {
+                const since = t.sinceArrival(due);
+                if (since < due) {
+                    t.stop.timedWait(due - since) catch {};
+                    continue;
+                }
+                if (!t.worker.touchOnce(t.client, t.item)) return;
+                // The next due time after the touch: those missed while it
+                // ran are skipped.
+                due = (t.sinceArrival(due) / t.interval_ns + 1) *| t.interval_ns;
+            }
+        }
+
+        fn sinceArrival(t: *const Toucher, fallback: u64) u64 {
+            return if (std.time.Instant.now()) |now| now.since(t.item.arrived) else |_| fallback;
+        }
+    };
+
+    /// Start touching `item` on a thread, when auto_touch is on; null
+    /// otherwise, or when the thread can't start.
+    fn startTouching(self: *Self, toucher: *Toucher, item: *const Leased, touch_conn: *?Client) ?std.Thread {
+        if (!self.config.auto_touch) return null;
+        toucher.* = .{ .worker = self, .item = item, .client = touch_conn, .interval_ns = touchInterval(item.lease_ms) *| std.time.ns_per_ms };
+        return std.Thread.spawn(.{}, Toucher.run, .{toucher}) catch |err| {
+            std.log.err("[flo-stream-worker] Can't start touching record {}: {}", .{ item.record.id, err });
+            return null;
+        };
+    }
+
+    /// Touch `item` once on the touch connection; false when touching
+    /// should stop: the record moved on, or the server refused the touch. A
+    /// lost touch is tried again next interval.
+    fn touchOnce(self: *Self, touch_conn: *?Client, item: *const Leased) bool {
+        if (touch_conn.* == null) {
+            touch_conn.* = Client.init(self.allocator, self.config.endpoint, .{
+                .namespace = self.config.namespace,
+                .retry = self.config.retry,
+            });
+        }
+        const client = &touch_conn.*.?;
+        if (!client.isConnected()) client.connect() catch |err| {
+            std.log.warn("[flo-stream-worker] Touch for record {}: can't connect: {}", .{ item.record.id, err });
+            return true;
+        };
+        var stream = Stream.init(client);
+        var touched = stream.groupTouch(item.stream_name, self.config.group, item.lease, &.{item.record}, .{ .namespace = self.config.namespace, .consumer = self.consumer_name }) catch |err| {
+            if (client_mod.isConnectionError(err)) {
+                std.log.warn("[flo-stream-worker] Touch for record {} failed: {}; trying again", .{ item.record.id, err });
+                client.disconnect();
+                return true;
+            }
+            std.log.warn("[flo-stream-worker] Touch for record {} was refused, stopping: {}", .{ item.record.id, err });
+            return false;
+        };
+        defer touched.deinit();
+        if (touched.refused.len > 0) {
+            std.log.warn("[flo-stream-worker] Touch for record {} applied nothing ({s}), stopping", .{ item.record.id, std.enums.tagName(types.GroupRefusalWhy, touched.refused[0].why) orelse "unknown" });
+            return false;
+        }
+        return true;
+    }
+
     /// Deliver a record's ack or nack. A send lost to a dropped connection or
-    /// a timeout is sent again, unchanged, on a fresh connection that has
-    /// rejoined the groups, up to max_result_sends in all. A refusal is not
-    /// sent again: the server answered. An undelivered result is logged; the
-    /// record stays in this consumer's pending list.
-    fn report(self: *Self, conn: *Client, rejoin: bool, stream_name: []const u8, id: StreamID, kind: enum { ack, nack }) void {
+    /// a timeout is sent again, unchanged, on a fresh connection, up to
+    /// max_result_sends in all; a resent ack that already applied is
+    /// answered `gone`. A refusal is not sent again: the server answered.
+    /// An undelivered result is logged; the record is read again once its
+    /// lease runs out.
+    fn report(self: *Self, conn: *Client, item: *const Leased, kind: enum { ack, nack }) void {
         var stream = Stream.init(conn);
-        const ids = [_]StreamID{id};
+        const id = item.record.id;
         var sends: u32 = 0;
         while (true) {
             sends += 1;
             const result = switch (kind) {
-                .ack => stream.groupAck(stream_name, self.config.group, &ids, .{ .namespace = self.config.namespace }),
-                .nack => stream.groupNack(stream_name, self.config.group, &ids, .{ .namespace = self.config.namespace }),
+                .ack => stream.groupAck(item.stream_name, self.config.group, item.lease, &.{item.record}, .{ .namespace = self.config.namespace, .consumer = self.consumer_name }),
+                .nack => stream.groupNack(item.stream_name, self.config.group, item.lease, &.{item.record}, .{ .namespace = self.config.namespace, .consumer = self.consumer_name }),
             };
-            const err = if (result) return else |e| e;
-            if (!client_mod.isConnectionError(err)) {
-                types.logWorkerError("[flo-stream-worker] {s} of record {} refused: {}; dropped", .{ @tagName(kind), id, err });
-                return;
-            }
-            if (sends >= max_result_sends) {
-                types.logWorkerError("[flo-stream-worker] {s} of record {} not delivered after {d} sends: {}; dropped", .{ @tagName(kind), id, sends, err });
-                return;
-            }
-            conn.disconnect();
-            self.reconnectForResult(conn, rejoin) catch |rerr| {
-                if (!@atomicLoad(bool, &self.running, .monotonic)) {
-                    types.logWorkerError("[flo-stream-worker] {s} of record {} not delivered: worker stopping and reconnect failed: {}; dropped", .{ @tagName(kind), id, rerr });
-                } else {
-                    types.logWorkerError("[flo-stream-worker] {s} of record {} not delivered: reconnect failed: {}; dropped", .{ @tagName(kind), id, rerr });
+            if (result) |answer| {
+                var got = answer;
+                defer got.deinit();
+                // A resend finds its first already applied: gone is done.
+                if (got.refused.len > 0 and !(sends > 1 and got.refused[0].why == .gone)) {
+                    types.logWorkerError("[flo-stream-worker] {s} of record {} applied nothing: {s}; the record moved on", .{ @tagName(kind), id, std.enums.tagName(types.GroupRefusalWhy, got.refused[0].why) orelse "unknown" });
                 }
                 return;
-            };
-            std.log.warn("[flo-stream-worker] {s} of record {} lost: {}; resending", .{ @tagName(kind), id, err });
+            } else |err| {
+                if (!client_mod.isConnectionError(err)) {
+                    types.logWorkerError("[flo-stream-worker] {s} of record {} refused: {}; dropped", .{ @tagName(kind), id, err });
+                    return;
+                }
+                if (sends >= max_result_sends) {
+                    types.logWorkerError("[flo-stream-worker] {s} of record {} not delivered after {d} sends: {}; dropped", .{ @tagName(kind), id, sends, err });
+                    return;
+                }
+                conn.disconnect();
+                self.reconnectForResult(conn) catch |rerr| {
+                    if (!@atomicLoad(bool, &self.running, .monotonic)) {
+                        types.logWorkerError("[flo-stream-worker] {s} of record {} not delivered: worker stopping and reconnect failed: {}; dropped", .{ @tagName(kind), id, rerr });
+                    } else {
+                        types.logWorkerError("[flo-stream-worker] {s} of record {} not delivered: reconnect failed: {}; dropped", .{ @tagName(kind), id, rerr });
+                    }
+                    return;
+                };
+                std.log.warn("[flo-stream-worker] {s} of record {} lost: {}; resending", .{ @tagName(kind), id, err });
+            }
         }
     }
 };
@@ -796,6 +900,39 @@ test "StreamWorker.init turns block_ms 0 into 30000" {
     try std.testing.expectEqual(@as(u32, 30000), w.config.block_ms);
 }
 
+/// Group read answers for the tests.
+const group_test = struct {
+    const le = std.mem.toBytes;
+    /// The read's lease: term 3, index 9.
+    const term: u64 = 3;
+    const index: u64 = 9;
+
+    /// A read leasing records with these sequences, each payload "hi" and
+    /// first delivered, with an expiry far ahead.
+    fn answer(comptime seqs: []const u64) []const u8 {
+        comptime {
+            var out: []const u8 = &(le(term) ++ le(index) ++ le(@as(i64, std.math.maxInt(i64))) ++ le(@as(u32, seqs.len)));
+            for (seqs) |seq| out = out ++ le(seq) ++ "\x00" ** 8 ++ "\x00" ++ "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4 ++ le(@as(u32, 1));
+            const final = out[0..out.len].*;
+            return &final;
+        }
+    }
+
+    /// Whether a report names the read's lease and the one record `seq`,
+    /// first delivered: its value ends term, index, count, id, deliveries.
+    fn reportNames(req: []const u8, seq: u64) bool {
+        const v = @import("test_server.zig").valueOf(req);
+        var want: [8 + 8 + 4 + 8 + 8 + 4]u8 = undefined;
+        @memcpy(want[0..8], &le(term));
+        @memcpy(want[8..16], &le(index));
+        @memcpy(want[16..20], &le(@as(u32, 1)));
+        @memcpy(want[20..28], &le(@as(u64, 0)));
+        @memcpy(want[28..36], &le(seq));
+        @memcpy(want[36..40], &le(@as(u32, 1)));
+        return std.mem.endsWith(u8, v, &want);
+    }
+};
+
 fn runWorker(w: *StreamWorker) void {
     w.start() catch |err| std.debug.panic("stream worker start: {}", .{err});
 }
@@ -804,11 +941,9 @@ test "StreamWorker reconnects after a group read times out and acks the next rec
     const handler = struct {
         fn handle(_: *StreamContext) anyerror!void {}
     }.handle;
-    // [count:u32] then one record: [seq:u64][ts:u64][tier:u8][partition:u32]
-    // [key_present:u8][payload_len:u32]["hi"][header_count:u32]
-    const records = "\x01\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ "\x00" ** 8 ++ "\x00" ++
-        "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4;
-    var srv = try @import("stall_server.zig").StallServer.listen(.stream_group_join, .stream_group_read, .stream_group_ack, records);
+    // Groups have no join: any connection reads.
+    var srv = try @import("stall_server.zig").StallServer.listen(.stream_group_read, .stream_group_read, .stream_group_ack, comptime group_test.answer(&.{7}));
+    srv.empty_poll = &@import("stream.zig").empty_group_read;
     try srv.start();
     defer srv.deinit();
 
@@ -842,25 +977,6 @@ test "StreamWorker sends requests on its own connection after init returns" {
     try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.monotonic));
 }
 
-test "StreamWorker retries a group join the server refused without running" {
-    const handler = struct {
-        fn handle(_: *StreamContext) anyerror!void {}
-    }.handle;
-    const refused: @import("test_server.zig").Reply = .{ .status = 10, .body = "\x0c\x00\x00busy" };
-    var srv = try @import("test_server.zig").OkServer.listen();
-    srv.replies = &.{ refused, refused, refused };
-    try srv.start();
-    defer srv.deinit();
-
-    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .retry = .{ .max_attempts = 1 } }, handler);
-    defer w.deinit();
-    w.running = true;
-
-    try w.joinGroups();
-    try std.testing.expectEqual(@as(u32, 4), srv.requests.load(.acquire));
-    try std.testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.stream_group_join)), srv.last_op);
-}
-
 test "StreamWorker gives its connection the retry policy it is configured with" {
     const handler = struct {
         fn handle(_: *StreamContext) anyerror!void {}
@@ -874,23 +990,6 @@ test "StreamWorker gives its connection the retry policy it is configured with" 
     try std.testing.expectEqual(retry_mod.RetryPolicy{ .max_attempts = 7, .initial_backoff_ms = 30, .max_backoff_ms = 30 }, w.client.retry);
 }
 
-test "StreamWorker gives up a group join on any other refusal" {
-    const handler = struct {
-        fn handle(_: *StreamContext) anyerror!void {}
-    }.handle;
-    var srv = try @import("test_server.zig").OkServer.listen();
-    srv.replies = &.{.{ .status = 10, .body = "\x0c\x00\x02busy" }};
-    try srv.start();
-    defer srv.deinit();
-
-    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events" }, handler);
-    defer w.deinit();
-    w.running = true;
-
-    try std.testing.expectError(FloError.Overloaded, w.joinGroups());
-    try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
-}
-
 test "StreamWorker paces group reads that come back empty at once" {
     const handler = struct {
         fn handle(_: *StreamContext) anyerror!void {}
@@ -899,6 +998,7 @@ test "StreamWorker paces group reads that come back empty at once" {
     try srv.start();
     defer srv.deinit();
 
+    srv.body = &@import("stream.zig").empty_group_read;
     var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 30_000 }, handler);
     defer w.deinit();
     w.running = true;
@@ -917,14 +1017,10 @@ test "StreamWorker resends an ack lost with its connection, never nacks it, and 
             handled += 1;
         }
     };
-    // [count:u32] then per record: [seq:u64][ts:u64][tier:u8][partition:u32]
-    // [key_present:u8][payload_len:u32]["hi"][header_count:u32]
-    const record = "\x00" ** 8 ++ "\x00" ++ "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4;
-    const records = "\x02\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ record ++ "\x08" ++ "\x00" ** 7 ++ record;
     const ScriptServer = @import("test_server.zig").ScriptServer;
     var srv = try ScriptServer.listen();
     srv.rules = &.{
-        .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = records } } },
+        .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = comptime group_test.answer(&.{ 7, 8 }) } } },
         .{ .op = .stream_group_ack, .nth = 0, .action = .drop },
     };
     try srv.start();
@@ -939,8 +1035,6 @@ test "StreamWorker resends an ack lost with its connection, never nacks it, and 
     try std.testing.expectEqual(@as(u32, 3), srv.countOf(.stream_group_ack));
     try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_nack));
     try std.testing.expectEqual(@as(u32, 2), srv.connections.load(.monotonic));
-    // The group is joined again on the new connection before the resend.
-    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_join));
     const sameApartFromId = @import("test_server.zig").sameApartFromId;
     try std.testing.expect(sameApartFromId(srv.requestOf(.stream_group_ack, 0), srv.requestOf(.stream_group_ack, 1)));
     // The third ack is the second record's.
@@ -954,12 +1048,10 @@ test "StreamWorker does not resend an ack the server refused, and runs the rest 
             handled += 1;
         }
     };
-    const record = "\x00" ** 8 ++ "\x00" ++ "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4;
-    const records = "\x02\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ record ++ "\x08" ++ "\x00" ** 7 ++ record;
     const ScriptServer = @import("test_server.zig").ScriptServer;
     var srv = try ScriptServer.listen();
     srv.rules = &.{
-        .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = records } } },
+        .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = comptime group_test.answer(&.{ 7, 8 }) } } },
         .{ .op = .stream_group_ack, .nth = 0, .action = .{ .reply = .{ .status = @intFromEnum(types.StatusCode.conflict), .body = "\x09\x00\x01gone" } } },
     };
     try srv.start();
@@ -984,10 +1076,8 @@ test "a stream context hands its record's headers back as pairs" {
 }
 
 const concurrency_test = struct {
-    // [ts:i64][tier:u8][partition:u32][key_present:u8][payload_len:u32][payload][header_count:u32]
-    const record = "\x00" ** 8 ++ "\x00" ++ "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4;
     // Two records, sequences 7 and 8.
-    const records = "\x02\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ record ++ "\x08" ++ "\x00" ** 7 ++ record;
+    const records = group_test.answer(&.{ 7, 8 });
 
     var in_flight = std.atomic.Value(u32).init(0);
     var most = std.atomic.Value(u32).init(0);
@@ -1066,7 +1156,7 @@ test "StreamWorker drain from another thread only sets the flag, and the poll lo
 
 const batch_test = struct {
     // One record, sequence 7, payload "hi".
-    const one = "\x01\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ concurrency_test.record;
+    const one = group_test.answer(&.{7});
     var seen = std.atomic.Value(bool).init(false);
 
     /// Holds its record past the next poll's time, then checks the payload
@@ -1121,15 +1211,8 @@ const drain_gap_test = struct {
 test "StreamWorker finishes a drain while it can't reach the server" {
     const ScriptServer = @import("test_server.zig").ScriptServer;
     var srv = try ScriptServer.listen();
-    srv.rules = &.{
-        // The first read loses the connection, and every reconnect's join is
-        // cut off too.
-        .{ .op = .stream_group_read, .action = .drop },
-        .{ .op = .stream_group_join, .nth = 1, .action = .drop },
-        .{ .op = .stream_group_join, .nth = 2, .action = .drop },
-        .{ .op = .stream_group_join, .nth = 3, .action = .drop },
-        .{ .op = .stream_group_join, .nth = 4, .action = .drop },
-    };
+    // Every read loses the connection.
+    srv.rules = &.{.{ .op = .stream_group_read, .action = .drop }};
     try srv.start();
     defer srv.deinit();
 
@@ -1163,11 +1246,11 @@ test "StreamWorker finishes a drain while the server refuses connections" {
     try std.testing.expect(drain_gap_test.returnedWithin(&w, 500));
 }
 
-test "StreamWorker finishes a drain while its group join is backing off" {
+test "StreamWorker finishes a drain while its group read is backing off" {
     const ScriptServer = @import("test_server.zig").ScriptServer;
     var srv = try ScriptServer.listen();
     // [reason:u16][ran:u8][message]: refused, not run, so it is retried.
-    srv.rules = &.{.{ .op = .stream_group_join, .action = .{ .reply = .{ .status = @intFromEnum(types.StatusCode.overloaded), .body = "\x0c\x00\x00busy" } } }};
+    srv.rules = &.{.{ .op = .stream_group_read, .action = .{ .reply = .{ .status = @intFromEnum(types.StatusCode.overloaded), .body = "\x0c\x00\x00busy" } } }};
     try srv.start();
     defer srv.deinit();
 
@@ -1177,10 +1260,9 @@ test "StreamWorker finishes a drain while its group join is backing off" {
     const thread = try std.Thread.spawn(.{}, drain_gap_test.run, .{&w});
     defer thread.join();
     var waited: u32 = 0;
-    while (srv.countOf(.stream_group_join) < 2 and waited < 5000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
+    while (srv.countOf(.stream_group_read) < 2 and waited < 5000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
     w.drain();
     try std.testing.expect(drain_gap_test.returnedWithin(&w, 500));
-    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_read));
 }
 
 test "StreamWorker drained before start returns without reading" {
@@ -1245,7 +1327,7 @@ test "StreamWorker registers again, with the same options, when its heartbeat fi
     try std.testing.expect(!w.drain_sent);
 }
 
-test "StreamWorker waits out a halted shard at its join, registration and reads, then carries on" {
+test "StreamWorker waits out a halted shard at its registration and reads, then carries on" {
     const handler = struct {
         fn handle(_: *StreamContext) anyerror!void {}
     }.handle;
@@ -1254,9 +1336,6 @@ test "StreamWorker waits out a halted shard at its join, registration and reads,
     const halted: @import("test_server.zig").Reply = .{ .status = 12, .body = "\x1d\x00\x00shard 0 halted at index 8; an operator must repair it" };
     var srv = try ScriptServer.listen();
     srv.rules = &.{
-        .{ .op = .stream_group_join, .nth = 0, .action = .{ .reply = halted } },
-        .{ .op = .stream_group_join, .nth = 1, .action = .{ .reply = halted } },
-        .{ .op = .stream_group_join, .nth = 2, .action = .{ .reply = halted } },
         .{ .op = .worker_register, .nth = 0, .action = .{ .reply = halted } },
         .{ .op = .worker_register, .nth = 1, .action = .{ .reply = halted } },
         .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = halted } },
@@ -1274,7 +1353,6 @@ test "StreamWorker waits out a halted shard at its join, registration and reads,
     w.stop();
     thread.join();
 
-    try std.testing.expectEqual(@as(u32, 4), srv.countOf(.stream_group_join));
     try std.testing.expectEqual(@as(u32, 3), srv.countOf(.worker_register));
     try std.testing.expect(srv.countOf(.stream_group_read) >= 5);
 }
@@ -1286,8 +1364,7 @@ test "StreamWorker reads again when a group read is refused unavailable without 
             _ = handled.fetchAdd(1, .monotonic);
         }
     };
-    const record = "\x00" ** 8 ++ "\x02" ++ "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4; // tier 2: disk
-    const records = "\x01\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ record;
+    const records = comptime group_test.answer(&.{7});
     const ScriptServer = @import("test_server.zig").ScriptServer;
     // unavailable, reason unclassified, ran no: the records are being read from disk.
     const cold: @import("test_server.zig").Reply = .{ .status = 12, .body = "\x0c\x00\x00unavailable: too many reads are waiting on this shard's disk; retry" };
@@ -1368,11 +1445,11 @@ test "StreamWorker whose registration is outcome_pending returns it after one tr
     try std.testing.expectEqualStrings("shard 0 halted at this entry; a repair skips it", w.client.lastError().?.message);
 }
 
-test "StreamWorker stopped or drained while a halted shard holds its group join returns at once, sending nothing more" {
+test "StreamWorker stopped or drained while a halted shard holds its registration returns at once, reading nothing" {
     const ScriptServer = @import("test_server.zig").ScriptServer;
     for ([_]bool{ false, true }) |drain| {
         var srv = try ScriptServer.listen();
-        srv.rules = &.{.{ .op = .stream_group_join, .action = .{ .reply = halted_refusal } }};
+        srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = halted_refusal } }};
         try srv.start();
         defer srv.deinit();
 
@@ -1382,20 +1459,19 @@ test "StreamWorker stopped or drained while a halted shard holds its group join 
         w.client.prng = std.Random.DefaultPrng.init(7);
         const thread = try halted_start_test.begin(&w);
         var waited: u32 = 0;
-        while (srv.countOf(.stream_group_join) < 5 and waited < 8000) : (waited += 5) std.Thread.sleep(5 * std.time.ns_per_ms);
+        while (srv.countOf(.worker_register) < 5 and waited < 8000) : (waited += 5) std.Thread.sleep(5 * std.time.ns_per_ms);
         if (drain) w.drain() else w.stop();
         const prompt = halted_start_test.returnedWithin(&w, 100);
         thread.join();
         try std.testing.expect(prompt);
         try halted_start_test.result;
-        try std.testing.expectEqual(@as(u32, 5), srv.countOf(.stream_group_join));
+        try std.testing.expectEqual(@as(u32, 5), srv.countOf(.worker_register));
         try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_read));
     }
 }
 
 test "StreamWorker never resends an ack a halted shard refused" {
-    const record = "\x00" ** 8 ++ "\x00" ++ "\x00" ** 4 ++ "\x00" ++ "\x02\x00\x00\x00hi" ++ "\x00" ** 4;
-    const records = "\x01\x00\x00\x00" ++ "\x07" ++ "\x00" ** 7 ++ record;
+    const records = comptime group_test.answer(&.{7});
     const ScriptServer = @import("test_server.zig").ScriptServer;
     const pending: @import("test_server.zig").Reply = .{ .status = 13, .body = "\x1d\x00\x02committed; applies when the shard resumes" };
     for ([_]@import("test_server.zig").Reply{ halted_refusal, pending }) |refusal| {
@@ -1416,4 +1492,110 @@ test "StreamWorker never resends an ack a halted shard refused" {
         try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_nack));
         try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
     }
+}
+
+test "StreamWorker acks each record naming the read's lease, the record and its deliveries, as its consumer" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = comptime group_test.answer(&.{ 7, 8 }) } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .consumer = "c1", .block_ms = 100 }, drain_gap_test.handle);
+    defer w.deinit();
+    w.running = true;
+    try w.pollAndProcess("events");
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.stream_group_ack));
+    for ([_]u64{ 7, 8 }, 0..) |seq, i| {
+        const v = @import("test_server.zig").valueOf(srv.requestOf(.stream_group_ack, @intCast(i)));
+        try std.testing.expect(std.mem.startsWith(u8, v, "\x07\x00default\x02\x00c1"));
+        try std.testing.expect(group_test.reportNames(srv.requestOf(.stream_group_ack, @intCast(i)), seq));
+    }
+}
+
+test "StreamWorker backs off a group read refused at a limit, logging it once, and the client never retries it" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    // limit, reason too_many_actions, ran no.
+    const limit: @import("test_server.zig").Reply = .{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions" };
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .stream_group_read, .action = .{ .reply = limit } }};
+    try srv.start();
+    defer srv.deinit();
+
+    // The default retry policy, which retries what didn't run when it may
+    // pass: a limit won't.
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, drain_gap_test.handle);
+    defer w.deinit();
+    w.running = true;
+    try std.testing.expectError(FloError.Limit, w.pollAndProcess("events"));
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_read));
+    try std.testing.expectEqual(types.Reason.too_many_actions, w.client.lastError().?.reason);
+
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    std.Thread.sleep(700 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+    // Backing off from 100 ms, doubling: a handful of reads, not a spin.
+    const reads = srv.countOf(.stream_group_read);
+    try std.testing.expect(reads >= 2 and reads <= 8);
+    try std.testing.expectEqual(@as(?types.Reason, .too_many_actions), w.limit_notice.last);
+}
+
+test "a limit notice logs a reason once until cleared, and a new reason at once" {
+    const Fake = struct {
+        reason: types.Reason,
+        pub fn lastError(f: *const @This()) ?Client.LastError {
+            return .{ .code = 15, .reason = f.reason, .ran = .no, .message = "limit" };
+        }
+    };
+    var n: types.LimitNotice = .{};
+    var f: Fake = .{ .reason = .too_many_actions };
+    n.note(&f, "test");
+    try std.testing.expectEqual(@as(?types.Reason, .too_many_actions), n.last);
+    f.reason = .memory_budget;
+    n.note(&f, "test");
+    try std.testing.expectEqual(@as(?types.Reason, .memory_budget), n.last);
+    n.clear();
+    try std.testing.expectEqual(@as(?types.Reason, null), n.last);
+}
+
+test "StreamWorker touch intervals: a sixth of the lease, at least 100 ms; the lease read off the expiry within the server's bounds" {
+    try std.testing.expectEqual(@as(u64, 5_000), StreamWorker.touchInterval(30_000));
+    try std.testing.expectEqual(@as(u64, 100), StreamWorker.touchInterval(300));
+    try std.testing.expectEqual(@as(u64, 30_000), StreamWorker.leaseMsOf(1_030_000, 1_000_000));
+    // A clock ahead of the server's, or one far behind, is held to 5 s to 12 h.
+    try std.testing.expectEqual(@as(u64, 5_000), StreamWorker.leaseMsOf(1_000_000, 2_000_000));
+    try std.testing.expectEqual(@as(u64, 43_200_000), StreamWorker.leaseMsOf(std.math.maxInt(i64), 0));
+    try std.testing.expectEqual(@as(u64, 5_000), StreamWorker.leaseMsOf(0, std.math.maxInt(i64)));
+}
+
+test "StreamWorker with auto_touch touches a record on its own connection while the handler runs, then acks it" {
+    const slow = struct {
+        fn handle(_: *StreamContext) anyerror!void {
+            std.Thread.sleep(1_100 * std.time.ns_per_ms);
+        }
+    };
+    // Leased for 5 s from now.
+    var answer = comptime group_test.answer(&.{7})[0..].*;
+    std.mem.writeInt(i64, answer[16..24], std.time.milliTimestamp() + 5_000, .little);
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.concurrent = true;
+    srv.rules = &.{
+        .{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = &answer } } },
+        // [expires_at_ms:i64][applied:u32][refused:u32]
+        .{ .op = .stream_group_touch, .action = .{ .reply = .{ .status = 0, .body = "\x00" ** 8 ++ "\x01\x00\x00\x00" ++ "\x00" ** 4 } } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100, .auto_touch = true }, slow.handle);
+    defer w.deinit();
+    w.running = true;
+    try w.pollAndProcess("events");
+    // A 5 s lease: touched every 833 ms from the read's arrival.
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_touch));
+    try std.testing.expect(group_test.reportNames(srv.requestOf(.stream_group_touch, 0), 7));
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_ack));
+    try std.testing.expectEqual(@as(u32, 2), srv.connections.load(.monotonic));
 }

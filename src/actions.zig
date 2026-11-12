@@ -1531,3 +1531,26 @@ test "a registration carries every process, metadata and machine id; the server 
     try std.testing.expectEqual(@as(u16, 1025), std.mem.readInt(u16, many[5..7], .little));
     try std.testing.expectEqual(@as(usize, 7 + 1025 * 4 + 2), many.len);
 }
+
+test "a node at its action limit refuses a registration with Limit and its reason, never retried" {
+    var srv = try test_server.OkServer.listen();
+    // limit (15), reason too_many_actions (33), ran no.
+    srv.replies = &.{.{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions, the most it registers; delete one to register another" }};
+    try srv.start();
+    defer srv.deinit();
+
+    // The default policy retries refusals that didn't run and may pass;
+    // a limit won't pass by waiting.
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var actions = Actions.init(&client);
+    try std.testing.expectError(FloError.Limit, actions.registerAction("one-too-many", .user, .{}));
+    try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
+    const last = client.lastError().?;
+    try std.testing.expectEqual(@as(u8, 15), last.code);
+    try std.testing.expectEqual(types.Reason.too_many_actions, last.reason);
+    try std.testing.expectEqual(types.Ran.no, last.ran);
+    try std.testing.expect(std.mem.startsWith(u8, last.message, "limit: this node holds 10000 actions"));
+    try std.testing.expect(!client.refusedUnrun(FloError.Limit));
+}
