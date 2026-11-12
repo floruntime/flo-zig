@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0x19075df8e1ed5f75;
+pub const TABLE_HASH: u64 = 0xc688167b51fcc846;
 
 /// Why the server refused a request. Mirrors the server's list; the table
 /// hash covers it, so a server can't send one this SDK doesn't know.
@@ -43,9 +43,9 @@ pub const Reason = enum(u16) {
     condition_failed = 16,
     /// No open transaction has this id here.
     no_such_transaction = 17,
-    /// The routing key (the key, when none is given) isn't the one the
-    /// transaction was begun with.
-    wrong_routing_key = 18,
+    /// This key routes elsewhere than the key the transaction was begun
+    /// with: give every key in a transaction the same `{tag}`.
+    keys_not_colocated = 18,
     /// The transaction holds as many ops or bytes as it may.
     txn_too_large = 19,
     /// The shard holds as many waiting reads as it may.
@@ -80,6 +80,14 @@ pub const Reason = enum(u16) {
     admin_only = 30,
     /// A processing remove of a job still running: stop or cancel it first.
     job_running = 31,
+    /// Status limit: the node's memory budget is spent.
+    memory_budget = 32,
+    /// Status limit: the node holds as many actions as it registers.
+    too_many_actions = 33,
+    /// Status limit: the node holds as many workflow definitions as it keeps.
+    too_many_workflow_definitions = 34,
+    /// Status limit: the node holds as many workflow runs as it keeps.
+    too_many_workflow_runs = 35,
 };
 
 /// Whether a refused request took effect: retry logic reads this, not the
@@ -102,9 +110,9 @@ pub const MAX_BLOCK_MS: u32 = 300_000;
 /// Longest a KV get may wait (wait_ms).
 pub const MAX_WAIT_MS: u64 = 300_000;
 /// Longest value a KV put takes.
-pub const MAX_KV_VALUE_SIZE: usize = 253_817;
+pub const MAX_KV_VALUE_SIZE: usize = 257_916;
 /// The longest JSON document kv.json_set takes.
-pub const MAX_JSON_DOCUMENT_SIZE: usize = 252_819;
+pub const MAX_JSON_DOCUMENT_SIZE: usize = 256_918;
 /// The longest JSON path.
 pub const MAX_JSON_PATH: usize = 1024;
 /// The most names one kv.scan page holds.
@@ -198,6 +206,35 @@ pub fn pauseUnlessHalted(running: *const bool, halt: ?*const bool, ms: u64) void
     }
 }
 
+/// A loop backing off from limit refusals logs each distinct reason once,
+/// not once per tick, even when reasons alternate. `clear` after a call
+/// that succeeds, so a limit hit again later is logged again.
+pub const LimitNotice = struct {
+    /// The reasons logged since the last clear; the server has four.
+    seen: [8]Reason = undefined,
+    seen_len: usize = 0,
+
+    /// Log the limit refusal `client.lastError()` holds, unless its reason
+    /// was logged already.
+    pub fn note(self: *LimitNotice, client: anytype, comptime what: []const u8) void {
+        const last = client.lastError() orelse return;
+        if (self.logged(last.reason)) return;
+        if (self.seen_len < self.seen.len) {
+            self.seen[self.seen_len] = last.reason;
+            self.seen_len += 1;
+        }
+        std.log.warn(what ++ " refused at a limit ({s}): {s}; backing off, not retrying it until it passes", .{ std.enums.tagName(Reason, last.reason) orelse "unknown", last.message });
+    }
+
+    pub fn logged(self: *const LimitNotice, reason: Reason) bool {
+        return std.mem.indexOfScalar(Reason, self.seen[0..self.seen_len], reason) != null;
+    }
+
+    pub fn clear(self: *LimitNotice) void {
+        self.seen_len = 0;
+    }
+};
+
 /// Log a worker error: a result given up on, or a handler that failed. It
 /// is an error, but logged as a warning under test: the test runner fails
 /// any test that logs an error, and the worker tests provoke these on
@@ -261,13 +298,9 @@ pub const OpCode = enum(u16) {
 
     // ── Stream Consumer Groups (0x150 – 0x16F) ──
     stream_group_create = 0x150,
-    stream_group_join = 0x151,
-    stream_group_leave = 0x152,
     stream_group_read = 0x153,
     stream_group_ack = 0x154,
-    stream_group_claim = 0x155,
     stream_group_pending = 0x156,
-    stream_group_configure_sweeper = 0x157,
     stream_group_nack = 0x159,
     stream_group_touch = 0x15A,
     stream_group_info = 0x15B,
@@ -364,6 +397,10 @@ pub const StatusCode = enum(u8) {
     /// missing key. Reads, lists and scans in a namespace never created
     /// answer this; a write creates the namespace.
     no_namespace = 14,
+    /// The node is at a limit on what it holds; the reason names which.
+    /// Terminal: retrying won't clear it until something is deleted, the
+    /// node is given more room, or the setting is raised. It never ran.
+    limit = 15,
 
     // The server may send codes this SDK predates; `_` keeps them a value
     // rather than illegal behaviour, and toError maps them to ServerError.
@@ -387,6 +424,7 @@ pub const StatusCode = enum(u8) {
             .unavailable => "Unavailable: no leader or the shard isn't taking writes; retry",
             .outcome_pending => "Committed, not applied: its shard halted; don't resend it unchanged",
             .no_namespace => "No such namespace",
+            .limit => "At a limit: delete something, give the node more room, or raise the setting",
             // No buffer to format the code into; Client.lastError has it.
             _ => "Unknown status",
         };
@@ -407,6 +445,7 @@ pub const StatusCode = enum(u8) {
             .unavailable => FloError.Unavailable,
             .outcome_pending => FloError.OutcomePending,
             .no_namespace => FloError.NoNamespace,
+            .limit => FloError.Limit,
             else => FloError.ServerError,
         };
     }
@@ -434,8 +473,10 @@ pub const OptionTag = enum(u8) {
     force = 0x2C, // void: Flag to delete a stream that still holds records
 
     // Consumer Group Options (0x30 - 0x3F)
-    ack_timeout_ms = 0x30, // u32: Time before unacked message auto-redelivers
-    max_deliver = 0x31, // u8: Max delivery attempts before DLQ (default: 10, 0=unlimited)
+    ack_timeout_ms = 0x30, // u32: A group's lease: a record not acked this long is redelivered (5 s to 12 h)
+    max_deliver = 0x31, // u8: A group's attempts: a record is dead once nacked or expired this many times (1 to 255)
+    dead = 0x32, // void: A nack's records are dead now
+    error_text = 0x33, // string: Why a nack's records failed
 
     // Time-Series Options (0x60 - 0x6F)
     ts_from_ms = 0x60, // i64: Start of time range (inclusive, unix ms)
@@ -519,6 +560,13 @@ pub const FloError = error{
     /// (status conflict, reason stale_report); Client.lastError's message
     /// says how. Not resent: it would be refused again.
     StaleReport,
+    /// The node is at a limit on what it holds (status limit); the reason
+    /// (`Client.lastError`) names which: memory_budget, too_many_actions,
+    /// too_many_workflow_definitions or too_many_workflow_runs, and its
+    /// message says more. Terminal: retrying won't clear it until
+    /// something is deleted, the node is given more room, or the setting is
+    /// raised, so it is never retried. Not permanent. It never ran.
+    Limit,
     UnexpectedResponse,
 
     // Transaction errors
@@ -743,8 +791,6 @@ pub const GetOptions = struct {
     wait_ms: u64 = 0,
     /// The key to exist (the default), or its next version
     wait_for: WaitFor = .exists,
-    /// Routes the request in place of the key
-    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV put operations
@@ -757,8 +803,6 @@ pub const PutOptions = struct {
     condition: Condition = .always,
     /// The key's version the write requires; 0 means it doesn't exist
     cas_version: ?u64 = null,
-    /// Routes the request in place of the key
-    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV delete operations
@@ -768,8 +812,6 @@ pub const DeleteOptions = struct {
     /// The key's version the delete requires; another version returns
     /// `FloError.Conflict`. Use this for race-free "only the owner deletes".
     cas_version: ?u64 = null,
-    /// Routes the request in place of the key
-    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV scan operations
@@ -790,8 +832,6 @@ pub const HistoryOptions = struct {
     limit: u32 = 10,
     /// Only versions older than this one; null to start from the newest.
     before_version: ?u64 = null,
-    /// Routes the request in place of the key
-    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV incr operations
@@ -800,8 +840,6 @@ pub const KVIncrOptions = struct {
     namespace: ?[]const u8 = null,
     /// Negative values decrement.
     delta: i64 = 1,
-    /// Routes the request in place of the key
-    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV expire operations
@@ -811,33 +849,24 @@ pub const KVExpireOptions = struct {
     /// The key's version the expire requires; use this for race-free lease
     /// renewal.
     cas_version: ?u64 = null,
-    /// Routes the request in place of the key
-    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV exists operations
 pub const KVExistsOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Routes the request in place of the key
-    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV JSON operations
 pub const KVJsonOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Routes the request in place of the key
-    routing_key: ?[]const u8 = null,
 };
 
 /// Options for KV mget operations
 pub const KVMGetOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// The routing key every key was written with: all are looked up on its
-    /// shard. Without it, each key is looked up on its own shard.
-    routing_key: ?[]const u8 = null,
 };
 
 /// Options for a delete or expire inside a KV transaction
@@ -1049,6 +1078,9 @@ pub const StreamRecord = struct {
     stream: []const u8 = "",
     payload: []const u8,
     headers: []const Header = &.{},
+    /// From a group read: the record's deliveries, this one included. An
+    /// ack, nack or touch names it back. 0 from a plain read.
+    deliveries: u32 = 0,
 
     pub fn deinit(self: *StreamRecord, allocator: std.mem.Allocator) void {
         allocator.free(self.payload);
@@ -1157,8 +1189,31 @@ pub const StreamDeleteOptions = struct {
     force: bool = false,
 };
 
-/// Options for consumer group join
-pub const StreamGroupJoinOptions = struct {
+/// The longest consumer group name.
+pub const MAX_GROUP_NAME: usize = 256;
+/// The longest consumer name a group read or report takes.
+pub const MAX_GROUP_CONSUMER: usize = 4096;
+/// The most records one group read leases, and one report names.
+pub const MAX_GROUP_BATCH: u32 = 100;
+/// A group's lease (ack timeout) bounds: 5 s to 12 h.
+pub const MIN_GROUP_LEASE_MS: u32 = 5_000;
+pub const MAX_GROUP_LEASE_MS: u32 = 43_200_000;
+
+/// Options for consumer group create
+pub const StreamGroupCreateOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// The group's lease, 5000 to 43200000 ms: a record not acked or
+    /// touched this long after its read is ready again. Null for the
+    /// server's 30000.
+    ack_timeout_ms: ?u32 = null,
+    /// The group's attempts, 1 to 255: a record nacked or expired this many
+    /// times is dead. Null for the server's 5.
+    max_deliver: ?u8 = null,
+};
+
+/// Options for consumer group delete and info
+pub const StreamGroupOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
 };
@@ -1167,17 +1222,17 @@ pub const StreamGroupJoinOptions = struct {
 pub const StreamGroupReadOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Maximum number of records to read
+    /// Most records to lease, 1 to 100; null for 100.
     count: ?u32 = null,
-    /// Block waiting for new records, in ms (null or 0 = don't wait, max 300000)
+    /// Block waiting for records, in ms (null or 0 = don't wait, max 300000)
     block_ms: ?u32 = null,
 };
 
-/// Options for consumer group ack
-pub const StreamGroupAckOptions = struct {
+/// Options for consumer group ack and touch
+pub const StreamGroupReportOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Consumer ID. Sent, but the server doesn't check it: any consumer can ack an entry.
+    /// The consumer the records were read as.
     consumer: []const u8 = "",
 };
 
@@ -1185,8 +1240,89 @@ pub const StreamGroupAckOptions = struct {
 pub const StreamGroupNackOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
-    /// Consumer ID. Sent, but the server doesn't check it: any consumer can nack an entry.
+    /// The consumer the records were read as.
     consumer: []const u8 = "",
+    /// How long before they are ready again, at most a day.
+    delay_ms: u64 = 0,
+    /// Dead now, attempts left or not.
+    dead: bool = false,
+    /// Why they failed, at most 255 bytes.
+    error_message: []const u8 = "",
+};
+
+/// The delivery a group read made: an ack, nack or touch names it back.
+pub const GroupLease = struct {
+    term: u64,
+    index: u64,
+};
+
+/// One group read's records and their lease. Free with `deinit`.
+pub const GroupReadResult = struct {
+    records: []StreamRecord,
+    lease: GroupLease,
+    /// When the lease runs out without a touch, in Unix milliseconds; 0
+    /// when the read leased nothing.
+    expires_at_ms: i64,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *GroupReadResult) void {
+        for (self.records) |*r| r.deinit(self.allocator);
+        self.allocator.free(self.records);
+    }
+};
+
+/// Why an ack, nack or touch left a record as it was.
+pub const GroupRefusalWhy = enum(u8) {
+    /// Not in the group: acked already, or never read. For an ack, it's done.
+    gone = 0,
+    /// Read again since this delivery.
+    delivered_again = 1,
+    /// Another consumer holds it.
+    other_holder = 2,
+    /// Its lease ran out; it is ready again, or dead.
+    expired = 3,
+    /// Nacked since; it is ready again, or dead.
+    released = 4,
+    /// Nobody holds it.
+    not_held = 5,
+    _,
+};
+
+/// A record a report left as it was.
+pub const GroupRefusal = struct {
+    id: StreamID,
+    why: GroupRefusalWhy,
+};
+
+/// What an ack, nack or touch did: how many records it applied to, and
+/// those it didn't, each with why. A report for a delivery that has moved
+/// on is answered this way, applying nothing, not as an error. Free with
+/// `deinit`.
+pub const GroupReport = struct {
+    applied: u32,
+    refused: []GroupRefusal,
+    /// For a touch: when the lease runs out without another, in Unix
+    /// milliseconds. 0 for an ack or nack.
+    expires_at_ms: i64 = 0,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *GroupReport) void {
+        self.allocator.free(self.refused);
+    }
+};
+
+/// A consumer group's records by state.
+pub const StreamGroupInfo = struct {
+    /// Ready and leased.
+    pending: u64,
+    /// Consumers holding records now.
+    holders: u32,
+    created_at_ms: i64,
+    ready: u64,
+    leased: u64,
+    dead: u64,
+    /// Records at or below a trim, not yet cleaned out of the group.
+    trimmed_pending: u64,
 };
 
 /// Options for listing a stream's consumer groups or a group's members
@@ -1195,16 +1331,17 @@ pub const StreamGroupListOptions = struct {
     namespace: ?[]const u8 = null,
 };
 
-/// A consumer group as the stream's group list shows it. Members and
-/// pending are the leader's, and a leader change starts them again.
+/// A consumer group as the stream's group list shows it.
 pub const StreamGroupSummary = struct {
     name: []const u8,
+    /// Consumers holding its records now.
     members: u32,
+    /// Records ready or leased.
     pending: u64,
     created_at_ms: i64,
     ack_timeout_ms: u32,
     max_deliver: u8,
-    /// When it was last delivered to, in Unix milliseconds; 0 if never.
+    /// The last stream record it read: its timestamp, 0 if none.
     last_delivered_ms: u64,
     last_delivered_seq: u64,
 };
@@ -1222,19 +1359,21 @@ pub const StreamGroupList = struct {
     }
 };
 
+/// The server reports every member active.
 pub const StreamGroupMemberState = enum(u8) {
     active = 0,
     leaving = 1,
 };
 
-/// A consumer group's member. All of it is the leader's, and a leader
-/// change starts it again.
+/// A consumer holding a group's records.
 pub const StreamGroupMember = struct {
     id: []const u8,
     state: StreamGroupMemberState,
+    /// Records it holds.
     pending: u32,
+    /// When it took the oldest it holds.
     joined_at_ms: i64,
-    /// When it was last delivered to; null if never.
+    /// When it last took one.
     last_active_ms: ?i64,
 };
 
@@ -2023,6 +2162,26 @@ test "the op codes match the server's: namespace settings retired, ensure and re
     try std.testing.expectEqual(@as(u16, 0x30A), @intFromEnum(OpCode.action_await));
     try std.testing.expectEqual(@as(u16, 0x30D), @intFromEnum(OpCode.action_touch));
     try std.testing.expectEqual(@as(u16, 0x180), @intFromEnum(OpCode.queue_peek));
+}
+
+test "limit is its own terminal error, its reasons decode by name, and the txn reason is keys_not_colocated" {
+    try std.testing.expectEqual(FloError.Limit, StatusCode.limit.toError());
+    try std.testing.expectEqual(StatusCode.limit, @as(StatusCode, @enumFromInt(15)));
+    for ([_]struct { u16, Reason }{
+        .{ 18, .keys_not_colocated },
+        .{ 32, .memory_budget },
+        .{ 33, .too_many_actions },
+        .{ 34, .too_many_workflow_definitions },
+        .{ 35, .too_many_workflow_runs },
+    }) |c| try std.testing.expectEqual(c[1], std.enums.fromInt(Reason, c[0]).?);
+    var next: u16 = 36;
+    _ = &next;
+    try std.testing.expect(std.enums.fromInt(Reason, next) == null);
+    try std.testing.expect(!@hasField(Reason, "wrong_routing_key"));
+    // The removed group ops are gone from the SDK.
+    for ([_]u16{ 0x151, 0x152, 0x155, 0x157 }) |code| {
+        try std.testing.expect(std.enums.tagName(OpCode, @enumFromInt(code)) == null);
+    }
 }
 
 test "unavailable is retryable, internal_error is not, unknown codes are a server error" {

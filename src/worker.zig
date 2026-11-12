@@ -197,6 +197,8 @@ pub const ActionWorker = struct {
     /// auto_touch's connection for tasks run inline (concurrency 1), opened
     /// on first use; a slot has its own.
     touch_client: ?Client = null,
+    /// The limit refusal last logged, so a run of them logs once.
+    limit_notice: types.LimitNotice = .{},
     /// The next await's request key, and its length; 0 until one is made.
     /// The poll loop's alone.
     poll_key: [32]u8 = undefined,
@@ -302,7 +304,8 @@ pub const ActionWorker = struct {
     /// Registering replaces the action's settings, so workers
     /// that register one action with different options leave it with
     /// whichever registered last. `options.namespace` is ignored: the action
-    /// goes in the worker's.
+    /// goes in the worker's. A node at its action limit returns
+    /// `error.Limit` after one request, registering nothing.
     pub fn registerAction(self: *Self, action_name: []const u8, handler: ActionHandler, options: types.ActionRegisterOptions) !void {
         if (self.handlers.contains(action_name)) {
             return error.ActionAlreadyRegistered;
@@ -327,7 +330,14 @@ pub const ActionWorker = struct {
     /// Start the worker and begin processing actions.
     /// This function blocks until stop() is called or drain completes, then
     /// waits, without a limit, for running handlers to return and send their
-    /// results: a handler that never returns blocks it.
+    /// results: a handler that never returns blocks it. Registration waits
+    /// out a halted shard, and an overloaded or unavailable refusal that
+    /// didn't run, backing off until it clears or a stop or drain ends the
+    /// wait. Any other failure is returned (for a refusal, its typed error,
+    /// such as `error.Limit` or `error.BadRequest`, with the reason and
+    /// message in `client.lastError()`), so the worker never serves
+    /// unregistered: start fails with the limit error; a limit hit while
+    /// running is logged and backed off.
     pub fn start(self: *Self) !void {
         if (self.handlers.count() == 0) {
             return error.NoActionsRegistered;
@@ -349,13 +359,21 @@ pub const ActionWorker = struct {
             self.drain_sent = false;
         }
         self.drain_retry_ns = 0;
-        // A halted shard holds the start until it's repaired, or a stop or
-        // drain ends the wait. A registration that committed but hasn't
-        // applied (outcome_pending) is returned, not resent.
+        // A halted shard, or a refusal that didn't run and may pass
+        // (overloaded, unavailable), holds the start until it clears, or a
+        // stop or drain ends the wait. Any other failure is returned: a
+        // registration that committed but hasn't applied (outcome_pending)
+        // isn't resent, and the worker never serves unregistered.
         var halted = retry_mod.haltedBackoff();
+        var refused = retry_mod.workerBackoff();
         while (true) {
             self.registerWorker() catch |err| {
-                if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-worker]", "worker registration")) return err;
+                if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-worker]", "worker registration")) {
+                    if (!self.client.refusedUnrun(err)) return err;
+                    const ms = refused.next(self.client.prng.random());
+                    std.log.warn("[flo-worker] Worker registration refused, not run: {s}; retrying in {d}ms", .{ self.client.lastError().?.message, ms });
+                    types.pauseUnlessHalted(&self.running, &self.draining, ms);
+                }
                 if (types.goingOn(&self.running, &self.draining)) continue;
                 std.log.info("[flo-worker] Worker stopped before registering", .{});
                 @atomicStore(bool, &self.running, false, .monotonic);
@@ -411,8 +429,11 @@ pub const ActionWorker = struct {
                     .other => if (!self.client.waitIfHalted(err, &halted, &self.running, &self.draining, "[flo-worker]", "await")) {
                         const ms = failed.next(self.client.prng.random());
                         // A refusal that may pass is a warning: the poll goes
-                        // again with its request key.
-                        if (err == FloError.Unavailable or err == FloError.Overloaded) {
+                        // again with its request key. A limit is logged once
+                        // per reason while it lasts.
+                        if (err == FloError.Limit) {
+                            self.limit_notice.note(&self.client, "[flo-worker] await");
+                        } else if (err == FloError.Unavailable or err == FloError.Overloaded) {
                             std.log.warn("[flo-worker] Await refused: {}, retrying in {d}ms...", .{ err, ms });
                         } else std.log.err("[flo-worker] Await error: {}, retrying in {d}ms...", .{ err, ms });
                         types.pauseUnlessHalted(&self.running, &self.draining, ms);
@@ -422,6 +443,7 @@ pub const ActionWorker = struct {
             };
             failed.reset();
             halted.reset();
+            self.limit_notice.clear();
         }
 
         // Tasks still running finish and send their results.
@@ -2116,4 +2138,103 @@ test "ActionWorker never resends a complete or fail a halted shard refused" {
             try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
         }
     }
+}
+
+test "ActionWorker backs off an await refused at a limit, logging it once, without the client retrying it" {
+    var srv = try ScriptServer.listen();
+    // limit, reason memory_budget, ran no.
+    srv.rules = &.{.{ .op = .action_await, .action = .{ .reply = .{ .status = 15, .body = "\x20\x00\x00limit: node 1's memory budget is spent" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    std.Thread.sleep(700 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+    // Backing off from 100 ms, doubling: a handful of awaits, not a spin,
+    // and none of them retried by the client.
+    const awaits = srv.countOf(.action_await);
+    try std.testing.expect(awaits >= 2 and awaits <= 8);
+    try std.testing.expect(w.limit_notice.logged(.memory_budget));
+}
+
+test "ActionWorker start fails with the limit error after one registration, awaiting nothing" {
+    var srv = try ScriptServer.listen();
+    // limit, reason too_many_actions, ran no.
+    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try start_test.begin(&w);
+    const prompt = start_test.returnedWithin(&w, 1000);
+    thread.join();
+    try std.testing.expect(prompt);
+    try std.testing.expectError(FloError.Limit, start_test.result);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_await));
+    const last = w.client.lastError().?;
+    try std.testing.expectEqual(types.Reason.too_many_actions, last.reason);
+    try std.testing.expectEqualStrings("limit: this node holds 10000 actions", last.message);
+}
+
+test "ActionWorker.registerAction refused at the action limit returns the limit error after one request, keeping no handler" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .action_register, .action = .{ .reply = .{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try std.testing.expectError(FloError.Limit, w.registerAction("job", test_handlers.ok, .{}));
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_register));
+    try std.testing.expectEqual(types.Reason.too_many_actions, w.client.lastError().?.reason);
+    try std.testing.expect(!w.handlers.contains("job"));
+}
+
+test "ActionWorker start fails with a terminal refusal of its registration after one request, awaiting nothing" {
+    var srv = try ScriptServer.listen();
+    // bad_request, reason unclassified, ran no.
+    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 3, .body = "\x0c\x00\x00bad request: too many processes" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100 });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try start_test.begin(&w);
+    const prompt = start_test.returnedWithin(&w, 1000);
+    thread.join();
+    try std.testing.expect(prompt);
+    try std.testing.expectError(FloError.BadRequest, start_test.result);
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_await));
+    try std.testing.expectEqualStrings("bad request: too many processes", w.client.lastError().?.message);
+}
+
+test "ActionWorker start waits out a registration refused overloaded without running, then awaits" {
+    var srv = try ScriptServer.listen();
+    const busy: @import("test_server.zig").Reply = .{ .status = 10, .body = "\x06\x00\x00overloaded: shard busy" };
+    srv.rules = &.{
+        .{ .op = .worker_register, .nth = 0, .action = .{ .reply = busy } },
+        .{ .op = .worker_register, .nth = 1, .action = .{ .reply = busy } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100, .retry = .{ .max_attempts = 1 } });
+    defer w.deinit();
+    try w.registerAction("job", test_handlers.ok, .{});
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    var waited: u32 = 0;
+    while (srv.countOf(.action_await) < 1 and waited < 5000) : (waited += 10) std.Thread.sleep(10 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+    try std.testing.expectEqual(@as(u32, 3), srv.countOf(.worker_register));
+    try std.testing.expect(srv.countOf(.action_await) >= 1);
 }

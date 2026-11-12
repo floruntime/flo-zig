@@ -459,26 +459,104 @@ test "live: a queue's DLQ pages back empty, with its trailer" {
     try testing.expect(!page.has_more);
 }
 
-test "live: a stream's group list and a group's members show who joined" {
+test "live: a group read leases records until acked; an expired lease is read again, a stale report applies nothing, and a nack past max_deliver is dead" {
     var live: Live = .{ .client = undefined };
     try live.init();
     defer live.deinit();
     var stream = flo.Stream.init(&live.client);
-    _ = try stream.append("grouped", "x", .{});
-    try stream.groupJoin("grouped", "g", "c1", .{});
-    var groups = try stream.groupList("grouped", .{});
+    try testing.expect(try stream.groupCreate("leased", "g", .{ .ack_timeout_ms = 5_000, .max_deliver = 2 }));
+    try testing.expect(!try stream.groupCreate("leased", "g", .{ .ack_timeout_ms = 5_000, .max_deliver = 2 }));
+    try testing.expectError(flo.FloError.Conflict, stream.groupCreate("leased", "g", .{}));
+    _ = try stream.append("leased", "a", .{});
+    _ = try stream.append("leased", "b", .{});
+
+    var first = try stream.groupRead("leased", "g", "c1", .{ .count = 10 });
+    defer first.deinit();
+    try testing.expectEqual(@as(usize, 2), first.records.len);
+    try testing.expectEqualStrings("a", first.records[0].payload);
+    for (first.records) |r| try testing.expectEqual(@as(u32, 1), r.deliveries);
+    var acked = try stream.groupAck("leased", "g", first.lease, first.records[0..1], .{ .consumer = "c1" });
+    acked.deinit();
+    try testing.expectEqual(@as(u32, 1), acked.applied);
+
+    // c1 holds b; the list and members say so.
+    var groups = try stream.groupList("leased", .{});
     defer groups.deinit();
     try testing.expectEqual(@as(usize, 1), groups.groups.len);
-    try testing.expectEqualStrings("g", groups.groups[0].name);
     try testing.expectEqual(@as(u32, 1), groups.groups[0].members);
-    try testing.expect(!groups.more);
-
-    var members = try stream.groupMembers("grouped", "g", .{});
+    try testing.expectEqual(@as(u32, 5_000), groups.groups[0].ack_timeout_ms);
+    try testing.expectEqual(@as(u8, 2), groups.groups[0].max_deliver);
+    var members = try stream.groupMembers("leased", "g", .{});
     defer members.deinit();
-    try testing.expectEqual(@as(usize, 1), members.members.len);
     try testing.expectEqualStrings("c1", members.members[0].id);
-    try testing.expectEqual(flo.StreamGroupMemberState.active, members.members[0].state);
-    try testing.expectError(flo.FloError.NotFound, stream.groupMembers("grouped", "nobody", .{}));
+    try testing.expectEqual(@as(u32, 1), members.members[0].pending);
+    try testing.expectError(flo.FloError.NotFound, stream.groupMembers("leased", "nobody", .{}));
+
+    // Nothing new while b is leased and a is acked.
+    var none = try stream.groupRead("leased", "g", "c1", .{});
+    none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.records.len);
+
+    // b's lease runs out: it is read again, its second delivery.
+    var again: flo.GroupReadResult = undefined;
+    var waited: u32 = 0;
+    while (true) : (waited += 250) {
+        again = try stream.groupRead("leased", "g", "c2", .{ .block_ms = 250 });
+        if (again.records.len > 0) break;
+        again.deinit();
+        if (waited > 15_000) return error.NeverRedelivered;
+    }
+    defer again.deinit();
+    try testing.expectEqual(@as(usize, 1), again.records.len);
+    try testing.expectEqualStrings("b", again.records[0].payload);
+    try testing.expectEqual(@as(u32, 2), again.records[0].deliveries);
+
+    // c1's ack of its first delivery is stale: it applies nothing.
+    var stale = try stream.groupAck("leased", "g", first.lease, first.records[1..2], .{ .consumer = "c1" });
+    defer stale.deinit();
+    try testing.expectEqual(@as(u32, 0), stale.applied);
+    try testing.expectEqual(@as(usize, 1), stale.refused.len);
+    try testing.expectEqual(flo.GroupRefusalWhy.delivered_again, stale.refused[0].why);
+
+    // A nack of the second delivery spends the group's 2 attempts: dead.
+    var nacked = try stream.groupNack("leased", "g", again.lease, again.records, .{ .consumer = "c2", .error_message = "boom" });
+    nacked.deinit();
+    try testing.expectEqual(@as(u32, 1), nacked.applied);
+    const info = try stream.groupInfo("leased", "g", .{});
+    try testing.expectEqual(@as(u64, 1), info.dead);
+    try testing.expectEqual(@as(u64, 0), info.pending);
+    var after = try stream.groupRead("leased", "g", "c1", .{});
+    after.deinit();
+    try testing.expectEqual(@as(usize, 0), after.records.len);
+    try testing.expectEqual(@as(u64, 1), try stream.groupDelete("leased", "g", .{}));
+}
+
+test "live: a transaction over keys sharing a {tag} commits together, and an untagged key in it is refused keys_not_colocated" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var kv = flo.KV.init(&live.client);
+
+    var txn = try kv.begin("{t}a", .{});
+    defer txn.deinit();
+    _ = try txn.put("{t}a", "1", .{});
+    _ = try txn.put("{t}b", "2", .{});
+    const committed = try txn.commit();
+    try testing.expectEqual(@as(u16, 2), committed.op_count);
+    for ([_][2][]const u8{ .{ "{t}a", "1" }, .{ "{t}b", "2" } }) |kvp| {
+        var got = (try kv.get(kvp[0], .{})).?;
+        defer got.deinit(testing.allocator);
+        try testing.expectEqualStrings(kvp[1], got.value);
+    }
+
+    var other = try kv.begin("{t}a", .{});
+    defer other.deinit();
+    try testing.expectError(flo.FloError.BadRequest, other.put("untagged", "x", .{}));
+    const last = live.client.lastError().?;
+    try testing.expectEqual(flo.Reason.keys_not_colocated, last.reason);
+    try testing.expectEqual(flo.Ran.no, last.ran);
+    try other.rollback();
+    try testing.expect(try kv.get("untagged", .{}) == null);
 }
 
 test "live: the status of a run id the server never minted is not found" {

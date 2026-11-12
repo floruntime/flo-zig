@@ -75,7 +75,7 @@ pub fn workerBackoff() Backoff {
     return Backoff.init(worker_initial_backoff_ms, worker_max_backoff_ms);
 }
 
-/// A worker's registration, group join and polls wait out a halted shard
+/// A worker's registration and polls wait out a halted shard
 /// this way, up to 30 s between tries, until an operator repairs it.
 pub const halted_max_backoff_ms: u64 = 30_000;
 

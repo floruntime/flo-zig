@@ -48,7 +48,7 @@ pub const KV = struct {
     /// `FloError.Conflict`.
     pub fn delete(self: *KV, key: []const u8, options: types.DeleteOptions) FloError!bool {
         const ns = self.client.getNamespace(options.namespace);
-        const existed = try kvDelete(self.client, ns, key, options.cas_version, options.routing_key, null);
+        const existed = try kvDelete(self.client, ns, key, options.cas_version, null);
         return existed orelse FloError.UnexpectedResponse;
     }
 
@@ -67,7 +67,6 @@ pub const KV = struct {
     ) FloError!types.MGetResult {
         if (keys.len == 0 or keys.len > types.MAX_MGET) return FloError.BadRequest;
         for (keys) |k| if (k.len > types.MAX_MGET_KEY) return FloError.KeyTooLarge;
-        try checkRoutingKey(options.routing_key);
         const ns = self.client.getNamespace(options.namespace);
         const allocator = self.client.allocator;
 
@@ -86,7 +85,7 @@ pub const KV = struct {
             const chunk = keys[filled..end];
             const buf = try allocator.alloc(u8, mgetBodySize(chunk));
             defer allocator.free(buf);
-            const body = encodeMgetBody(buf, chunk, options.routing_key);
+            const body = encodeMgetBody(buf, chunk);
             var response = try call(self.client, .kv_mget, ns, "", body);
             defer response.deinit();
 
@@ -134,7 +133,7 @@ pub const KV = struct {
         options: types.HistoryOptions,
     ) FloError!types.HistoryResult {
         var buf: [MAX_HISTORY_BODY]u8 = undefined;
-        const body = try encodeHistoryBody(&buf, options.limit, options.before_version, options.routing_key);
+        const body = try encodeHistoryBody(&buf, options.limit, options.before_version);
         var response = try self.client.sendRequest(.kv_history, self.client.getNamespace(options.namespace), key, body, "");
         defer response.deinit();
         // A missing key has no versions; a stale answer keeps its mark.
@@ -157,7 +156,7 @@ pub const KV = struct {
     /// `wrong_type`).
     pub fn incr(self: *KV, key: []const u8, options: types.KVIncrOptions) FloError!types.IncrResult {
         const ns = self.client.getNamespace(options.namespace);
-        const a = try kvIncr(self.client, ns, key, options.delta, options.routing_key, null);
+        const a = try kvIncr(self.client, ns, key, options.delta, null);
         return .{
             .value = a.value orelse return FloError.UnexpectedResponse,
             .version = a.version orelse return FloError.UnexpectedResponse,
@@ -174,13 +173,13 @@ pub const KV = struct {
         options: types.KVExpireOptions,
     ) FloError!void {
         const ns = self.client.getNamespace(options.namespace);
-        return kvExpire(self.client, ns, key, ttl_ms, options.cas_version, options.routing_key, null);
+        return kvExpire(self.client, ns, key, ttl_ms, options.cas_version, null);
     }
 
     /// Whether `key` is present, without transferring its value.
     pub fn exists(self: *KV, key: []const u8, options: types.KVExistsOptions) FloError!types.ExistsResult {
         const ns = self.client.getNamespace(options.namespace);
-        const a = try kvExists(self.client, ns, key, options.routing_key, null);
+        const a = try kvExists(self.client, ns, key, null);
         return .{ .exists = a.exists, .stale = a.stale };
     }
 
@@ -197,7 +196,7 @@ pub const KV = struct {
         options: types.KVJsonOptions,
     ) FloError!?types.GetResult {
         var buf: [MAX_JSON_PATH_BODY]u8 = undefined;
-        const body = try encodeJsonPathBody(&buf, path, options.routing_key);
+        const body = try encodeJsonPathBody(&buf, path);
         var response = try self.client.sendRequest(.kv_json_get, self.client.getNamespace(options.namespace), key, body, "");
         defer response.deinit();
         if (try absent(self.client, &response)) return null;
@@ -221,7 +220,7 @@ pub const KV = struct {
         const allocator = self.client.allocator;
         const buf = try allocator.alloc(u8, jsonSetBodySize(document));
         defer allocator.free(buf);
-        const body = try encodeJsonSetBody(buf, path, document, options.routing_key);
+        const body = try encodeJsonSetBody(buf, path, document);
         var response = try call(self.client, .kv_json_set, self.client.getNamespace(options.namespace), key, body);
         defer response.deinit();
         return .{ .version = try decodeJsonSetAnswer(response.data) };
@@ -237,43 +236,41 @@ pub const KV = struct {
         options: types.KVJsonOptions,
     ) FloError!?types.PutResult {
         var buf: [MAX_JSON_PATH_BODY]u8 = undefined;
-        const body = try encodeJsonPathBody(&buf, path, options.routing_key);
+        const body = try encodeJsonPathBody(&buf, path);
         var response = try call(self.client, .kv_json_del, self.client.getNamespace(options.namespace), key, body);
         defer response.deinit();
         const version = try decodeJsonDelAnswer(response.data) orelse return null;
         return .{ .version = version };
     }
 
-    /// Open a per-shard KV transaction pinned to `routing_key`'s partition.
-    ///
-    /// Every op inside the transaction is routed by `routing_key`, so every
-    /// key it touches lives on that partition.
+    /// Open a per-shard KV transaction on the shard that owns `key`, pinned
+    /// to its `{tag}`, or to the whole key when it has none. Every key the
+    /// transaction touches must route with it: give them all the same
+    /// `{tag}` (`{user:1}:balance`, `{user:1}:history`). The tag is what
+    /// lies between the first `{` and the next `}`: an empty `{}` routes
+    /// every key that has one together, and a `{` with no `}` after it
+    /// routes by the whole key. An op on a key that routes elsewhere is
+    /// refused bad_request, reason `keys_not_colocated`, without running.
     ///
     /// **Caller must call `txn.commit()` or `txn.rollback()`, then
-    /// `txn.deinit()` to release the routing key copy.**
+    /// `txn.deinit()` to release the namespace copy.**
     pub fn begin(
         self: *KV,
-        routing_key: []const u8,
+        key: []const u8,
         options: types.KVBeginOptions,
     ) FloError!Transaction {
-        if (routing_key.len == 0) return FloError.BadRequest;
-        if (routing_key.len > MAX_ROUTING_KEY) return FloError.KeyTooLarge;
+        if (key.len == 0) return FloError.BadRequest;
+        if (key.len > MAX_KEY) return FloError.KeyTooLarge;
         const ns = self.client.getNamespace(options.namespace);
 
-        // The routing key is the envelope key; the body is empty.
-        var response = try call(self.client, .kv_txn_begin, ns, routing_key, "");
+        // The key is the envelope key; the body is empty.
+        var response = try call(self.client, .kv_txn_begin, ns, key, "");
         defer response.deinit();
         const a = try decodeTxnBeginAnswer(response.data);
 
-        const allocator = self.client.allocator;
-        const rk_owned = try allocator.dupe(u8, routing_key);
-        errdefer allocator.free(rk_owned);
-        const ns_owned = try allocator.dupe(u8, ns);
-
         return Transaction{
             .client = self.client,
-            .namespace = ns_owned,
-            .routing_key = rk_owned,
+            .namespace = try self.client.allocator.dupe(u8, ns),
             .id = a.txn,
             .pinned_hash = a.pinned,
             .done = false,
@@ -284,14 +281,14 @@ pub const KV = struct {
 /// Per-shard KV transaction handle.
 ///
 /// Operations are buffered on the server's pinned shard until `commit()` or
-/// `rollback()` is called. Each op is routed by the transaction's routing
-/// key. Writes inside a transaction have no version or result until commit,
-/// and a condition, `cas_version` or `incr` that doesn't hold is refused at
-/// commit, not at the op: the commit returns `FloError.Conflict` (or
-/// `FloError.BadRequest` for an incr that can't apply) and nothing applies.
-/// A transaction holds at most 64 ops and 256 KiB by default; both are
-/// operator settings, and past them an op is refused (reason
-/// `txn_too_large`).
+/// `rollback()` is called. Each op routes by its own key, which must share
+/// the `{tag}` the transaction was begun with. Writes inside a transaction
+/// have no version or result until commit, and a condition, `cas_version`
+/// or `incr` that doesn't hold is refused at commit, not at the op: the
+/// commit returns `FloError.Conflict` (or `FloError.BadRequest` for an incr
+/// that can't apply) and nothing applies. A transaction holds at most 64
+/// ops and 256 KiB by default; both are operator settings, and past them an
+/// op is refused (reason `txn_too_large`).
 ///
 /// The following operations are NOT supported inside a transaction and
 /// return `FloError.TxnUnsupportedOp` without a server round-trip:
@@ -299,17 +296,15 @@ pub const KV = struct {
 pub const Transaction = struct {
     client: *Client,
     namespace: []const u8,
-    routing_key: []const u8,
     /// Server-assigned transaction id.
     id: u64,
-    /// Partition hash this transaction is bound to.
+    /// The routing hash this transaction is pinned to.
     pinned_hash: u64,
     done: bool,
 
-    /// Release the owned routing key + namespace copies. Must be called after
-    /// `commit()` or `rollback()`.
+    /// Release the owned namespace copy. Must be called after `commit()` or
+    /// `rollback()`.
     pub fn deinit(self: *Transaction) void {
-        self.client.allocator.free(self.routing_key);
         self.client.allocator.free(self.namespace);
     }
 
@@ -325,42 +320,40 @@ pub const Transaction = struct {
         options: types.PutOptions,
     ) FloError!types.PutResult {
         try self.checkAlive();
-        var opts = options;
-        opts.routing_key = self.routing_key;
-        return kvSet(self.client, self.namespace, key, value, opts, self.id);
+        return kvSet(self.client, self.namespace, key, value, options, self.id);
     }
 
     /// Read a key inside the transaction (sees buffered writes).
     /// **Caller owns the returned `GetResult` and must call `result.deinit(allocator)`.**
     pub fn get(self: *Transaction, key: []const u8) FloError!?types.GetResult {
         try self.checkAlive();
-        return kvGet(self.client, self.namespace, key, .{ .routing_key = self.routing_key }, self.id);
+        return kvGet(self.client, self.namespace, key, .{}, self.id);
     }
 
     /// Buffer a delete inside the transaction.
     pub fn delete(self: *Transaction, key: []const u8, options: types.KVTxnWriteOptions) FloError!void {
         try self.checkAlive();
-        _ = try kvDelete(self.client, self.namespace, key, options.cas_version, self.routing_key, self.id);
+        _ = try kvDelete(self.client, self.namespace, key, options.cas_version, self.id);
     }
 
     /// Buffer an atomic counter increment inside the transaction; its value
     /// is known only after commit.
     pub fn incr(self: *Transaction, key: []const u8, delta: i64) FloError!void {
         try self.checkAlive();
-        _ = try kvIncr(self.client, self.namespace, key, delta, self.routing_key, self.id);
+        _ = try kvIncr(self.client, self.namespace, key, delta, self.id);
     }
 
     /// Buffer a TTL change inside the transaction, in milliseconds;
     /// `ttl_ms = 0` clears the TTL.
     pub fn expire(self: *Transaction, key: []const u8, ttl_ms: u64, options: types.KVTxnWriteOptions) FloError!void {
         try self.checkAlive();
-        return kvExpire(self.client, self.namespace, key, ttl_ms, options.cas_version, self.routing_key, self.id);
+        return kvExpire(self.client, self.namespace, key, ttl_ms, options.cas_version, self.id);
     }
 
     /// Check key existence inside the transaction (sees buffered writes).
     pub fn exists(self: *Transaction, key: []const u8) FloError!types.ExistsResult {
         try self.checkAlive();
-        const a = try kvExists(self.client, self.namespace, key, self.routing_key, self.id);
+        const a = try kvExists(self.client, self.namespace, key, self.id);
         return .{ .exists = a.exists, .stale = a.stale };
     }
 
@@ -415,11 +408,11 @@ pub const Transaction = struct {
 // byte then its value; a field with a default is sent present. A byte
 // string or list has a length prefix as wide as its bound needs.
 
-/// The longest routing key; its length prefix is a u16.
-const MAX_ROUTING_KEY = 4096;
+/// The longest key the server takes.
+const MAX_KEY = 4096;
 /// The longest scan cursor: the shard it stopped on (u16), then the last
 /// key; its length prefix is a u16.
-const MAX_CURSOR = 2 + MAX_ROUTING_KEY;
+const MAX_CURSOR = 2 + MAX_KEY;
 
 /// Send a table op; a refusal surfaces as its error.
 fn call(client: *Client, op: types.OpCode, namespace: []const u8, key: []const u8, body: []const u8) FloError!wire.RawResponse {
@@ -455,68 +448,48 @@ const BodyWriter = struct {
             w.int(u64, x);
         } else w.put(&.{0});
     }
-    /// An empty routing key is none, as in the other SDKs.
-    fn routingKey(w: *BodyWriter, k: ?[]const u8) void {
-        const key = k orelse return w.put(&.{0});
-        if (key.len == 0) return w.put(&.{0});
-        w.put(&.{1});
-        w.lenBytes(u16, key);
-    }
     fn written(w: *const BodyWriter) []const u8 {
         return w.buf[0..w.pos];
     }
 };
 
-fn checkRoutingKey(k: ?[]const u8) FloError!void {
-    if ((k orelse "").len > MAX_ROUTING_KEY) return FloError.KeyTooLarge;
-}
+/// The most a kv.get body can take: wait_ms, wait_for, txn.
+const MAX_GET_BODY = 9 + 2 + 9;
 
-/// The most an optional routing key field takes.
-const ROUTING_KEY_FIELD = 3 + MAX_ROUTING_KEY;
-
-/// The most a kv.get body can take: wait_ms, wait_for, routing_key, txn.
-const MAX_GET_BODY = 9 + 2 + ROUTING_KEY_FIELD + 9;
-
-/// kv.get's request: wait_ms, wait_for, routing_key, txn.
+/// kv.get's request: wait_ms, wait_for, txn.
 fn encodeGetBody(buf: *[MAX_GET_BODY]u8, options: types.GetOptions, txn: ?u64) FloError![]const u8 {
     if (options.wait_ms > types.MAX_WAIT_MS) return FloError.BlockTooLong;
-    try checkRoutingKey(options.routing_key);
     var w: BodyWriter = .{ .buf = buf };
     w.put(&.{1});
     w.int(u64, options.wait_ms);
     w.put(&.{ 1, @intFromEnum(options.wait_for) });
-    w.routingKey(options.routing_key);
     w.optU64(txn);
     return w.written();
 }
 
 /// The size of kv.set's body for `value`, at most.
 fn setBodySize(value: []const u8) usize {
-    return 4 + value.len + 9 + 2 + 9 + ROUTING_KEY_FIELD + 9;
+    return 4 + value.len + 9 + 2 + 9 + 9;
 }
 
-/// kv.set's request: value, ttl_ms, condition, cas_version, routing_key, txn.
+/// kv.set's request: value, ttl_ms, condition, cas_version, txn.
 fn encodeSetBody(buf: []u8, value: []const u8, options: types.PutOptions, txn: ?u64) FloError![]const u8 {
     if (value.len > types.MAX_KV_VALUE_SIZE) return FloError.ValueTooLarge;
-    try checkRoutingKey(options.routing_key);
     var w: BodyWriter = .{ .buf = buf };
     w.lenBytes(u32, value);
     w.optU64(if (options.ttl_ms) |t| if (t > 0) t else null else null);
     w.put(&.{ 1, @intFromEnum(options.condition) });
     w.optU64(options.cas_version);
-    w.routingKey(options.routing_key);
     w.optU64(txn);
     return w.written();
 }
 
-const MAX_DELETE_BODY = 9 + ROUTING_KEY_FIELD + 9;
+const MAX_DELETE_BODY = 9 + 9;
 
-/// kv.delete's request: cas_version, routing_key, txn.
-fn encodeDeleteBody(buf: *[MAX_DELETE_BODY]u8, cas_version: ?u64, routing_key: ?[]const u8, txn: ?u64) FloError![]const u8 {
-    try checkRoutingKey(routing_key);
+/// kv.delete's request: cas_version, txn.
+fn encodeDeleteBody(buf: *[MAX_DELETE_BODY]u8, cas_version: ?u64, txn: ?u64) []const u8 {
     var w: BodyWriter = .{ .buf = buf };
     w.optU64(cas_version);
-    w.routingKey(routing_key);
     w.optU64(txn);
     return w.written();
 }
@@ -534,42 +507,38 @@ fn encodeScanBody(buf: *[MAX_SCAN_BODY]u8, limit: u32, cursor: []const u8) FloEr
     return w.written();
 }
 
-const MAX_HISTORY_BODY = 5 + 9 + ROUTING_KEY_FIELD;
+const MAX_HISTORY_BODY = 5 + 9;
 
-/// kv.history's request: limit, before_version, routing_key.
-fn encodeHistoryBody(buf: *[MAX_HISTORY_BODY]u8, limit: u32, before_version: ?u64, routing_key: ?[]const u8) FloError![]const u8 {
+/// kv.history's request: limit, before_version.
+fn encodeHistoryBody(buf: *[MAX_HISTORY_BODY]u8, limit: u32, before_version: ?u64) FloError![]const u8 {
     if (limit < 1 or limit > types.MAX_HISTORY) return FloError.BadRequest;
-    try checkRoutingKey(routing_key);
     var w: BodyWriter = .{ .buf = buf };
     w.put(&.{1});
     w.int(u32, limit);
     w.optU64(before_version);
-    w.routingKey(routing_key);
     return w.written();
 }
 
-/// The size of kv.mget's body for `keys`, at most.
+/// The size of kv.mget's body for `keys`.
 fn mgetBodySize(keys: []const []const u8) usize {
-    var n: usize = 2 + ROUTING_KEY_FIELD;
+    var n: usize = 2;
     for (keys) |k| n += 2 + k.len;
     return n;
 }
 
-/// kv.mget's request: keys, routing_key. The caller has checked their
-/// count and lengths.
-fn encodeMgetBody(buf: []u8, keys: []const []const u8, routing_key: ?[]const u8) []const u8 {
+/// kv.mget's request: keys. The caller has checked their count and lengths.
+fn encodeMgetBody(buf: []u8, keys: []const []const u8) []const u8 {
     var w: BodyWriter = .{ .buf = buf };
     w.int(u16, @intCast(keys.len));
     for (keys) |k| w.lenBytes(u16, k);
-    w.routingKey(routing_key);
     return w.written();
 }
 
 /// The longest kv.mget body the server takes.
 const MAX_MGET_BODY = 257_949;
 /// The most one kv.mget's key elements (each length and bytes) may total:
-/// the body less the key count and the longest routing key.
-const MAX_MGET_KEYS = MAX_MGET_BODY - 2 - ROUTING_KEY_FIELD;
+/// the body less the key count.
+const MAX_MGET_KEYS = MAX_MGET_BODY - 2;
 
 /// Where the mget request that starts at `keys[start]` ends: as many keys as
 /// fit one body. Keys are at most 4096 bytes, so at least one always does.
@@ -583,40 +552,34 @@ fn mgetChunkEnd(keys: []const []const u8, start: usize) usize {
     return end;
 }
 
-const MAX_INCR_BODY = 9 + ROUTING_KEY_FIELD + 9;
+const MAX_INCR_BODY = 9 + 9;
 
-/// kv.incr's request: delta, routing_key, txn.
-fn encodeIncrBody(buf: *[MAX_INCR_BODY]u8, delta: i64, routing_key: ?[]const u8, txn: ?u64) FloError![]const u8 {
-    try checkRoutingKey(routing_key);
+/// kv.incr's request: delta, txn.
+fn encodeIncrBody(buf: *[MAX_INCR_BODY]u8, delta: i64, txn: ?u64) []const u8 {
     var w: BodyWriter = .{ .buf = buf };
     w.put(&.{1});
     w.int(i64, delta);
-    w.routingKey(routing_key);
     w.optU64(txn);
     return w.written();
 }
 
-const MAX_EXPIRE_BODY = 8 + 9 + ROUTING_KEY_FIELD + 9;
+const MAX_EXPIRE_BODY = 8 + 9 + 9;
 
-/// kv.expire's request: ttl_ms (required; 0 clears), cas_version, routing_key, txn.
-fn encodeExpireBody(buf: *[MAX_EXPIRE_BODY]u8, ttl_ms: u64, cas_version: ?u64, routing_key: ?[]const u8, txn: ?u64) FloError![]const u8 {
+/// kv.expire's request: ttl_ms (required; 0 clears), cas_version, txn.
+fn encodeExpireBody(buf: *[MAX_EXPIRE_BODY]u8, ttl_ms: u64, cas_version: ?u64, txn: ?u64) FloError![]const u8 {
     if (ttl_ms > types.MAX_TTL_MS) return FloError.BadRequest;
-    try checkRoutingKey(routing_key);
     var w: BodyWriter = .{ .buf = buf };
     w.int(u64, ttl_ms);
     w.optU64(cas_version);
-    w.routingKey(routing_key);
     w.optU64(txn);
     return w.written();
 }
 
-const MAX_EXISTS_BODY = ROUTING_KEY_FIELD + 9;
+const MAX_EXISTS_BODY = 9;
 
-/// kv.exists's request: routing_key, txn.
-fn encodeExistsBody(buf: *[MAX_EXISTS_BODY]u8, routing_key: ?[]const u8, txn: ?u64) FloError![]const u8 {
-    try checkRoutingKey(routing_key);
+/// kv.exists's request: txn.
+fn encodeExistsBody(buf: *[MAX_EXISTS_BODY]u8, txn: ?u64) []const u8 {
     var w: BodyWriter = .{ .buf = buf };
-    w.routingKey(routing_key);
     w.optU64(txn);
     return w.written();
 }
@@ -628,34 +591,30 @@ fn jsonPath(path: []const u8) FloError![]const u8 {
     return if (path.len == 0) "$" else path;
 }
 
-const MAX_JSON_PATH_BODY = 3 + types.MAX_JSON_PATH + ROUTING_KEY_FIELD;
+const MAX_JSON_PATH_BODY = 3 + types.MAX_JSON_PATH;
 
-/// kv.json_get's and kv.json_del's request: path, routing_key.
-fn encodeJsonPathBody(buf: *[MAX_JSON_PATH_BODY]u8, path: []const u8, routing_key: ?[]const u8) FloError![]const u8 {
+/// kv.json_get's and kv.json_del's request: path.
+fn encodeJsonPathBody(buf: *[MAX_JSON_PATH_BODY]u8, path: []const u8) FloError![]const u8 {
     const p = try jsonPath(path);
-    try checkRoutingKey(routing_key);
     var w: BodyWriter = .{ .buf = buf };
     w.put(&.{1});
     w.lenBytes(u16, p);
-    w.routingKey(routing_key);
     return w.written();
 }
 
 /// The size of kv.json_set's body for `document`, at most.
 fn jsonSetBodySize(document: []const u8) usize {
-    return 3 + types.MAX_JSON_PATH + 4 + document.len + ROUTING_KEY_FIELD;
+    return 3 + types.MAX_JSON_PATH + 4 + document.len;
 }
 
-/// kv.json_set's request: path, document, routing_key.
-fn encodeJsonSetBody(buf: []u8, path: []const u8, document: []const u8, routing_key: ?[]const u8) FloError![]const u8 {
+/// kv.json_set's request: path, document.
+fn encodeJsonSetBody(buf: []u8, path: []const u8, document: []const u8) FloError![]const u8 {
     const p = try jsonPath(path);
     if (document.len > types.MAX_JSON_DOCUMENT_SIZE) return FloError.ValueTooLarge;
-    try checkRoutingKey(routing_key);
     var w: BodyWriter = .{ .buf = buf };
     w.put(&.{1});
     w.lenBytes(u16, p);
     w.lenBytes(u32, document);
-    w.routingKey(routing_key);
     return w.written();
 }
 
@@ -700,33 +659,33 @@ fn kvSet(client: *Client, namespace: []const u8, key: []const u8, value: []const
 }
 
 /// kv.delete: whether the key existed, unknown (null) inside a transaction.
-fn kvDelete(client: *Client, namespace: []const u8, key: []const u8, cas_version: ?u64, routing_key: ?[]const u8, txn: ?u64) FloError!?bool {
+fn kvDelete(client: *Client, namespace: []const u8, key: []const u8, cas_version: ?u64, txn: ?u64) FloError!?bool {
     var buf: [MAX_DELETE_BODY]u8 = undefined;
-    const body = try encodeDeleteBody(&buf, cas_version, routing_key, txn);
+    const body = encodeDeleteBody(&buf, cas_version, txn);
     var response = try call(client, .kv_delete, namespace, key, body);
     defer response.deinit();
     return decodeDeleteAnswer(response.data);
 }
 
-fn kvIncr(client: *Client, namespace: []const u8, key: []const u8, delta: i64, routing_key: ?[]const u8, txn: ?u64) FloError!IncrAnswer {
+fn kvIncr(client: *Client, namespace: []const u8, key: []const u8, delta: i64, txn: ?u64) FloError!IncrAnswer {
     var buf: [MAX_INCR_BODY]u8 = undefined;
-    const body = try encodeIncrBody(&buf, delta, routing_key, txn);
+    const body = encodeIncrBody(&buf, delta, txn);
     var response = try call(client, .kv_incr, namespace, key, body);
     defer response.deinit();
     return decodeIncrAnswer(response.data);
 }
 
-fn kvExpire(client: *Client, namespace: []const u8, key: []const u8, ttl_ms: u64, cas_version: ?u64, routing_key: ?[]const u8, txn: ?u64) FloError!void {
+fn kvExpire(client: *Client, namespace: []const u8, key: []const u8, ttl_ms: u64, cas_version: ?u64, txn: ?u64) FloError!void {
     var buf: [MAX_EXPIRE_BODY]u8 = undefined;
-    const body = try encodeExpireBody(&buf, ttl_ms, cas_version, routing_key, txn);
+    const body = try encodeExpireBody(&buf, ttl_ms, cas_version, txn);
     var response = try call(client, .kv_expire, namespace, key, body);
     defer response.deinit();
     return decodeEmptyAnswer(response.data);
 }
 
-fn kvExists(client: *Client, namespace: []const u8, key: []const u8, routing_key: ?[]const u8, txn: ?u64) FloError!ExistsAnswer {
+fn kvExists(client: *Client, namespace: []const u8, key: []const u8, txn: ?u64) FloError!ExistsAnswer {
     var buf: [MAX_EXISTS_BODY]u8 = undefined;
-    const body = try encodeExistsBody(&buf, routing_key, txn);
+    const body = encodeExistsBody(&buf, txn);
     var response = try call(client, .kv_exists, namespace, key, body);
     defer response.deinit();
     var answer = try decodeExistsAnswer(response.data);
@@ -954,65 +913,62 @@ inline fn hex(comptime s: []const u8) *const [s.len / 2]u8 {
 
 test "kv.set's body carries every field in order" {
     var buf: [setBodySize("v")]u8 = undefined;
-    const body = try encodeSetBody(&buf, "v", .{ .ttl_ms = 1500, .condition = .if_absent, .cas_version = 7, .routing_key = "rk" }, 9);
-    var want: [43]u8 = undefined;
+    const body = try encodeSetBody(&buf, "v", .{ .ttl_ms = 1500, .condition = .if_absent, .cas_version = 7 }, 9);
+    var want: [38]u8 = undefined;
     var w: BodyWriter = .{ .buf = &want };
     w.int(u32, 1);
     w.put("v");
     w.optU64(1500);
     w.put(&.{ 1, 1 });
     w.optU64(7);
-    w.put(&.{ 1, 2, 0, 'r', 'k' });
     w.optU64(9);
     try testing.expectEqualSlices(u8, w.written(), body);
 
     // A TTL of 0 is none, and the defaults go present.
     const plain = try encodeSetBody(&buf, "", .{ .ttl_ms = 0 }, null);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 }, plain);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 1, 0, 0, 0 }, plain);
     try testing.expectError(FloError.ValueTooLarge, encodeSetBody(&buf, &[_]u8{0} ** (types.MAX_KV_VALUE_SIZE + 1), .{}, null));
 }
 
-test "kv.get's body carries its wait, routing key and txn, and the read deadline covers the wait" {
+test "kv.get's body carries its wait and txn, and the read deadline covers the wait" {
     var buf: [MAX_GET_BODY]u8 = undefined;
-    const body = try encodeGetBody(&buf, .{ .wait_ms = 5000, .wait_for = .change, .routing_key = "rk" }, null);
+    const body = try encodeGetBody(&buf, .{ .wait_ms = 5000, .wait_for = .change }, 3);
     var want: [32]u8 = undefined;
     var w: BodyWriter = .{ .buf = &want };
     w.put(&.{1});
     w.int(u64, 5000);
-    w.put(&.{ 1, 1, 1, 2, 0, 'r', 'k', 0 });
+    w.put(&.{ 1, 1 });
+    w.optU64(3);
     try testing.expectEqualSlices(u8, w.written(), body);
     try testing.expectError(FloError.BlockTooLong, encodeGetBody(&buf, .{ .wait_ms = types.MAX_WAIT_MS + 1 }, null));
-    // An empty routing key is sent absent.
-    try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0 }, try encodeGetBody(&buf, .{ .routing_key = "" }, null));
+    try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 }, try encodeGetBody(&buf, .{}, null));
 }
 
 test "the other KV ops' requests match the server's schemas byte for byte" {
     var del: [MAX_DELETE_BODY]u8 = undefined;
-    try expectHex("010700000000000000010200726b00", try encodeDeleteBody(&del, 7, "rk", null));
+    try expectHex("01070000000000000000", encodeDeleteBody(&del, 7, null));
     var scan: [MAX_SCAN_BODY]u8 = undefined;
     try expectHex("010200000002006331", try encodeScanBody(&scan, 2, "c1"));
     var hist: [MAX_HISTORY_BODY]u8 = undefined;
-    try expectHex("01020000000000", try encodeHistoryBody(&hist, 2, null, null));
-    try expectHex("010200000000010200726b", try encodeHistoryBody(&hist, 2, null, "rk"));
+    try expectHex("010200000000", try encodeHistoryBody(&hist, 2, null));
     // before_version present.
-    try expectHex("010200000001050000000000000000", try encodeHistoryBody(&hist, 2, 5, null));
+    try expectHex("0102000000010500000000000000", try encodeHistoryBody(&hist, 2, 5));
     const keys = [_][]const u8{ "a", "b" };
     var mget: [mgetBodySize(&keys)]u8 = undefined;
-    try expectHex("020001006101006200", encodeMgetBody(&mget, &keys, null));
-    try expectHex("0200010061010062010200726b", encodeMgetBody(&mget, &keys, "rk"));
+    try expectHex("0200010061010062", encodeMgetBody(&mget, &keys));
     var incr: [MAX_INCR_BODY]u8 = undefined;
-    try expectHex("01fbffffffffffffff00010900000000000000", try encodeIncrBody(&incr, -5, null, 9));
+    try expectHex("01fbffffffffffffff010900000000000000", encodeIncrBody(&incr, -5, 9));
     var expire: [MAX_EXPIRE_BODY]u8 = undefined;
-    try expectHex("60ea000000000000000000", try encodeExpireBody(&expire, 60000, null, null, null));
+    try expectHex("60ea0000000000000000", try encodeExpireBody(&expire, 60000, null, null));
     var exists: [MAX_EXISTS_BODY]u8 = undefined;
-    try expectHex("0000", try encodeExistsBody(&exists, null, null));
+    try expectHex("00", encodeExistsBody(&exists, null));
     var path: [MAX_JSON_PATH_BODY]u8 = undefined;
-    try expectHex("010300242e6100", try encodeJsonPathBody(&path, "$.a", null));
-    try expectHex("010300242e6200", try encodeJsonPathBody(&path, "$.b", null));
+    try expectHex("010300242e61", try encodeJsonPathBody(&path, "$.a"));
+    try expectHex("010300242e62", try encodeJsonPathBody(&path, "$.b"));
     var json_set: [jsonSetBodySize("{}")]u8 = undefined;
-    try expectHex("01010024020000007b7d010200726b", try encodeJsonSetBody(&json_set, "$", "{}", "rk"));
+    try expectHex("01010024020000007b7d", try encodeJsonSetBody(&json_set, "$", "{}"));
     // "" is the whole document.
-    try expectHex("01010024020000007b7d010200726b", try encodeJsonSetBody(&json_set, "", "{}", "rk"));
+    try expectHex("01010024020000007b7d", try encodeJsonSetBody(&json_set, "", "{}"));
     try expectHex("0100000000000000", &txnBody(1));
 }
 
@@ -1212,13 +1168,13 @@ test "mget asks again from next until every key is answered" {
     try client.connect();
     var kv = KV.init(&client);
 
-    var result = try kv.mget(&.{ "a", "b" }, .{ .routing_key = "rk" });
+    var result = try kv.mget(&.{ "a", "b" }, .{});
     defer result.deinit();
     try testing.expectEqual(@as(u32, 2), srv.requests.load(.acquire));
     try testing.expectEqual(@as(u16, @intFromEnum(types.OpCode.kv_mget)), srv.last_op);
     try testing.expectEqualStrings("", srv.lastKey());
-    // The second request asks for the keys from next on, by the same routing key.
-    try expectHex("0100010062010200726b", srv.lastBody());
+    // The second request asks for the keys from next on.
+    try expectHex("0100010062", srv.lastBody());
 
     try testing.expectEqual(@as(usize, 2), result.entries.len);
     try testing.expectEqualStrings("a", result.entries[0].key);
@@ -1235,19 +1191,18 @@ test "an mget too big for one body is split across bodies that each fit" {
     for (&keys) |*k| k.* = key;
     const end = mgetChunkEnd(&keys, 0);
     try testing.expect(end > 0 and end < keys.len);
-    // The keys total at most 253848 bytes, leaving room for the count and the
-    // longest routing key; one key more would overrun.
-    try testing.expectEqual(253_848, MAX_MGET_KEYS);
+    // The keys total at most 257947 bytes, leaving room for the count; one
+    // key more would overrun.
+    try testing.expectEqual(257_947, MAX_MGET_KEYS);
     try testing.expectEqual(@as(usize, MAX_MGET_KEYS / (2 + types.MAX_MGET_KEY)), end);
     var body_buf: [MAX_MGET_BODY]u8 = undefined;
-    const rk = "r" ** MAX_ROUTING_KEY;
-    try testing.expect(encodeMgetBody(&body_buf, keys[0..end], rk).len <= MAX_MGET_BODY);
+    try testing.expect(encodeMgetBody(&body_buf, keys[0..end]).len <= MAX_MGET_BODY);
     try testing.expect(mgetBodySize(keys[0 .. end + 1]) > MAX_MGET_BODY);
     // Small keys split exactly at the bound.
     var small: [256][]const u8 = undefined;
-    const small_key = "s" ** 1000;
+    const small_key = "s" ** 1100;
     for (&small) |*k| k.* = small_key;
-    try testing.expectEqual(@as(usize, MAX_MGET_KEYS / 1002), mgetChunkEnd(&small, 0));
+    try testing.expectEqual(@as(usize, MAX_MGET_KEYS / 1102), mgetChunkEnd(&small, 0));
     // A full body still fits the request frame.
     try testing.expect(wire.requestSize(.kv_mget, "default", "", &[_]u8{0} ** MAX_MGET_BODY, "") <= Client.max_request_size);
     // The next chunk starts where this one ended.
@@ -1270,12 +1225,12 @@ test "delete says whether the key existed; a missing key is no error" {
 
     try testing.expect(!try kv.delete("gone", .{}));
     try testing.expectEqualStrings("gone", srv.lastKey());
-    try expectHex("000000", srv.lastBody());
-    try testing.expect(try kv.delete("here", .{ .cas_version = 7, .routing_key = "rk" }));
-    try expectHex("010700000000000000010200726b00", srv.lastBody());
+    try expectHex("0000", srv.lastBody());
+    try testing.expect(try kv.delete("here", .{ .cas_version = 7 }));
+    try expectHex("01070000000000000000", srv.lastBody());
 }
 
-test "transaction ops carry the txn and its routing key; commit and rollback carry only the txn" {
+test "transaction ops carry the txn and route by their own key; commit and rollback carry only the txn" {
     var srv = try test_server.OkServer.listen();
     srv.replies = &.{
         .{ .status = 0, .body = hex("01000000000000000200000000000000") }, // begin
@@ -1300,30 +1255,30 @@ test "transaction ops carry the txn and its routing key; commit and rollback car
         }
     }.of;
 
-    var txn = try kv.begin("rk", .{});
+    var txn = try kv.begin("{t}a", .{});
     defer txn.deinit();
     try testing.expectEqual(op(.kv_txn_begin), srv.last_op);
-    try testing.expectEqualStrings("rk", srv.lastKey());
+    try testing.expectEqualStrings("{t}a", srv.lastKey());
     try testing.expectEqualStrings("", srv.lastBody());
     try testing.expectEqual(@as(u64, 1), txn.id);
     try testing.expectEqual(@as(u64, 2), txn.pinned_hash);
 
-    try txn.delete("k", .{ .cas_version = 7 });
+    try txn.delete("{t}b", .{ .cas_version = 7 });
     try testing.expectEqual(op(.kv_delete), srv.last_op);
-    try testing.expectEqualStrings("k", srv.lastKey());
-    try expectHex("010700000000000000010200726b010100000000000000", srv.lastBody());
+    try testing.expectEqualStrings("{t}b", srv.lastKey());
+    try expectHex("010700000000000000010100000000000000", srv.lastBody());
 
     try txn.incr("n", -5);
     try testing.expectEqual(op(.kv_incr), srv.last_op);
-    try expectHex("01fbffffffffffffff010200726b010100000000000000", srv.lastBody());
+    try expectHex("01fbffffffffffffff010100000000000000", srv.lastBody());
 
     try txn.expire("k", 60000, .{});
     try testing.expectEqual(op(.kv_expire), srv.last_op);
-    try expectHex("60ea00000000000000010200726b010100000000000000", srv.lastBody());
+    try expectHex("60ea00000000000000010100000000000000", srv.lastBody());
 
     try testing.expect(!(try txn.exists("k")).exists);
     try testing.expectEqual(op(.kv_exists), srv.last_op);
-    try expectHex("010200726b010100000000000000", srv.lastBody());
+    try expectHex("010100000000000000", srv.lastBody());
 
     const committed = try txn.commit();
     try testing.expectEqual(op(.kv_txn_commit), srv.last_op);
@@ -1334,7 +1289,7 @@ test "transaction ops carry the txn and its routing key; commit and rollback car
     try testing.expectError(FloError.TxnFinished, txn.delete("k", .{}));
     try txn.rollback(); // a no-op after commit
 
-    var other = try kv.begin("rk", .{});
+    var other = try kv.begin("{t}a", .{});
     defer other.deinit();
     try other.rollback();
     try testing.expectEqual(op(.kv_txn_rollback), srv.last_op);
@@ -1364,19 +1319,13 @@ test "requests out of bounds are refused before a round trip" {
     try testing.expectError(FloError.BadRequest, kv.expire("k", types.MAX_TTL_MS + 1, .{}));
     try testing.expectError(FloError.BadRequest, kv.jsonGet("k", "$" ** (types.MAX_JSON_PATH + 1), .{}));
     try testing.expectError(FloError.BadRequest, kv.jsonDel("k", "\xff", .{}));
-    const rk = "r" ** (MAX_ROUTING_KEY + 1);
-    try testing.expectError(FloError.KeyTooLarge, kv.exists("k", .{ .routing_key = rk }));
-    try testing.expectError(FloError.KeyTooLarge, kv.incr("k", .{ .routing_key = rk }));
-    try testing.expectError(FloError.KeyTooLarge, kv.delete("k", .{ .routing_key = rk }));
-    try testing.expectError(FloError.KeyTooLarge, kv.begin(rk, .{}));
+    try testing.expectError(FloError.KeyTooLarge, kv.begin("k" ** (MAX_KEY + 1), .{}));
     try testing.expectError(FloError.BadRequest, kv.begin("", .{}));
     const doc = try testing.allocator.alloc(u8, types.MAX_JSON_DOCUMENT_SIZE + 1);
     defer testing.allocator.free(doc);
     try testing.expectError(FloError.ValueTooLarge, kv.jsonSet("k", "$", doc, .{}));
     const long_key = "k" ** (types.MAX_MGET_KEY + 1);
     try testing.expectError(FloError.KeyTooLarge, kv.mget(&.{long_key}, .{}));
-    try testing.expectError(FloError.KeyTooLarge, kv.mget(&.{"k"}, .{ .routing_key = rk }));
-    try testing.expectError(FloError.KeyTooLarge, kv.history("k", .{ .routing_key = rk }));
     try testing.expectEqual(@as(u32, 0), srv.requests.load(.acquire));
     try testing.expect(client.isConnected());
 }
@@ -1412,7 +1361,7 @@ test "scan sends its limit and cursor and returns names and the next cursor" {
 
 test "a scan cursor as long as a key goes out and comes back whole" {
     // [shard u16][last key], the key as long as the server takes one.
-    const cursor = "\x01\x00" ++ "k" ** MAX_ROUTING_KEY;
+    const cursor = "\x01\x00" ++ "k" ** MAX_KEY;
     var answer: [2 + 1 + 2 + cursor.len]u8 = undefined;
     @memcpy(answer[0..5], &[_]u8{ 0, 0, 1, cursor.len & 0xff, cursor.len >> 8 });
     @memcpy(answer[5..], cursor);
@@ -1460,17 +1409,17 @@ test "incr, expire, exists and the JSON ops answer through their schemas" {
     const n = try kv.incr("n", .{});
     try testing.expectEqual(@as(i64, 42), n.value);
     try testing.expectEqual(@as(u64, 4), n.version);
-    try expectHex("0101000000000000000000", srv.lastBody());
+    try expectHex("01010000000000000000", srv.lastBody());
 
     try kv.expire("k", 0, .{ .cas_version = 3 });
-    try expectHex("00000000000000000103000000000000000000", srv.lastBody());
+    try expectHex("000000000000000001030000000000000000", srv.lastBody());
 
     try testing.expect((try kv.exists("k", .{})).exists);
 
     var doc = (try kv.jsonGet("k", "", .{})).?;
     defer doc.deinit(testing.allocator);
     try testing.expectEqualStrings("{}", doc.value);
-    try expectHex("0101002400", srv.lastBody());
+    try expectHex("01010024", srv.lastBody());
     try testing.expect(try kv.jsonGet("k", "$", .{}) == null);
     try testing.expectError(FloError.NotFound, kv.jsonGet("k", "$", .{}));
     try testing.expectEqual(types.Reason.no_such_transaction, client.lastError().?.reason);
@@ -1589,12 +1538,12 @@ test "history of a missing key is empty" {
     var kv = KV.init(&client);
 
     for (0..2) |_| {
-        var history = try kv.history("gone", .{ .routing_key = "rk" });
+        var history = try kv.history("gone", .{});
         defer history.deinit();
         try testing.expectEqual(@as(usize, 0), history.versions.len);
         try testing.expect(!history.more and !history.stale);
     }
-    try expectHex("010a00000000010200726b", srv.lastBody());
+    try expectHex("010a00000000", srv.lastBody());
 }
 
 test "a halted shard's answers read as stale, a missing key on one is StaleNotFound, and an unknown flag is refused" {
@@ -1652,4 +1601,35 @@ test "a halted shard's answers read as stale, a missing key on one is StaleNotFo
 
     try testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
     try testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
+}
+
+test "a transaction op on a key that routes elsewhere is refused keys_not_colocated, once, and the transaction goes on" {
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 0, .body = hex("01000000000000000200000000000000") }, // begin
+        // bad_request, reason keys_not_colocated (18), ran no.
+        .{ .status = @intFromEnum(types.StatusCode.bad_request), .body = "\x12\x00\x00bad request: this key routes elsewhere than the key the transaction was begun with; give every key in a transaction the same {tag}" },
+        .{ .status = 0, .body = hex("00") }, // set, its version unknown until commit
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var kv = KV.init(&client);
+
+    var txn = try kv.begin("{t}a", .{});
+    defer txn.deinit();
+    try testing.expectError(FloError.BadRequest, txn.put("b", "1", .{}));
+    const last = client.lastError().?;
+    try testing.expectEqual(types.Reason.keys_not_colocated, last.reason);
+    try testing.expectEqual(types.Ran.no, last.ran);
+    try testing.expect(std.mem.indexOf(u8, last.message, "{tag}") != null);
+    // Not retried: the refusal is the server's answer.
+    try testing.expectEqual(@as(u32, 2), srv.requests.load(.acquire));
+    try testing.expectEqualStrings("b", srv.lastKey());
+    _ = try txn.put("{t}b", "1", .{});
+    try testing.expectEqualStrings("{t}b", srv.lastKey());
+    try testing.expectEqual(@as(u32, 3), srv.requests.load(.acquire));
 }

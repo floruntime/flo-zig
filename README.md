@@ -178,10 +178,6 @@ while (true) {
 // order, with `found`
 var many = try kv.mget(&.{ "a", "b", "c" }, .{});
 defer many.deinit();
-// Keys all written with one routing key: give it, and all are looked up on
-// its shard (without it, each key is looked up on its own shard)
-var routed = try kv.mget(&.{ "order:1", "order:2" }, .{ .routing_key = "customer:42" });
-defer routed.deinit();
 
 // Counters: returns the new value and version
 const counter = try kv.incr("hits", .{ .delta = 5 });
@@ -204,30 +200,39 @@ if (try kv.jsonGet("user:1", "$.name", .{})) |found| {
 _ = try kv.jsonDel("user:1", "$.name", .{});
 ```
 
-Ops that take a `routing_key` option route by it in place of the key, so
-keys that share one live on the same shard.
+A key routes to its shard by its `{tag}`, the part between the first `{`
+and the next `}`, or by the whole key when it has none: keys stored
+together, as a transaction needs them, share a tag (`{user:1}:balance`,
+`{user:1}:history`). An empty tag `{}` routes every key that has one
+together, and a `{` with no `}` after it routes by the whole key. `mget` takes keys on any shards; the server gathers
+them.
 
 A request frame is at most 256 KiB (`Client.max_request_size`), enough for
-the largest value (253817 bytes) or JSON document the server takes; a bigger
+the largest value (257916 bytes) or JSON document (256918 bytes) the server
+takes; a bigger
 frame returns `error.PayloadTooLarge` without sending anything. `mget`
 splits its keys across as many requests as it needs.
 
 #### Transactions
 
-A transaction is pinned to one routing key's shard. Inside it, `put`,
-`get`, `delete`, `incr`, `expire` and `exists` are routed by that key and
-buffered until commit; `scan`, `mget`, `history` and the JSON ops are
-refused with `error.TxnUnsupportedOp`.
+`kv.begin(key)` pins a transaction to the shard that owns `key`, by its
+`{tag}` (or the whole key when it has none). Inside it, `put`, `get`,
+`delete`, `incr`, `expire` and `exists` are buffered until commit, each on
+a key that must route with the one it began with: give them all the same
+tag. A key that routes elsewhere is refused with `error.BadRequest`, reason
+`keys_not_colocated` (`client.lastError()`), without running. `scan`,
+`mget`, `history` and the JSON ops are refused with
+`error.TxnUnsupportedOp`.
 
 ```zig
-var txn = try kv.begin("account:42", .{});
+var txn = try kv.begin("{account:42}:balance", .{});
 defer txn.deinit();
 errdefer txn.rollback() catch {};
 
-_ = try txn.put("account:42:balance", "100", .{});
-try txn.incr("account:42:ops", 1);
-try txn.expire("account:42:lock", 0, .{});
-try txn.delete("account:42:hold", .{ .cas_version = 3 });
+_ = try txn.put("{account:42}:balance", "100", .{});
+try txn.incr("{account:42}:ops", 1);
+try txn.expire("{account:42}:lock", 0, .{});
+try txn.delete("{account:42}:hold", .{ .cas_version = 3 });
 
 const committed = try txn.commit(); // commit_index, op_count
 ```
@@ -312,37 +317,29 @@ const result = try stream.append("events", "payload data", .{});
 
 // With headers, stored with the record and read back as key/value pairs
 _ = try stream.append("events", "payload data", .{ .headers = &.{.{ .key = "source", .value = "web" }} });
-std.debug.print("Appended at seq={d}\n", .{result.first_offset});
+std.debug.print("Appended at seq={d}\n", .{result.id.sequence});
 
 // Read from beginning
 var records = try stream.read("events", .{});
 defer records.deinit();
 
 for (records.records) |rec| {
-    std.debug.print("seq={d}: {s}\n", .{ rec.seq, rec.payload });
+    std.debug.print("seq={d}: {s}\n", .{ rec.id.sequence, rec.payload });
 }
 
-// Read from specific offset
-var records = try stream.read("events", .{
-    .start_mode = .offset,
-    .offset = 100,
+// `start` is exclusive: pass the last id you read and get what came after it
+var next = try stream.read("events", .{
+    .start = records.records[records.records.len - 1].id,
     .count = 50,
 });
-defer records.deinit();
+defer next.deinit();
 
-// Read from tail (latest)
-var records = try stream.read("events", .{
-    .start_mode = .tail,
-    .count = 10,
+// Long polling from the tail: wait up to 5 seconds for new records
+var fresh = try stream.read("events", .{
+    .tail = true,
+    .block_ms = 5000,
 });
-defer records.deinit();
-
-// Long polling (block waiting for new records)
-var records = try stream.read("events", .{
-    .start_mode = .tail,
-    .block_ms = 5000,  // Wait up to 5 seconds
-});
-defer records.deinit();
+defer fresh.deinit();
 
 // Get stream info
 const info = try stream.info("events", .{});
@@ -358,36 +355,55 @@ try stream.delete("events", .{ .force = true });
 
 ### Stream Consumer Groups
 
+A group read leases records to its consumer: those ready again first (a
+lease ran out, or a nack), then the stream's past the group's last. Ack
+each within the group's lease (its ack timeout, 5 s to 12 h, 30 s by
+default), or touch it to keep it: a record left past its lease is ready
+for the next read, by any consumer, so delivery is at least once. A
+record nacked or expired `max_deliver` times (5 by default) is dead, and
+stays until the group is deleted. Ack, nack and touch name the read's
+`lease` and each record's `deliveries`; one for a delivery that has moved
+on applies nothing, and its `GroupReport` says why (`delivered_again`,
+`expired`, ...). Groups have no join, leave or claim. The first read of a
+group creates it at the defaults; a group name is at most 256 bytes.
+
 ```zig
 var stream = flo.Stream.init(&client);
 
-// Join a consumer group
-try stream.groupJoin("events", "my-group", "worker-1", .{});
+// Optional: create the group with its own lease and attempts. Its settings
+// are fixed: creating it again with others is error.Conflict.
+_ = try stream.groupCreate("events", "my-group", .{ .ack_timeout_ms = 60_000, .max_deliver = 3 });
 
-// Read from consumer group (auto-tracks offset per consumer)
-var records = try stream.groupRead("events", "my-group", "worker-1", .{
+var batch = try stream.groupRead("events", "my-group", "worker-1", .{
     .count = 10,
     .block_ms = 5000,
 });
-defer records.deinit();
+defer batch.deinit();
 
-// Process records...
-for (records.records) |rec| {
-    // Process rec.payload
+for (batch.records) |rec| {
+    // rec.payload; rec.deliveries > 1 means it came round again
+    _ = rec;
 }
 
-// Acknowledge processed records
-var seqs: [10]u64 = undefined;
-for (records.records, 0..) |rec, i| {
-    seqs[i] = rec.seq;
+// Ack them all, naming the read's lease; a read that leased nothing has
+// nothing to ack (a report takes 1 to 100 records)
+if (batch.records.len > 0) {
+    var report = try stream.groupAck("events", "my-group", batch.lease, batch.records, .{ .consumer = "worker-1" });
+    defer report.deinit();
+    for (report.refused) |r| std.debug.print("{} not acked: {s}\n", .{ r.id, @tagName(r.why) });
 }
-try stream.groupAck("events", "my-group", seqs[0..records.records.len], .{});
 
-// The stream's groups, and a group's members, as the leader sees them
-var groups = try stream.groupList("events", .{});
-defer groups.deinit();
+// Or: nack (ready again after delay_ms, or dead), or touch to keep holding
+// var n = try stream.groupNack("events", "my-group", batch.lease, batch.records, .{ .consumer = "worker-1", .delay_ms = 1000 });
+
+// The group's records by state, its consumers holding records, and the
+// stream's groups
+const info = try stream.groupInfo("events", "my-group", .{});
+_ = info.dead;
 var members = try stream.groupMembers("events", "my-group", .{});
 defer members.deinit();
+var groups = try stream.groupList("events", .{});
+defer groups.deinit();
 ```
 
 ### Action Operations
@@ -629,6 +645,7 @@ All operations return `flo.FloError` which includes:
 - `OutcomePending` - The write committed but hasn't applied, because its shard halted (never retried)
 - `StaleNotFound` - `get` or `jsonGet` on a halted shard: the key is missing as of the halt, which isn't the same as missing
 - `StaleReport` - An action complete, fail or touch for a delivery that has moved on (never resent)
+- `Limit` - The node is at a limit on what it holds (status `limit`); `lastError().?.reason` names which: `memory_budget`, `too_many_actions`, `too_many_workflow_definitions` or `too_many_workflow_runs`. Terminal: retrying won't clear it until something is deleted, the node gets more room, or the setting is raised, so nothing retries it. It doesn't mean permanent. It never ran
 - `UnexpectedResponse` - Unexpected response format
 - `ServerError` - Generic server error, including status codes this SDK doesn't know
 
@@ -650,7 +667,7 @@ reason `shard_halted`, ran unknown) is a write that committed and hasn't applied
 sending it again would write it twice, or halt the shard again. The message says
 whether it applies when the shard resumes.
 
-The workers are different: their registration, group join and polls are theirs
+The workers are different: their registration and polls are theirs
 to retry. On `shard_halted` they wait, from 100 ms up to 30 s, logging a warning
 with the server's message each time, and carry on by themselves once the shard is
 repaired; a stop or drain ends the wait. A worker started during a halt comes up
@@ -682,16 +699,19 @@ afresh.
 
 The action and stream workers wait the same way between failed polls, from
 100 ms up to 5 s, starting again from 100 ms after a poll that succeeds; `stop()`
-ends a wait within about 10 ms. A stream worker retries a group join refused
-this way instead of stopping, and a group read refused `unavailable` without
+ends a wait within about 10 ms. A group read refused `unavailable` without
 running (its records are still being read from disk, say) is read again with
-the same group and consumer: it claimed nothing. `WorkerConfig` and `StreamWorkerConfig` take a `retry` field
+the same group and consumer: it leased nothing. For `limit`, start fails with the limit error; a limit hit while running is
+logged and backed off: a registration refused `limit` makes `start()` return
+`error.Limit` after one request, with the reason and message in
+`lastError()`, and a poll refused `limit` is backed off the same way as any
+other, never spun on, and logged once per reason until a poll succeeds. `WorkerConfig` and `StreamWorkerConfig` take a `retry` field
 for the connection each worker opens.
 
 A worker whose complete, fail, ack or nack is lost with its connection (or
 times out) reconnects and sends the same result again, up to three sends in
-all; a resent complete or fail that already applied answers ok, and a refusal
-is not resent. Delivery is at-least-once: a handler may see a
+all; a resent complete or fail that already applied answers ok, a resent ack
+is answered `gone` (done), and a refusal is not resent. Delivery is at-least-once: a handler may see a
 task or record again, so make handlers safe to repeat.
 
 ```zig
@@ -709,6 +729,18 @@ worker handles at once (at most `batch_size`). Above 1, each runs on a thread wi
 connection of its own for its ack or nack, so a batch's records are handled out of order,
 and handlers and the worker's allocator must be thread-safe. The next read waits for the
 whole batch. `drain()` and `stop()` are safe to call from any thread.
+
+A stream worker acks a record whose handler returns, and nacks one whose handler
+fails, naming the read's lease. The group's lease runs for the whole batch from its
+read, records waiting their turn included, so handle it within the lease, call
+`ctx.touch()`, or set `.auto_touch = true` in `StreamWorkerConfig`. That touches
+every record of the batch not yet acked or nacked, in one touch, every sixth of the
+lease (at least 100 ms apart, counted from the batch's arrival), re-pacing off each
+touch answer's expiry. A touch refused conflict, not_found or bad_request stops the
+touching; any other failure is tried again with back-off, and a record the server
+refuses is dropped from it. A record left past its lease is read again, by this
+consumer or another. `stop()` lets started records finish and hands the unstarted
+ones back at once with a nack, which spends one of their attempts.
 
 A worker polls and tells the server of its own `drain()` on one connection, so the
 drain goes out once the held poll returns, up to `block_ms`. A drain sent from

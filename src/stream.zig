@@ -279,242 +279,208 @@ pub const Stream = struct {
     // =========================================================================
     // Consumer Group Operations
     // =========================================================================
+    //
+    // A group read leases records to its consumer until an ack, a nack or
+    // the group's lease (ack timeout) running out, when they are ready for
+    // the next read: delivery is at least once. Ack, nack and touch name the
+    // read's lease and each record's deliveries, so a report for a delivery
+    // that has moved on applies nothing.
 
-    /// Join a consumer group.
-    pub fn groupJoin(
+    /// Create a consumer group on a stream, with its lease and attempts;
+    /// returns whether it made one. Creating it again with the same
+    /// settings returns false; with others it is `FloError.Conflict`, as
+    /// a group's settings are fixed when it is made.
+    /// A group a read names that doesn't exist is created then, at the
+    /// server's defaults: a 30 s lease and 5 attempts.
+    pub fn groupCreate(
         self: *Stream,
         stream_name: []const u8,
         group: []const u8,
-        consumer: []const u8,
-        options: types.StreamGroupJoinOptions,
-    ) FloError!void {
-        const ns = self.client.getNamespace(options.namespace);
-
-        // Encode group and consumer in value field: [group_len:u16][group][consumer_len:u16][consumer]
-        var value_buf: [512]u8 = undefined;
-        var offset: usize = 0;
-
-        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(group.len), .little);
-        offset += 2;
-        @memcpy(value_buf[offset..][0..group.len], group);
-        offset += group.len;
-
-        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(consumer.len), .little);
-        offset += 2;
-        @memcpy(value_buf[offset..][0..consumer.len], consumer);
-        offset += consumer.len;
-
-        var response = try self.client.sendRequest(
-            .stream_group_join,
-            ns,
-            stream_name,
-            value_buf[0..offset],
-            "",
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
+        options: types.StreamGroupCreateOptions,
+    ) FloError!bool {
+        var buf: [2 + types.MAX_GROUP_NAME]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeName(&w, group, types.MAX_GROUP_NAME);
+        var opts_buf: [16]u8 = undefined;
+        var builder = wire.OptionsBuilder.init(&opts_buf);
+        if (options.ack_timeout_ms) |ms| {
+            if (ms < types.MIN_GROUP_LEASE_MS or ms > types.MAX_GROUP_LEASE_MS) return FloError.BadRequest;
+            try builder.addU32(.ack_timeout_ms, ms);
         }
+        if (options.max_deliver) |n| {
+            if (n == 0) return FloError.BadRequest;
+            try builder.addU8(.max_deliver, n);
+        }
+        var response = try self.client.sendRequest(.stream_group_create, self.client.getNamespace(options.namespace), stream_name, w.buffered(), builder.getOptions());
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        if (response.data.len != 1) return FloError.IncompleteResponse;
+        return response.data[0] != 0;
     }
 
-    /// Read from a consumer group.
-    /// **Caller owns the returned `StreamReadResult` and must call `result.deinit()`.**
+    /// Delete a consumer group and every record it holds; returns how many
+    /// records it dropped.
+    pub fn groupDelete(
+        self: *Stream,
+        stream_name: []const u8,
+        group: []const u8,
+        options: types.StreamGroupOptions,
+    ) FloError!u64 {
+        var buf: [2 + types.MAX_GROUP_NAME]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeName(&w, group, types.MAX_GROUP_NAME);
+        var response = try self.client.sendRequest(.stream_group_delete, self.client.getNamespace(options.namespace), stream_name, w.buffered(), "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        if (response.data.len != 8) return FloError.IncompleteResponse;
+        return std.mem.readInt(u64, response.data[0..8], .little);
+    }
+
+    /// A consumer group's records by state. A group the stream doesn't have
+    /// is `FloError.NotFound`.
+    pub fn groupInfo(
+        self: *Stream,
+        stream_name: []const u8,
+        group: []const u8,
+        options: types.StreamGroupOptions,
+    ) FloError!types.StreamGroupInfo {
+        var buf: [2 + types.MAX_GROUP_NAME]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeName(&w, group, types.MAX_GROUP_NAME);
+        var response = try self.client.sendRequest(.stream_group_info, self.client.getNamespace(options.namespace), stream_name, w.buffered(), "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        var r: Reader = .{ .data = response.data };
+        const got: types.StreamGroupInfo = .{
+            .pending = try r.int(u64),
+            .holders = try r.int(u32),
+            .created_at_ms = @intCast(try r.int(u64) / std.time.ns_per_ms),
+            .ready = try r.int(u64),
+            .leased = try r.int(u64),
+            .dead = try r.int(u64),
+            .trimmed_pending = try r.int(u64),
+        };
+        try r.end();
+        return got;
+    }
+
+    /// Lease up to `options.count` (1 to 100; null for 100) of the group's
+    /// records to `consumer`: those ready again (a lease ran out, or a nack)
+    /// first, then the stream's past the group's last. Ack each within the
+    /// lease, or touch it: one left past `result.expires_at_ms` is ready
+    /// again for the next read, and one nacked or expired as many times as
+    /// the group's attempts is dead. None within `block_ms` is an empty
+    /// result.
+    /// **Caller owns the returned `GroupReadResult` and must call `result.deinit()`.**
     pub fn groupRead(
         self: *Stream,
         stream_name: []const u8,
         group: []const u8,
         consumer: []const u8,
         options: types.StreamGroupReadOptions,
-    ) FloError!types.StreamReadResult {
-        const ns = self.client.getNamespace(options.namespace);
-
-        // Encode group and consumer in value field
-        var value_buf: [512]u8 = undefined;
-        var offset: usize = 0;
-
-        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(group.len), .little);
-        offset += 2;
-        @memcpy(value_buf[offset..][0..group.len], group);
-        offset += group.len;
-
-        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(consumer.len), .little);
-        offset += 2;
-        @memcpy(value_buf[offset..][0..consumer.len], consumer);
-        offset += consumer.len;
+    ) FloError!types.GroupReadResult {
+        var buf: [4 + types.MAX_GROUP_NAME + types.MAX_GROUP_CONSUMER]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeName(&w, group, types.MAX_GROUP_NAME);
+        try writeName(&w, consumer, types.MAX_GROUP_CONSUMER);
 
         var opts_buf: [32]u8 = undefined;
         var builder = wire.OptionsBuilder.init(&opts_buf);
-
         if (options.count) |c| {
+            if (c < 1 or c > types.MAX_GROUP_BATCH) return FloError.BadRequest;
             try builder.addU32(.count, c);
         }
+        if (options.block_ms) |block| try builder.addU32(.block_ms, block);
 
-        if (options.block_ms) |block| {
-            try builder.addU32(.block_ms, block);
-        }
-
-        var response = try self.client.sendRequest(
-            .stream_group_read,
-            ns,
-            stream_name,
-            value_buf[0..offset],
-            builder.getOptions(),
-        );
+        var response = try self.client.sendRequest(.stream_group_read, self.client.getNamespace(options.namespace), stream_name, w.buffered(), builder.getOptions());
         defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
-
-        return parseStreamReadResponse(self.client.allocator, response.data);
+        if (response.status != .ok) return response.status.toError();
+        return parseGroupReadResponse(self.client.allocator, response.data);
     }
 
-    /// Acknowledge records in a consumer group.
+    /// Ack records a group read leased: they are done. Each record is
+    /// applied or refused on its own; one refused `gone` was acked already.
+    /// **Caller owns the returned `GroupReport` and must call `report.deinit()`.**
     pub fn groupAck(
         self: *Stream,
         stream_name: []const u8,
         group: []const u8,
-        ids: []const types.StreamID,
-        options: types.StreamGroupAckOptions,
-    ) FloError!void {
-        const ns = self.client.getNamespace(options.namespace);
-
-        // Encode group, consumer and ids in value field:
-        // [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
-        var value_buf: [4096]u8 = undefined;
-        var offset: usize = 0;
-
-        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(group.len), .little);
-        offset += 2;
-        @memcpy(value_buf[offset..][0..group.len], group);
-        offset += group.len;
-
-        const consumer = options.consumer;
-        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(consumer.len), .little);
-        offset += 2;
-        if (consumer.len > 0) {
-            @memcpy(value_buf[offset..][0..consumer.len], consumer);
-            offset += consumer.len;
-        }
-
-        std.mem.writeInt(u32, value_buf[offset..][0..4], @intCast(ids.len), .little);
-        offset += 4;
-
-        for (ids) |id| {
-            std.mem.writeInt(u64, value_buf[offset..][0..8], id.timestamp_ms, .little);
-            offset += 8;
-            std.mem.writeInt(u64, value_buf[offset..][0..8], id.sequence, .little);
-            offset += 8;
-        }
-
-        var response = try self.client.sendRequest(
-            .stream_group_ack,
-            ns,
-            stream_name,
-            value_buf[0..offset],
-            "",
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
+        lease: types.GroupLease,
+        records: []const types.StreamRecord,
+        options: types.StreamGroupReportOptions,
+    ) FloError!types.GroupReport {
+        return self.groupReport(.stream_group_ack, stream_name, group, lease, records, options.consumer, options.namespace, "");
     }
 
-    /// Leave a consumer group.
-    pub fn groupLeave(
-        self: *Stream,
-        stream_name: []const u8,
-        group: []const u8,
-        consumer: []const u8,
-        options: types.StreamGroupJoinOptions,
-    ) FloError!void {
-        const ns = self.client.getNamespace(options.namespace);
-
-        // Same encoding as GroupJoin
-        var value_buf: [512]u8 = undefined;
-        var offset: usize = 0;
-
-        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(group.len), .little);
-        offset += 2;
-        @memcpy(value_buf[offset..][0..group.len], group);
-        offset += group.len;
-
-        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(consumer.len), .little);
-        offset += 2;
-        @memcpy(value_buf[offset..][0..consumer.len], consumer);
-        offset += consumer.len;
-
-        var response = try self.client.sendRequest(
-            .stream_group_leave,
-            ns,
-            stream_name,
-            value_buf[0..offset],
-            "",
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
-    }
-
-    /// Negatively acknowledge records in a consumer group.
-    /// The server makes the records available for redelivery.
+    /// Nack records a group read leased: ready again after
+    /// `options.delay_ms`, or dead once the group's attempts are spent (or
+    /// at once with `options.dead`).
+    /// **Caller owns the returned `GroupReport` and must call `report.deinit()`.**
     pub fn groupNack(
         self: *Stream,
         stream_name: []const u8,
         group: []const u8,
-        ids: []const types.StreamID,
+        lease: types.GroupLease,
+        records: []const types.StreamRecord,
         options: types.StreamGroupNackOptions,
-    ) FloError!void {
-        const ns = self.client.getNamespace(options.namespace);
-
-        // Encode group, consumer and ids in value field:
-        // [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
-        var value_buf: [4096]u8 = undefined;
-        var offset: usize = 0;
-
-        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(group.len), .little);
-        offset += 2;
-        @memcpy(value_buf[offset..][0..group.len], group);
-        offset += group.len;
-
-        const consumer = options.consumer;
-        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(consumer.len), .little);
-        offset += 2;
-        if (consumer.len > 0) {
-            @memcpy(value_buf[offset..][0..consumer.len], consumer);
-            offset += consumer.len;
-        }
-
-        std.mem.writeInt(u32, value_buf[offset..][0..4], @intCast(ids.len), .little);
-        offset += 4;
-
-        for (ids) |id| {
-            std.mem.writeInt(u64, value_buf[offset..][0..8], id.timestamp_ms, .little);
-            offset += 8;
-            std.mem.writeInt(u64, value_buf[offset..][0..8], id.sequence, .little);
-            offset += 8;
-        }
-
-        var response = try self.client.sendRequest(
-            .stream_group_nack,
-            ns,
-            stream_name,
-            value_buf[0..offset],
-            "",
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
+    ) FloError!types.GroupReport {
+        if (options.delay_ms > types.MAX_FAIL_DELAY_MS) return FloError.BadRequest;
+        var opts_buf: [16 + 2 + 255]u8 = undefined;
+        var builder = wire.OptionsBuilder.init(&opts_buf);
+        if (options.delay_ms > 0) try builder.addU64(.delay_ms, options.delay_ms);
+        if (options.dead) try builder.addFlag(.dead);
+        if (options.error_message.len > 0) try builder.addBytes(.error_text, options.error_message);
+        return self.groupReport(.stream_group_nack, stream_name, group, lease, records, options.consumer, options.namespace, builder.getOptions());
     }
 
-    /// The stream's consumer groups: members, pending entries, settings and
-    /// the last record delivered. Answered by the leader.
+    /// Keep records a group read leased: with half their lease or less
+    /// left it runs a full lease from now, up to 12 h from their read; with
+    /// more left, nothing changes. The report's `expires_at_ms` is the
+    /// lease's end.
+    /// **Caller owns the returned `GroupReport` and must call `report.deinit()`.**
+    pub fn groupTouch(
+        self: *Stream,
+        stream_name: []const u8,
+        group: []const u8,
+        lease: types.GroupLease,
+        records: []const types.StreamRecord,
+        options: types.StreamGroupReportOptions,
+    ) FloError!types.GroupReport {
+        return self.groupReport(.stream_group_touch, stream_name, group, lease, records, options.consumer, options.namespace, "");
+    }
+
+    fn groupReport(
+        self: *Stream,
+        op: types.OpCode,
+        stream_name: []const u8,
+        group: []const u8,
+        lease: types.GroupLease,
+        records: []const types.StreamRecord,
+        consumer: []const u8,
+        namespace: ?[]const u8,
+        options: []const u8,
+    ) FloError!types.GroupReport {
+        if (records.len < 1 or records.len > types.MAX_GROUP_BATCH) return FloError.BadRequest;
+        var buf: [4 + types.MAX_GROUP_NAME + types.MAX_GROUP_CONSUMER + 20 + types.MAX_GROUP_BATCH * 20]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeName(&w, group, types.MAX_GROUP_NAME);
+        try writeName(&w, consumer, types.MAX_GROUP_CONSUMER);
+        w.writeInt(u64, lease.term, .little) catch unreachable;
+        w.writeInt(u64, lease.index, .little) catch unreachable;
+        w.writeInt(u32, @intCast(records.len), .little) catch unreachable;
+        for (records) |rec| {
+            w.writeInt(u64, rec.id.timestamp_ms, .little) catch unreachable;
+            w.writeInt(u64, rec.id.sequence, .little) catch unreachable;
+            w.writeInt(u32, rec.deliveries, .little) catch unreachable;
+        }
+        var response = try self.client.sendRequest(op, self.client.getNamespace(namespace), stream_name, w.buffered(), options);
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeGroupReport(self.client.allocator, response.data, op == .stream_group_touch);
+    }
+
+    /// The stream's consumer groups: how many consumers hold records, the
+    /// records ready or leased, settings and the last record delivered.
     /// **Caller owns the returned list and must call `list.deinit()`.**
     pub fn groupList(self: *Stream, stream_name: []const u8, options: types.StreamGroupListOptions) FloError!types.StreamGroupList {
         var response = try self.client.sendRequest(.stream_group_list, self.client.getNamespace(options.namespace), stream_name, "", "");
@@ -523,9 +489,9 @@ pub const Stream = struct {
         return decodeGroupList(self.client.allocator, response.data);
     }
 
-    /// A consumer group's members: each one's state, pending entries, and
-    /// when it joined and was last delivered to. Answered by the leader; a
-    /// group the stream doesn't have is `FloError.NotFound`.
+    /// A consumer group's members: the consumers holding its records, each
+    /// with how many, since when, and when it last took one. A group the
+    /// stream doesn't have is `FloError.NotFound`.
     /// **Caller owns the returned list and must call `list.deinit()`.**
     pub fn groupMembers(self: *Stream, stream_name: []const u8, group: []const u8, options: types.StreamGroupListOptions) FloError!types.StreamGroupMembers {
         if (group.len > max_group_name) return FloError.ValueTooLarge;
@@ -540,6 +506,19 @@ pub const Stream = struct {
     }
 };
 
+/// A u16-length-prefixed name of at most `max` bytes.
+fn writeName(w: *std.Io.Writer, name: []const u8, max: usize) FloError!void {
+    if (name.len > max) return FloError.ValueTooLarge;
+    w.writeInt(u16, @intCast(name.len), .little) catch return FloError.BufferTooSmall;
+    w.writeAll(name) catch return FloError.BufferTooSmall;
+}
+
+/// A group read that leased nothing, as the server answers it.
+pub const empty_group_read = [_]u8{0} ** 28;
+
+/// A record's smallest encoding: no key, payload or headers.
+const min_record = 8 + 8 + 1 + 4 + 1 + 4 + 4;
+
 /// Parse stream read response
 /// Wire format: [count:u32]([sequence:u64][timestamp_ms:i64][tier:u8][partition:u32][key_present:u8][payload_len:u32][payload][header_count:u32])*
 fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloError!types.StreamReadResult {
@@ -549,16 +528,40 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
             .allocator = allocator,
         };
     }
+    var pos: usize = 4;
+    const records = try parseRecords(allocator, data, &pos, std.mem.readInt(u32, data[0..4], .little), false);
+    return .{ .records = records, .allocator = allocator };
+}
 
-    var pos: usize = 0;
-    const count = std.mem.readInt(u32, data[pos..][0..4], .little);
-    pos += 4;
+/// A group read's answer: [term:u64][index:u64][expires_at_ms:i64][count:u32]
+/// then each record as a stream read gives it, followed by its
+/// [deliveries:u32]. A read that leased nothing is all zeros.
+fn parseGroupReadResponse(allocator: std.mem.Allocator, data: []const u8) FloError!types.GroupReadResult {
+    if (data.len < 28) return FloError.IncompleteResponse;
+    var pos: usize = 28;
+    const records = try parseRecords(allocator, data, &pos, std.mem.readInt(u32, data[24..28], .little), true);
+    errdefer {
+        for (records) |*r| r.deinit(allocator);
+        allocator.free(records);
+    }
+    if (pos != data.len) return FloError.IncompleteResponse;
+    return .{
+        .records = records,
+        .lease = .{ .term = std.mem.readInt(u64, data[0..8], .little), .index = std.mem.readInt(u64, data[8..16], .little) },
+        .expires_at_ms = std.mem.readInt(i64, data[16..24], .little),
+        .allocator = allocator,
+    };
+}
 
-    // Each record: [seq:u64][ts:i64][tier:u8][partition:u32][key_present:u8]
-    //              [payload_len:u32][payload][header_count:u32]
+/// `count` records from `data` at `pos.*`, each followed by its deliveries
+/// when `group`.
+fn parseRecords(allocator: std.mem.Allocator, data: []const u8, pos_ptr: *usize, count: u32, comptime group: bool) FloError![]types.StreamRecord {
+    var pos = pos_ptr.*;
+    defer pos_ptr.* = pos;
     // A count the data can't hold is refused before it sizes an allocation.
-    const min_record = 8 + 8 + 1 + 4 + 1 + 4 + 4;
-    if (count > (data.len - pos) / min_record) return FloError.IncompleteResponse;
+    const each = min_record + if (group) 4 else 0;
+    if (count > (data.len - pos) / each) return FloError.IncompleteResponse;
+    if (group and count > types.MAX_GROUP_BATCH) return FloError.IncompleteResponse;
 
     const records = allocator.alloc(types.StreamRecord, count) catch return FloError.OutOfMemory;
     // Only records[0..i] are filled; an answer cut short frees those alone.
@@ -569,30 +572,13 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
     }
 
     while (i < count) : (i += 1) {
-        // Read sequence
-        if (pos + 8 > data.len) return FloError.IncompleteResponse;
+        if (pos + 8 + 8 + 1 + 4 + 1 > data.len) return FloError.IncompleteResponse;
         const sequence = std.mem.readInt(u64, data[pos..][0..8], .little);
-        pos += 8;
-
-        // Read timestamp_ms
-        if (pos + 8 > data.len) return FloError.IncompleteResponse;
-        const timestamp_ms = std.mem.readInt(u64, data[pos..][0..8], .little);
-        pos += 8;
-
-        // Read tier
-        if (pos + 1 > data.len) return FloError.IncompleteResponse;
-        const tier_byte = data[pos];
-        pos += 1;
-        const tier: types.StorageTier = @enumFromInt(tier_byte);
-
-        // Skip partition
-        if (pos + 4 > data.len) return FloError.IncompleteResponse;
-        pos += 4;
-
-        // Read key_present
-        if (pos + 1 > data.len) return FloError.IncompleteResponse;
-        const key_present = data[pos];
-        pos += 1;
+        const timestamp_ms = std.mem.readInt(u64, data[pos + 8 ..][0..8], .little);
+        const tier: types.StorageTier = @enumFromInt(data[pos + 16]);
+        // The partition is skipped.
+        const key_present = data[pos + 21];
+        pos += 22;
 
         // Read key (stream name) if present
         var stream_name: []const u8 = "";
@@ -600,7 +586,7 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
             if (pos + 4 > data.len) return FloError.IncompleteResponse;
             const key_len = std.mem.readInt(u32, data[pos..][0..4], .little);
             pos += 4;
-            if (pos + key_len > data.len) return FloError.IncompleteResponse;
+            if (key_len > data.len - pos) return FloError.IncompleteResponse;
             stream_name = allocator.dupe(u8, data[pos..][0..key_len]) catch return FloError.OutOfMemory;
             pos += key_len;
         }
@@ -611,7 +597,7 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
         const payload_len = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
 
-        if (pos + payload_len > data.len) return FloError.IncompleteResponse;
+        if (payload_len > data.len - pos) return FloError.IncompleteResponse;
         const payload = allocator.dupe(u8, data[pos..][0..payload_len]) catch return FloError.OutOfMemory;
         errdefer allocator.free(payload);
         pos += payload_len;
@@ -651,6 +637,13 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
             headers[filled] = .{ .key = key, .value = value };
         }
 
+        var deliveries: u32 = 0;
+        if (group) {
+            if (pos + 4 > data.len) return FloError.IncompleteResponse;
+            deliveries = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4;
+        }
+
         records[i] = .{
             .id = .{
                 .timestamp_ms = timestamp_ms,
@@ -660,13 +653,30 @@ fn parseStreamReadResponse(allocator: std.mem.Allocator, data: []const u8) FloEr
             .stream = stream_name,
             .payload = payload,
             .headers = headers,
+            .deliveries = deliveries,
         };
     }
+    return records;
+}
 
-    return types.StreamReadResult{
-        .records = records,
-        .allocator = allocator,
-    };
+/// An ack's, nack's or touch's answer: [expires_at_ms:i64] (touch only),
+/// [applied:u32][refused:u32] then each refused {ms:u64, seq:u64, why:u8}.
+fn decodeGroupReport(allocator: std.mem.Allocator, data: []const u8, touch: bool) FloError!types.GroupReport {
+    var r: Reader = .{ .data = data };
+    const expires_at_ms: i64 = if (touch) try r.int(i64) else 0;
+    const applied = try r.int(u32);
+    const n = try r.int(u32);
+    if (n > types.MAX_GROUP_BATCH or n > r.remaining() / 17) return FloError.IncompleteResponse;
+    const refused = try allocator.alloc(types.GroupRefusal, n);
+    errdefer allocator.free(refused);
+    for (refused) |*f| {
+        const ms = try r.int(u64);
+        const seq = try r.int(u64);
+        // A why this SDK predates is kept as its number.
+        f.* = .{ .id = .{ .timestamp_ms = ms, .sequence = seq }, .why = @enumFromInt(try r.int(u8)) };
+    }
+    try r.end();
+    return .{ .applied = applied, .refused = refused, .expires_at_ms = expires_at_ms, .allocator = allocator };
 }
 
 // =============================================================================
@@ -1005,4 +1015,163 @@ test "group list and member answers cut anywhere, overlong or short of memory ar
     try std.testing.expectError(FloError.IncompleteResponse, Run.members(a, &unknown));
     try std.testing.checkAllAllocationFailures(a, Run.list, .{list});
     try std.testing.checkAllAllocationFailures(a, Run.members, .{members});
+}
+
+/// A group read leasing seq 7 ("hi", header k=v, 2 deliveries) under lease
+/// (3, 9), expiring at 5000.
+const test_group_read = le(@as(u64, 3)) ++ le(@as(u64, 9)) ++ le(@as(i64, 5000)) ++ le(@as(u32, 1)) ++
+    le(@as(u64, 7)) ++ le(@as(u64, 100)) ++ "\x00" ++ le(@as(u32, 0)) ++ "\x00" ++ le(@as(u32, 2)) ++ "hi" ++
+    le(@as(u32, 1)) ++ le(@as(u32, 1)) ++ "k" ++ le(@as(u32, 1)) ++ "v" ++ le(@as(u32, 2));
+
+test "a group read sends group and consumer, and reads each record's deliveries and the read's lease" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{ .{ .status = 0, .body = test_group_read }, .{ .status = 0, .body = &empty_group_read } };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    var got = try stream.groupRead("events", "g", "c1", .{ .count = 5, .block_ms = 100 });
+    defer got.deinit();
+    try std.testing.expectEqual(@as(u16, 0x153), srv.last_op);
+    try std.testing.expectEqualStrings("events", srv.lastKey());
+    try std.testing.expectEqualSlices(u8, "\x01\x00g\x02\x00c1", srv.lastValue());
+    try std.testing.expectEqualSlices(u8, "\x15\x04\x05\x00\x00\x00\x17\x04\x64\x00\x00\x00", srv.lastOptions());
+    try std.testing.expectEqual(types.GroupLease{ .term = 3, .index = 9 }, got.lease);
+    try std.testing.expectEqual(@as(i64, 5000), got.expires_at_ms);
+    try std.testing.expectEqual(@as(usize, 1), got.records.len);
+    try std.testing.expectEqual(types.StreamID{ .timestamp_ms = 100, .sequence = 7 }, got.records[0].id);
+    try std.testing.expectEqual(@as(u32, 2), got.records[0].deliveries);
+    try std.testing.expectEqualStrings("hi", got.records[0].payload);
+    try std.testing.expectEqualStrings("v", got.records[0].headers[0].value);
+
+    // Nothing leased: all zeros.
+    var none = try stream.groupRead("events", "g", "c1", .{});
+    defer none.deinit();
+    try std.testing.expectEqual(@as(usize, 0), none.records.len);
+    try std.testing.expectEqualSlices(u8, "", srv.lastOptions());
+
+    // Out of bounds, refused before a round trip.
+    try std.testing.expectError(FloError.BadRequest, stream.groupRead("events", "g", "c1", .{ .count = 0 }));
+    try std.testing.expectError(FloError.BadRequest, stream.groupRead("events", "g", "c1", .{ .count = types.MAX_GROUP_BATCH + 1 }));
+    try std.testing.expectError(FloError.ValueTooLarge, stream.groupRead("events", "g" ** (types.MAX_GROUP_NAME + 1), "c1", .{}));
+    try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.acquire));
+}
+
+fn parseGroupAndFree(a: std.mem.Allocator, data: []const u8) !void {
+    var res = try parseGroupReadResponse(a, data);
+    res.deinit();
+}
+
+test "a group read answer cut anywhere, overlong, or short of memory is refused and leaks nothing" {
+    const a = std.testing.allocator;
+    const whole: []const u8 = test_group_read;
+    for (0..whole.len) |n| try std.testing.expectError(FloError.IncompleteResponse, parseGroupAndFree(a, whole[0..n]));
+    try std.testing.expectError(FloError.IncompleteResponse, parseGroupAndFree(a, test_group_read ++ "\x00"));
+    try std.testing.checkAllAllocationFailures(a, parseGroupAndFree, .{whole});
+}
+
+test "ack, nack and touch name the read's lease and each record's deliveries, and a stale report applies nothing without an error" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        // Applied 1, refused none.
+        .{ .status = 0, .body = &(le(@as(u32, 1)) ++ le(@as(u32, 0))) },
+        // A stale report: applied 0, (100, 7) delivered again.
+        .{ .status = 0, .body = &(le(@as(u32, 0)) ++ le(@as(u32, 1)) ++ le(@as(u64, 100)) ++ le(@as(u64, 7)) ++ [_]u8{1}) },
+        // A touch: expiry, then applied 1, refused none.
+        .{ .status = 0, .body = &(le(@as(i64, 9000)) ++ le(@as(u32, 1)) ++ le(@as(u32, 0))) },
+        // A why this SDK predates is kept.
+        .{ .status = 0, .body = &(le(@as(u32, 0)) ++ le(@as(u32, 1)) ++ le(@as(u64, 100)) ++ le(@as(u64, 7)) ++ [_]u8{9}) },
+    };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    const lease: types.GroupLease = .{ .term = 3, .index = 9 };
+    const recs = [_]types.StreamRecord{.{ .id = .{ .timestamp_ms = 100, .sequence = 7 }, .payload = "", .deliveries = 2 }};
+    const named = "\x01\x00g\x02\x00c1" ++ le(@as(u64, 3)) ++ le(@as(u64, 9)) ++ le(@as(u32, 1)) ++ le(@as(u64, 100)) ++ le(@as(u64, 7)) ++ le(@as(u32, 2));
+
+    var acked = try stream.groupAck("events", "g", lease, &recs, .{ .consumer = "c1" });
+    defer acked.deinit();
+    try std.testing.expectEqual(@as(u16, 0x154), srv.last_op);
+    try std.testing.expectEqualSlices(u8, named, srv.lastValue());
+    try std.testing.expectEqual(@as(u32, 1), acked.applied);
+
+    var stale = try stream.groupNack("events", "g", lease, &recs, .{ .consumer = "c1", .delay_ms = 1000, .dead = true, .error_message = "bad" });
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(u16, 0x159), srv.last_op);
+    try std.testing.expectEqualSlices(u8, named, srv.lastValue());
+    // delay_ms (0x11, u64), dead (0x32), error_text (0x33).
+    try std.testing.expectEqualSlices(u8, "\x11\x08" ++ le(@as(u64, 1000)) ++ "\x32\x00\x33\x03bad", srv.lastOptions());
+    try std.testing.expectEqual(@as(u32, 0), stale.applied);
+    try std.testing.expectEqual(types.GroupRefusalWhy.delivered_again, stale.refused[0].why);
+    try std.testing.expectEqual(types.StreamID{ .timestamp_ms = 100, .sequence = 7 }, stale.refused[0].id);
+
+    var touched = try stream.groupTouch("events", "g", lease, &recs, .{ .consumer = "c1" });
+    defer touched.deinit();
+    try std.testing.expectEqual(@as(u16, 0x15A), srv.last_op);
+    try std.testing.expectEqual(@as(i64, 9000), touched.expires_at_ms);
+    try std.testing.expectEqual(@as(u32, 1), touched.applied);
+
+    var unknown = try stream.groupAck("events", "g", lease, &recs, .{ .consumer = "c1" });
+    defer unknown.deinit();
+    try std.testing.expectEqual(@as(u8, 9), @intFromEnum(unknown.refused[0].why));
+
+    try std.testing.expectError(FloError.BadRequest, stream.groupAck("events", "g", lease, &.{}, .{}));
+    try std.testing.expectError(FloError.BadRequest, stream.groupNack("events", "g", lease, &recs, .{ .delay_ms = types.MAX_FAIL_DELAY_MS + 1 }));
+    try std.testing.expectError(FloError.OptionValueTooLarge, stream.groupNack("events", "g", lease, &recs, .{ .error_message = "e" ** 256 }));
+    try std.testing.expectEqual(@as(u32, 4), srv.requests.load(.acquire));
+}
+
+test "a group report answer cut anywhere or overlong is refused" {
+    const a = std.testing.allocator;
+    const body = le(@as(i64, 1)) ++ le(@as(u32, 0)) ++ le(@as(u32, 1)) ++ le(@as(u64, 100)) ++ le(@as(u64, 7)) ++ "\x01";
+    for (0..body.len) |n| try std.testing.expectError(FloError.IncompleteResponse, decodeGroupReport(a, body[0..n], true));
+    try std.testing.expectError(FloError.IncompleteResponse, decodeGroupReport(a, body ++ "\x00", true));
+    var r = try decodeGroupReport(a, body, true);
+    r.deinit();
+}
+
+test "group create sends its lease and attempts, delete and info read their answers, and a removed group op has no API" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 0, .body = "\x01" },
+        .{ .status = 0, .body = &le(@as(u64, 4)) },
+        .{ .status = 0, .body = &(le(@as(u64, 3)) ++ le(@as(u32, 1)) ++ le(@as(u64, 7_000_000)) ++ le(@as(u64, 1)) ++ le(@as(u64, 2)) ++ le(@as(u64, 5)) ++ le(@as(u64, 0))) },
+        .{ .status = @intFromEnum(types.StatusCode.not_found), .body = "\x0c\x00\x00not found: no such consumer group" },
+    };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    try std.testing.expect(try stream.groupCreate("events", "g", .{ .ack_timeout_ms = 5000, .max_deliver = 2 }));
+    try std.testing.expectEqual(@as(u16, 0x150), srv.last_op);
+    try std.testing.expectEqualSlices(u8, "\x01\x00g", srv.lastValue());
+    try std.testing.expectEqualSlices(u8, "\x30\x04" ++ le(@as(u32, 5000)) ++ "\x31\x01\x02", srv.lastOptions());
+
+    try std.testing.expectEqual(@as(u64, 4), try stream.groupDelete("events", "g", .{}));
+    try std.testing.expectEqual(@as(u16, 0x15C), srv.last_op);
+
+    const info = try stream.groupInfo("events", "g", .{});
+    try std.testing.expectEqual(@as(u16, 0x15B), srv.last_op);
+    try std.testing.expectEqual(types.StreamGroupInfo{ .pending = 3, .holders = 1, .created_at_ms = 7, .ready = 1, .leased = 2, .dead = 5, .trimmed_pending = 0 }, info);
+    try std.testing.expectError(FloError.NotFound, stream.groupInfo("events", "nope", .{}));
+
+    try std.testing.expectError(FloError.BadRequest, stream.groupCreate("events", "g", .{ .ack_timeout_ms = types.MIN_GROUP_LEASE_MS - 1 }));
+    try std.testing.expectError(FloError.BadRequest, stream.groupCreate("events", "g", .{ .ack_timeout_ms = types.MAX_GROUP_LEASE_MS + 1 }));
+    try std.testing.expectError(FloError.BadRequest, stream.groupCreate("events", "g", .{ .max_deliver = 0 }));
+    try std.testing.expectEqual(@as(u32, 4), srv.requests.load(.acquire));
+
+    inline for (.{ "groupJoin", "groupLeave", "groupClaim", "groupConfigureSweeper" }) |name| try std.testing.expect(!@hasDecl(Stream, name));
 }

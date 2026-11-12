@@ -159,7 +159,8 @@ pub const OkServer = struct {
 /// A loopback server for worker tests that serves one connection after
 /// another and answers each request as the first matching `Rule` says
 /// (OK by default). An OK without a body is the op's empty answer: no task
-/// for an action await, an expiry of 0 for a touch, and nothing for the
+/// for an action await, an expiry of 0 for a touch, nothing leased for a
+/// group read, nothing applied for a group report, and nothing for the
 /// rest. It keeps every request's op and raw bytes, header included.
 pub const ScriptServer = struct {
     pub const Action = union(enum) {
@@ -331,6 +332,10 @@ pub const ScriptServer = struct {
         return switch (op) {
             .action_await => "\x00",
             .action_touch => "\x00" ** 8,
+            // Nothing leased; nothing applied or refused.
+            .stream_group_read => "\x00" ** 28,
+            .stream_group_ack, .stream_group_nack => "\x00" ** 8,
+            .stream_group_touch => "\x00" ** 16,
             else => "",
         };
     }

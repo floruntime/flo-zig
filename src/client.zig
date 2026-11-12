@@ -243,7 +243,7 @@ pub const Client = struct {
         return last.code == @intFromEnum(StatusCode.unavailable) and last.ran == .no and last.reason == .shard_halted;
     }
 
-    /// For a worker's own supervision calls (registration, group join,
+    /// For a worker's own supervision calls (registration and
     /// polls), which wait out a halted shard where a caller's request would
     /// get the refusal back: whether err is a halted shard's refusal, and if
     /// so, a warning with the server's message and the next wait of
