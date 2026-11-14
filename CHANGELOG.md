@@ -2,8 +2,29 @@
 
 ## Unreleased
 
-- **Breaking:** pinned to the table hash of flo `723fd758` (`0xc688167b51fcc846`);
+- **Breaking:** pinned to the table hash of flo `fd771c1d` (`0xc1f93eb0ed86a281`);
   this SDK and older servers refuse each other.
+- `Reason` is non-exhaustive: a reason this SDK predates decodes as its number,
+  with the status and message in `lastError()`, rather than failing the call as
+  `error.IncompleteResponse`.
+- New reason `queue_full` (36), under `overloaded`: an enqueue past its queue's
+  caps or the shard's. It drains as messages are acked, so the client retries
+  it, as before.
+- New reason `group_held_full` (37), under `overloaded`: a group read took
+  nothing new because its consumers hold too many records unacked (or it holds
+  dead ones). `groupRead` returns the new `error.GroupHeldFull`, never retried;
+  the stream worker logs it once and backs off, as for `limit`.
+- **Breaking:** a group nack's error travels in the body, up to 1024 bytes
+  (`MAX_NACK_ERROR`); a longer one is `error.ValueTooLarge` before sending. The
+  `error_text` option tag is gone.
+- New `StreamGroupNackOptions.abandon`: hands records back unstarted, ready at
+  once, the delivery counted but no failure, so they never dead-letter. It
+  takes no `delay_ms`, `dead` or error (`error.BadRequest`). The stream
+  worker's `stop()` now abandons its unstarted records rather than nacking them.
+- A group ack, nack or touch for a group that isn't there is `error.NotFound`
+  as a whole, not every record `gone`; the stream worker logs it as such.
+- **Breaking:** `PeekedMessage.attempts` and `DeadLetter.attempts` are
+  `deliveries`.
 - **Breaking:** consumer groups lease records until acked, as queues do.
   `Stream.groupRead` returns a `GroupReadResult`: the records, each with its
   `deliveries`, the read's `lease` (term, index) and `expires_at_ms`.
@@ -24,8 +45,7 @@
   reported, waiting ones included, every sixth of the lease (at least 100 ms
   apart, from the batch's arrival), re-paced off each touch answer's expiry;
   it stops only on a stale report, conflict, not_found or bad_request and
-  retries anything else with back-off. `stop()` hands unstarted records back
-  with a nack (spending an attempt).
+  retries anything else with back-off.
   `StreamContext` carries the `lease`, `deliveries()` and `touch()`.
   `groupList` and `groupMembers` now count the consumers holding records.
 - **Breaking:** `routing_key` is gone from every KV option type. A key routes
@@ -37,9 +57,10 @@
   The largest value is 257,916 bytes and the largest JSON document 256,918.
 - New status `limit` (15): `error.Limit`, with reason `memory_budget`,
   `too_many_actions`, `too_many_workflow_definitions` or
-  `too_many_workflow_runs` in `lastError()`. Terminal: retrying won't clear it
-  until something is deleted, the node gets more room, or a setting is raised,
-  so nothing retries it. For the workers, start fails with the limit error; a
+  `too_many_workflow_runs` in `lastError()`. The limits are built into the
+  server, not settings, and `too_many_actions` counts per shard: retrying won't
+  clear it until something is deleted (or, for the memory budget, the node gets
+  more memory), so nothing retries it. For the workers, start fails with the limit error; a
   limit hit while running is logged and backed off (once per reason).
 - **Breaking:** queues are leased until completed: delivery is at least
   once. `Queue.dequeue` (`0x181`) leases its messages to `options.consumer`

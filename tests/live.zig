@@ -1336,3 +1336,151 @@ test "live: a read in a namespace never created is no_namespace" {
     _ = try kv.put("other", "x", .{});
     try testing.expect((try kv.get("k", .{})) == null);
 }
+
+const StopAfterOne = struct {
+    var worker: ?*flo.StreamWorker = null;
+    var handled = std.atomic.Value(u32).init(0);
+
+    fn handle(_: *flo.StreamContext) anyerror!void {
+        _ = handled.fetchAdd(1, .monotonic);
+        worker.?.stop();
+    }
+
+    fn run(w: *flo.StreamWorker) void {
+        w.start() catch |err| std.log.err("live stream worker: {}", .{err});
+    }
+};
+
+test "live: a stream worker stopped mid-batch abandons its unstarted records: read again with deliveries 2, none dead" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var stream = flo.Stream.init(&live.client);
+    // One attempt: a record whose hand-back counted a failure would be dead.
+    _ = try stream.groupCreate("stopping", "g", .{ .max_deliver = 1 });
+    for ([_][]const u8{ "a", "b", "c" }) |p| _ = try stream.append("stopping", p, .{});
+
+    var w = try flo.StreamWorker.init(testing.allocator, .{ .endpoint = try endpoint(), .namespace = live.namespace, .stream = "stopping", .group = "g", .consumer = "c1", .batch_size = 3, .block_ms = 500 }, StopAfterOne.handle);
+    defer w.deinit();
+    StopAfterOne.worker = &w;
+    StopAfterOne.handled.store(0, .monotonic);
+    const thread = try std.Thread.spawn(.{}, StopAfterOne.run, .{&w});
+    thread.join();
+    try testing.expectEqual(@as(u32, 1), StopAfterOne.handled.load(.monotonic));
+
+    // Ready at once, not after the 30 s lease.
+    var again = try stream.groupRead("stopping", "g", "c2", .{ .count = 10, .block_ms = 1000 });
+    defer again.deinit();
+    try testing.expectEqual(@as(usize, 2), again.records.len);
+    try testing.expectEqualStrings("b", again.records[0].payload);
+    for (again.records) |r| try testing.expectEqual(@as(u32, 2), r.deliveries);
+    const info = try stream.groupInfo("stopping", "g", .{});
+    try testing.expectEqual(@as(u64, 0), info.dead);
+    try testing.expectEqual(@as(u64, 2), info.leased);
+}
+
+test "live: a record abandoned more times than max_deliver is not dead; a nack is" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var stream = flo.Stream.init(&live.client);
+    _ = try stream.groupCreate("abandoned", "g", .{ .max_deliver = 2 });
+    _ = try stream.append("abandoned", "x", .{});
+
+    for (1..5) |n| {
+        var got = try stream.groupRead("abandoned", "g", "c1", .{ .block_ms = 1000 });
+        defer got.deinit();
+        try testing.expectEqual(@as(usize, 1), got.records.len);
+        try testing.expectEqual(@as(u32, @intCast(n)), got.records[0].deliveries);
+        var back = try stream.groupNack("abandoned", "g", got.lease, got.records, .{ .consumer = "c1", .abandon = true });
+        defer back.deinit();
+        try testing.expectEqual(@as(u32, 1), back.applied);
+    }
+    try testing.expectEqual(@as(u64, 0), (try stream.groupInfo("abandoned", "g", .{})).dead);
+    try testing.expectEqual(@as(u64, 1), (try stream.groupInfo("abandoned", "g", .{})).ready);
+
+    // The server refuses abandon with an error, too; sent by hand past the
+    // SDK's own check.
+    var got = try stream.groupRead("abandoned", "g", "c1", .{ .block_ms = 1000 });
+    defer got.deinit();
+    var buf: [128]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&buf);
+    try bw.writeInt(u16, 1, .little);
+    try bw.writeAll("g");
+    try bw.writeInt(u16, 2, .little);
+    try bw.writeAll("c1");
+    try bw.writeInt(u64, got.lease.term, .little);
+    try bw.writeInt(u64, got.lease.index, .little);
+    try bw.writeInt(u32, 1, .little);
+    try bw.writeInt(u64, got.records[0].id.timestamp_ms, .little);
+    try bw.writeInt(u64, got.records[0].id.sequence, .little);
+    try bw.writeInt(u32, got.records[0].deliveries, .little);
+    try bw.writeInt(u16, 4, .little);
+    try bw.writeAll("boom");
+    var resp = try live.client.sendRequest(.stream_group_nack, live.namespace, "abandoned", bw.buffered(), "\x34\x00");
+    resp.deinit();
+    try testing.expectEqual(flo.StatusCode.bad_request, resp.status);
+
+    // Two failures spend the group's 2 attempts: dead.
+    var failed = try stream.groupNack("abandoned", "g", got.lease, got.records, .{ .consumer = "c1" });
+    failed.deinit();
+    try testing.expectEqual(@as(u32, 1), failed.applied);
+    var last = try stream.groupRead("abandoned", "g", "c1", .{ .block_ms = 1000 });
+    defer last.deinit();
+    var dead = try stream.groupNack("abandoned", "g", last.lease, last.records, .{ .consumer = "c1" });
+    dead.deinit();
+    try testing.expectEqual(@as(u64, 1), (try stream.groupInfo("abandoned", "g", .{})).dead);
+}
+
+test "live: a nack carries a 1024-byte error; the server refuses a longer one" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var stream = flo.Stream.init(&live.client);
+    _ = try stream.append("nack-error", "x", .{});
+    var got = try stream.groupRead("nack-error", "g", "c1", .{ .block_ms = 1000 });
+    defer got.deinit();
+    try testing.expectEqual(@as(usize, 1), got.records.len);
+
+    // Past the SDK's check, by hand: the server's own bound.
+    var buf: [128 + flo.MAX_NACK_ERROR + 1]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&buf);
+    try bw.writeInt(u16, 1, .little);
+    try bw.writeAll("g");
+    try bw.writeInt(u16, 2, .little);
+    try bw.writeAll("c1");
+    try bw.writeInt(u64, got.lease.term, .little);
+    try bw.writeInt(u64, got.lease.index, .little);
+    try bw.writeInt(u32, 1, .little);
+    try bw.writeInt(u64, got.records[0].id.timestamp_ms, .little);
+    try bw.writeInt(u64, got.records[0].id.sequence, .little);
+    try bw.writeInt(u32, got.records[0].deliveries, .little);
+    try bw.writeInt(u16, flo.MAX_NACK_ERROR + 1, .little);
+    try bw.splatByteAll('e', flo.MAX_NACK_ERROR + 1);
+    var resp = try live.client.sendRequest(.stream_group_nack, live.namespace, "nack-error", bw.buffered(), "");
+    resp.deinit();
+    try testing.expectEqual(flo.StatusCode.bad_request, resp.status);
+    try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "1024") != null);
+
+    const longest = "e" ** flo.MAX_NACK_ERROR;
+    try testing.expectError(flo.FloError.ValueTooLarge, stream.groupNack("nack-error", "g", got.lease, got.records, .{ .consumer = "c1", .error_message = longest ++ "e" }));
+    var nacked = try stream.groupNack("nack-error", "g", got.lease, got.records, .{ .consumer = "c1", .error_message = longest });
+    defer nacked.deinit();
+    try testing.expectEqual(@as(u32, 1), nacked.applied);
+    try testing.expectEqual(@as(usize, 0), nacked.refused.len);
+}
+
+test "live: a report to a deleted group is not found" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var stream = flo.Stream.init(&live.client);
+    _ = try stream.append("deleted-group", "x", .{});
+    var got = try stream.groupRead("deleted-group", "g", "c1", .{ .block_ms = 1000 });
+    defer got.deinit();
+    try testing.expectEqual(@as(usize, 1), got.records.len);
+    _ = try stream.groupDelete("deleted-group", "g", .{});
+    try testing.expectError(flo.FloError.NotFound, stream.groupAck("deleted-group", "g", got.lease, got.records, .{ .consumer = "c1" }));
+    try testing.expectEqual(flo.Reason.not_found, live.client.lastError().?.reason);
+    try testing.expectError(flo.FloError.NotFound, stream.groupNack("deleted-group", "g", got.lease, got.records, .{ .consumer = "c1", .abandon = true }));
+}

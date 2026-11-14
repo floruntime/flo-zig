@@ -1476,10 +1476,7 @@ test "a refusal whose body isn't [reason][ran][message] is refused, not guessed 
     var srv = try test_server.OkServer.listen();
     srv.replies = &.{
         .{ .status = 3, .body = "\x01\x00" },
-        .{ .status = 3, .body = "\xff\xff\x00x" },
         .{ .status = 3, .body = "\x01\x00\x09x" },
-        // Reason 257: read as a byte it would pass as unknown_op.
-        .{ .status = 3, .body = "\x01\x01\x00x" },
     };
     try srv.start();
     defer srv.deinit();
@@ -1488,10 +1485,45 @@ test "a refusal whose body isn't [reason][ran][message] is refused, not guessed 
     defer client.deinit();
     try client.connect();
     var kv = KV.init(&client);
-    for (0..4) |_| {
+    for (0..2) |_| {
         try std.testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
         try std.testing.expect(client.lastError() == null);
     }
+}
+
+test "a reason this SDK predates decodes as its number, with its status and message" {
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        // Reason 257: read as a byte it would pass as unknown_op.
+        .{ .status = 3, .body = "\x01\x01\x00new reason" },
+        .{ .status = 3, .body = "\xff\xff\x02x" },
+        // An unknown status and an unknown reason.
+        .{ .status = 200, .body = "\x63\x00\x00both new" },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var kv = KV.init(&client);
+    try std.testing.expectError(FloError.BadRequest, kv.get("k", .{}));
+    var last = client.lastError().?;
+    try std.testing.expectEqual(@as(u16, 257), @intFromEnum(last.reason));
+    try std.testing.expect(std.enums.tagName(types.Reason, last.reason) == null);
+    try std.testing.expectEqual(types.Ran.no, last.ran);
+    try std.testing.expectEqualStrings("new reason", last.message);
+
+    try std.testing.expectError(FloError.BadRequest, kv.get("k", .{}));
+    last = client.lastError().?;
+    try std.testing.expectEqual(@as(u16, 0xffff), @intFromEnum(last.reason));
+    try std.testing.expectEqual(types.Ran.unknown, last.ran);
+
+    try std.testing.expectError(FloError.ServerError, kv.get("k", .{}));
+    last = client.lastError().?;
+    try std.testing.expectEqual(@as(u8, 200), last.code);
+    try std.testing.expectEqual(@as(u16, 99), @intFromEnum(last.reason));
+    try std.testing.expectEqualStrings("both new", last.message);
 }
 
 test "values up to the server's bounds go out in one frame; a frame over it is refused unsent" {

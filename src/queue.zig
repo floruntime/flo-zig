@@ -22,10 +22,12 @@ pub const Queue = struct {
     }
 
     /// Enqueue a message to a queue; returns its seq. A queue holds at most
-    /// its cap of messages and bytes, and a shard's queues their cap of
-    /// bytes: past one, the enqueue is refused overloaded without running,
-    /// which the client retries like any such refusal before returning
-    /// `FloError.Overloaded` (`client.lastError()` names the cap).
+    /// its cap of messages and bytes, and a shard's queues and groups
+    /// together their cap of bytes: past one, the enqueue is refused
+    /// overloaded (reason queue_full) without running. It drains as
+    /// messages are acked, so the client retries it like any such refusal
+    /// before returning `FloError.Overloaded` (`client.lastError()` names
+    /// the cap): back off and send again.
     pub fn enqueue(
         self: *Queue,
         queue_name: []const u8,
@@ -317,7 +319,7 @@ const min_dead_letter = 8 + 4 + 4 + 8 + 4 + 1 + 8;
 
 /// queue_dlq_list's answer:
 ///   [count:u32]([seq:u64][size:u32][len:u32][payload][enqueued_at_ms:i64]
-///   [attempts:u32][priority:u8][moved_at_ms:i64])*
+///   [deliveries:u32][priority:u8][moved_at_ms:i64])*
 ///   [total:u64][has_more:u8][last_seq:u64]
 fn decodeDlqPage(allocator: Allocator, data: []const u8) FloError!types.DlqPage {
     var r: Reader = .{ .data = data };
@@ -336,7 +338,7 @@ fn decodeDlqPage(allocator: Allocator, data: []const u8) FloError!types.DlqPage 
         const payload = try r.lenBytes(u32);
         if (payload.len > max_shown_payload or payload.len > size) return FloError.IncompleteResponse;
         const enqueued_at_ms = try r.int(i64);
-        const attempts = try r.int(u32);
+        const deliveries = try r.int(u32);
         const priority = try r.int(u8);
         const moved_at_ms = try r.int(i64);
         letters[got] = .{
@@ -344,7 +346,7 @@ fn decodeDlqPage(allocator: Allocator, data: []const u8) FloError!types.DlqPage 
             .size = size,
             .payload = try allocator.dupe(u8, payload),
             .enqueued_at_ms = enqueued_at_ms,
-            .attempts = attempts,
+            .deliveries = deliveries,
             .priority = priority,
             .moved_at_ms = moved_at_ms,
         };
@@ -359,7 +361,7 @@ fn decodeDlqPage(allocator: Allocator, data: []const u8) FloError!types.DlqPage 
 /// A peeked message's smallest encoding: an empty payload.
 const min_peeked = 8 + 4 + 4 + 8 + 4 + 2;
 
-/// queue.peek's answer: messages (u8 count), each {seq, priority, attempts,
+/// queue.peek's answer: messages (u8 count), each {seq, priority, deliveries,
 /// enqueued_at_ms, size, payload}, then more.
 fn decodePeekAnswer(allocator: Allocator, data: []const u8) FloError!types.PeekResult {
     var r: Reader = .{ .data = data };
@@ -374,7 +376,7 @@ fn decodePeekAnswer(allocator: Allocator, data: []const u8) FloError!types.PeekR
     while (got < n) : (got += 1) {
         const seq = try r.int(u64);
         const priority = try r.int(u32);
-        const attempts = try r.int(u32);
+        const deliveries = try r.int(u32);
         const enqueued_at_ms = try r.int(i64);
         const size = try r.int(u32);
         const payload = try r.lenBytes(u16);
@@ -382,7 +384,7 @@ fn decodePeekAnswer(allocator: Allocator, data: []const u8) FloError!types.PeekR
         messages[got] = .{
             .seq = seq,
             .priority = priority,
-            .attempts = attempts,
+            .deliveries = deliveries,
             .enqueued_at_ms = enqueued_at_ms,
             .size = size,
             .payload = try allocator.dupe(u8, payload),
@@ -424,7 +426,7 @@ test "dlqList sends its limit and after in the value and reads the page and its 
     try std.testing.expectEqual(@as(u64, 7), first.seq);
     try std.testing.expectEqual(@as(u32, 5), first.size);
     try std.testing.expectEqualStrings("ab", first.payload);
-    try std.testing.expectEqual(@as(u32, 3), first.attempts);
+    try std.testing.expectEqual(@as(u32, 3), first.deliveries);
     try std.testing.expectEqual(@as(u8, 4), first.priority);
     try std.testing.expectEqual(@as(i64, 200), first.moved_at_ms);
     try std.testing.expectEqual(@as(u64, 9), page.total);
@@ -478,7 +480,7 @@ test "peek sends its limit as the body and reads the messages and more" {
     try std.testing.expectEqual(@as(usize, 2), got.messages.len);
     try std.testing.expectEqualStrings("hi", got.messages[0].payload);
     try std.testing.expectEqual(@as(u32, 7), got.messages[1].priority);
-    try std.testing.expectEqual(@as(u32, 1), got.messages[1].attempts);
+    try std.testing.expectEqual(@as(u32, 1), got.messages[1].deliveries);
     try std.testing.expectEqual(@as(u32, 3), got.messages[1].size);
     try std.testing.expect(got.more);
 
@@ -642,9 +644,11 @@ test "reports refuse no messages, more than 100, or an error the server would, b
     try std.testing.expectError(FloError.BadRequest, queue.fail("q", lease, many[0..1], .{ .delay_ms = types.MAX_FAIL_DELAY_MS + 1 }));
 }
 
+/// overloaded, queue_full (36), ran no: past the queue's cap.
+const queue_full_reply: test_server.Reply = .{ .status = 10, .body = "\x24\x00\x00overloaded: queue 'jobs' is full: it holds 2 messages (at most 2)" };
+
 test "enqueue sends delay_ms when it's set, and a full queue is overloaded, retried, then returned" {
-    // overloaded, unclassified, ran no: past the queue's cap.
-    const full: test_server.Reply = .{ .status = 10, .body = "\x0c\x00\x00overloaded: queue 'jobs' is full: it holds 2 messages (at most 2)" };
+    const full = queue_full_reply;
     var f: Fake = .{ .srv = undefined };
     try f.start(&.{ .{ .status = 0, .body = &le(@as(u64, 5)) }, full, full, full, full });
     defer f.stop();
@@ -656,6 +660,16 @@ test "enqueue sends delay_ms when it's set, and a full queue is overloaded, retr
     try std.testing.expectError(FloError.Overloaded, queue.enqueue("jobs", "x", .{}));
     try std.testing.expectEqual(@as(u32, 5), f.srv.requests.load(.acquire));
     try std.testing.expect(std.mem.startsWith(u8, f.client.lastError().?.message, "overloaded: queue 'jobs' is full"));
+    try std.testing.expectEqual(types.Reason.queue_full, f.client.lastError().?.reason);
+}
+
+test "a full queue is retried, and the enqueue lands once it drains" {
+    var f: Fake = .{ .srv = undefined };
+    try f.start(&.{ queue_full_reply, queue_full_reply, .{ .status = 0, .body = &le(@as(u64, 9)) } });
+    defer f.stop();
+    var queue = Queue.init(&f.client);
+    try std.testing.expectEqual(@as(u64, 9), try queue.enqueue("jobs", "x", .{}));
+    try std.testing.expectEqual(@as(u32, 3), f.srv.requests.load(.acquire));
 }
 
 test "purge answers how many messages it removed" {

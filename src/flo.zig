@@ -220,6 +220,8 @@ pub const VERSION = types.VERSION;
 pub const TABLE_HASH = types.TABLE_HASH;
 pub const Reason = types.Reason;
 pub const Ran = types.Ran;
+/// The longest error a group nack carries.
+pub const MAX_NACK_ERROR = types.MAX_NACK_ERROR;
 
 // =============================================================================
 // Convenience Functions

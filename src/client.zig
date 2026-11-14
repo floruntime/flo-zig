@@ -348,7 +348,9 @@ pub const Client = struct {
 
         if (response_header.status != 0) {
             // A refusal's body: [reason:u16][ran:u8][message].
-            const reason = if (data.len >= 3) std.enums.fromInt(types.Reason, std.mem.readInt(u16, data[0..2], .little)) else null;
+            // A reason this SDK predates keeps its number; the status says
+            // whether to retry it.
+            const reason: ?types.Reason = if (data.len >= 3) @enumFromInt(std.mem.readInt(u16, data[0..2], .little)) else null;
             const ran = if (data.len >= 3) std.enums.fromInt(types.Ran, data[2]) else null;
             if (reason == null or ran == null) {
                 // last_error_code was cleared when this request began, so

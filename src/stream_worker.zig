@@ -377,7 +377,9 @@ pub const StreamWorker = struct {
                     // Refused without running (records still being read
                     // from disk, no leader yet): the read leased nothing,
                     // so the same group and consumer read again.
-                    if (err == FloError.Limit) {
+                    // Neither passes by reading again: logged once per
+                    // reason, then backed off.
+                    if (err == FloError.Limit or err == FloError.GroupHeldFull) {
                         self.limit_notice.note(&self.client, "[flo-stream-worker] group read");
                     } else if (self.client.refusedUnrun(err)) {
                         std.log.warn("[flo-stream-worker] GroupRead refused, not run: {s}; retrying in {d}ms", .{ self.client.lastError().?.message, ms });
@@ -452,8 +454,9 @@ pub const StreamWorker = struct {
 
     /// Stop the worker: it reads nothing more. Records of the batch in hand
     /// that have started run to the end and are acked or nacked; those not
-    /// started are handed back at once with a nack, which spends one of
-    /// their attempts (`max_deliver`), so the next read takes them.
+    /// started are abandoned: handed back ready at once, their delivery
+    /// counted but no failure, so the next read takes them and they spend
+    /// none of the group's attempts (`max_deliver`).
     pub fn stop(self: *Self) void {
         std.log.info("[flo-stream-worker] Stopping...", .{});
         @atomicStore(bool, &self.running, false, .monotonic);
@@ -678,17 +681,19 @@ pub const StreamWorker = struct {
             self.report(conn, item, .ack);
         } else |err| {
             _ = self.messages_failed.fetchAdd(1, .monotonic);
-            std.log.err("[flo-stream-worker] Record {} failed: {}", .{ item.record.id, err });
+            types.logWorkerError("[flo-stream-worker] Record {} failed: {}", .{ item.record.id, err });
             self.report(conn, item, .nack);
         }
     }
 
-    /// Nack a record a stop came before, so it is ready for the next read
-    /// at once rather than when its lease runs out. It spends an attempt.
+    /// Abandon a record a stop came before, so it is ready for the next
+    /// read at once rather than when its lease runs out. Only unstarted
+    /// records are abandoned: an abandon counts no failure, so it never
+    /// dead-letters, and one that failed is nacked.
     fn handBack(self: *Self, conn: *Client, item: *const Leased) void {
         if (item.toucher) |t| t.drop(item.record.id);
         std.log.info("[flo-stream-worker] Stopping: record {} handed back unstarted", .{item.record.id});
-        self.report(conn, item, .nack);
+        self.report(conn, item, .abandon);
     }
 
     /// auto_touch never touches more often, whatever the lease.
@@ -847,7 +852,9 @@ pub const StreamWorker = struct {
     /// answered `gone`. A refusal is not sent again: the server answered.
     /// An undelivered result is logged; the record is read again once its
     /// lease runs out.
-    fn report(self: *Self, conn: *Client, item: *const Leased, kind: enum { ack, nack }) void {
+    /// A group that isn't there (deleted under the worker) refuses the
+    /// report as a whole; that is logged as such, not taken as done.
+    fn report(self: *Self, conn: *Client, item: *const Leased, kind: enum { ack, nack, abandon }) void {
         var stream = Stream.init(conn);
         const id = item.record.id;
         var sends: u32 = 0;
@@ -856,6 +863,7 @@ pub const StreamWorker = struct {
             const result = switch (kind) {
                 .ack => stream.groupAck(item.stream_name, self.config.group, item.lease, &.{item.record}, .{ .namespace = self.config.namespace, .consumer = self.consumer_name }),
                 .nack => stream.groupNack(item.stream_name, self.config.group, item.lease, &.{item.record}, .{ .namespace = self.config.namespace, .consumer = self.consumer_name }),
+                .abandon => stream.groupNack(item.stream_name, self.config.group, item.lease, &.{item.record}, .{ .namespace = self.config.namespace, .consumer = self.consumer_name, .abandon = true }),
             };
             if (result) |answer| {
                 var got = answer;
@@ -866,6 +874,10 @@ pub const StreamWorker = struct {
                 }
                 return;
             } else |err| {
+                if (err == FloError.NotFound) {
+                    types.logWorkerError("[flo-stream-worker] {s} of record {} refused: group '{s}' on stream '{s}' isn't there (deleted?)", .{ @tagName(kind), id, self.config.group, item.stream_name });
+                    return;
+                }
                 if (!client_mod.isConnectionError(err)) {
                     types.logWorkerError("[flo-stream-worker] {s} of record {} refused: {}; dropped", .{ @tagName(kind), id, err });
                     return;
@@ -1010,14 +1022,17 @@ const group_test = struct {
     /// first delivered: its value ends term, index, count, id, deliveries.
     fn reportNames(req: []const u8, seq: u64) bool {
         const v = @import("test_server.zig").valueOf(req);
-        var want: [8 + 8 + 4 + 8 + 8 + 4]u8 = undefined;
+        var want: [8 + 8 + 4 + 8 + 8 + 4 + 2]u8 = undefined;
         @memcpy(want[0..8], &le(term));
         @memcpy(want[8..16], &le(index));
         @memcpy(want[16..20], &le(@as(u32, 1)));
         @memcpy(want[20..28], &le(@as(u64, 0)));
         @memcpy(want[28..36], &le(seq));
         @memcpy(want[36..40], &le(@as(u32, 1)));
-        return std.mem.endsWith(u8, v, &want);
+        // A nack's body ends with its error: none, from the worker.
+        const nack = std.mem.readInt(u16, req[20..22], .little) == @intFromEnum(types.OpCode.stream_group_nack);
+        @memcpy(want[40..42], "\x00\x00");
+        return std.mem.endsWith(u8, v, want[0..if (nack) 42 else 40]);
     }
 };
 
@@ -1825,7 +1840,7 @@ test "StreamWorker with auto_touch tries a touch refused overloaded again, soone
     try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_ack));
 }
 
-test "StreamWorker stopped mid-batch finishes the record it started and hands the rest back with a nack" {
+test "StreamWorker stopped mid-batch finishes the record it started and abandons the rest" {
     const stopping = struct {
         var worker: ?*StreamWorker = null;
         var handled = std.atomic.Value(u32).init(0);
@@ -1851,4 +1866,51 @@ test "StreamWorker stopped mid-batch finishes the record it started and hands th
     try std.testing.expectEqual(@as(u32, 2), srv.countOf(.stream_group_nack));
     try std.testing.expect(group_test.reportNames(srv.requestOf(.stream_group_nack, 0), 8));
     try std.testing.expect(group_test.reportNames(srv.requestOf(.stream_group_nack, 1), 9));
+    // Abandoned, not failed: the abandon flag (0x34) alone.
+    for (0..2) |i| try std.testing.expectEqualSlices(u8, "\x34\x00", @import("test_server.zig").optionsOf(srv.requestOf(.stream_group_nack, @intCast(i))));
+}
+
+test "StreamWorker nacks a record its handler failed, without abandon" {
+    const failing = struct {
+        fn handle(_: *StreamContext) anyerror!void {
+            return error.Boom;
+        }
+    };
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = comptime group_test.answer(&.{7}) } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, failing.handle);
+    defer w.deinit();
+    w.running = true;
+    try w.pollAndProcess("events");
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_nack));
+    try std.testing.expect(group_test.reportNames(srv.requestOf(.stream_group_nack, 0), 7));
+    try std.testing.expectEqualSlices(u8, "", @import("test_server.zig").optionsOf(srv.requestOf(.stream_group_nack, 0)));
+}
+
+test "StreamWorker backs off a group read whose group holds too many records, logging it once, and the client never retries it" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    // overloaded, reason group_held_full (37), ran no.
+    const held: @import("test_server.zig").Reply = .{ .status = 10, .body = "\x25\x00\x00overloaded: group 'default' on stream 'events' is full" };
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .stream_group_read, .action = .{ .reply = held } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, drain_gap_test.handle);
+    defer w.deinit();
+    w.running = true;
+    try std.testing.expectError(FloError.GroupHeldFull, w.pollAndProcess("events"));
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_read));
+
+    const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
+    std.Thread.sleep(700 * std.time.ns_per_ms);
+    w.stop();
+    thread.join();
+    const reads = srv.countOf(.stream_group_read);
+    try std.testing.expect(reads >= 2 and reads <= 8);
+    try std.testing.expect(w.limit_notice.logged(.group_held_full));
 }
