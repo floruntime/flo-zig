@@ -351,7 +351,7 @@ pub const Client = struct {
             // A reason this SDK predates keeps its number; the status says
             // whether to retry it.
             const reason: ?types.Reason = if (data.len >= 3) @enumFromInt(std.mem.readInt(u16, data[0..2], .little)) else null;
-            const ran = if (data.len >= 3) std.enums.fromInt(types.Ran, data[2]) else null;
+            const ran: ?types.Ran = if (data.len >= 3) @enumFromInt(data[2]) else null;
             if (reason == null or ran == null) {
                 // last_error_code was cleared when this request began, so
                 // lastError names no earlier refusal.

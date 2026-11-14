@@ -93,10 +93,10 @@ pub const Reason = enum(u16) {
     /// caps allow, or the shard's queues and groups together do. It drains
     /// as messages are acked, so the client retries it.
     queue_full = 36,
-    /// Status overloaded: a group read took nothing new because the group's
-    /// consumers hold too many records unacked (or it holds dead ones).
-    /// Reading again won't help until they ack or nack: `FloError.GroupHeldFull`,
-    /// never retried.
+    /// Status overloaded: a group read took nothing new. Either the group
+    /// holds as many records as its caps allow, leased, ready and dead
+    /// together, or the shard's queues and groups together hold their cap
+    /// of bytes. See `FloError.GroupHeldFull`; never retried.
     group_held_full = 37,
 
     _,
@@ -110,6 +110,8 @@ pub const Ran = enum(u8) {
     yes = 1,
     /// It may still take effect; check before resending.
     unknown = 2,
+    /// A value this SDK predates: treated as unknown, so never retried.
+    _,
 };
 
 /// Size limits (for client-side validation)
@@ -235,7 +237,8 @@ pub const LimitNotice = struct {
             self.seen[self.seen_len] = last.reason;
             self.seen_len += 1;
         }
-        std.log.warn(what ++ " refused at a limit ({s}): {s}; backing off, not retrying it until it passes", .{ std.enums.tagName(Reason, last.reason) orelse "unknown", last.message });
+        const hint = if (last.reason == .group_held_full) " (it clears as the group's records are acked or nacked, its dead records removed by deleting the group or trimming the stream, or, at the shard's cap, as other groups and queues drain)" else "";
+        std.log.warn(what ++ " refused at a limit ({s}): {s}; backing off, not retrying it until it passes{s}", .{ std.enums.tagName(Reason, last.reason) orelse "unknown", last.message, hint });
     }
 
     pub fn logged(self: *const LimitNotice, reason: Reason) bool {
@@ -581,10 +584,15 @@ pub const FloError = error{
     /// something is deleted (or, for the memory budget, the node is given
     /// more memory), so it is never retried. Not permanent. It never ran.
     Limit,
-    /// A group read took nothing new: the group's consumers hold too many
-    /// records they haven't acked, or it holds dead ones (status
-    /// overloaded, reason group_held_full). Reading again won't help until
-    /// they ack or nack, so it is never retried; back off, as for `Limit`.
+    /// A group read took nothing new (status overloaded, reason
+    /// group_held_full): the group holds as many records as its caps
+    /// allow, leased, ready and dead together, or the shard's queues and
+    /// groups together hold their cap of bytes. Reading again won't help,
+    /// so it is never retried; back off, as for `Limit`. The group's room
+    /// comes back as its consumers ack or nack, but dead records count too
+    /// and stay until the group is deleted or a trim of the stream cuts
+    /// them. At the shard's cap, it clears as other groups and queues on
+    /// the shard drain. The message says which cap.
     GroupHeldFull,
     UnexpectedResponse,
 

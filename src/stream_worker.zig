@@ -115,6 +115,17 @@ pub const StreamContext = struct {
     allocator: Allocator,
     /// The connection the record's ack or nack goes on.
     client: ?*Client = null,
+    /// The worker's running flag; cleared by its stop.
+    running: ?*const bool = null,
+
+    /// Whether the worker is stopping. The worker can't interrupt a
+    /// handler: a long one checks this and returns an error to cut itself
+    /// short. An error returned while stopping hands the record back
+    /// unstarted (abandoned: no attempt spent), not nacked.
+    pub fn stopping(self: *const StreamContext) bool {
+        const running = self.running orelse return false;
+        return !@atomicLoad(bool, running, .monotonic);
+    }
 
     /// Get the raw record payload.
     pub fn payload(self: *const StreamContext) []const u8 {
@@ -453,10 +464,13 @@ pub const StreamWorker = struct {
     }
 
     /// Stop the worker: it reads nothing more. Records of the batch in hand
-    /// that have started run to the end and are acked or nacked; those not
-    /// started are abandoned: handed back ready at once, their delivery
-    /// counted but no failure, so the next read takes them and they spend
-    /// none of the group's attempts (`max_deliver`).
+    /// that have started run to the end (the worker can't interrupt a
+    /// handler; `ctx.stopping()` lets one cut itself short). One whose
+    /// handler returns is acked; one whose handler returns an error after
+    /// the stop is abandoned, as are those not started: handed back ready
+    /// at once, their delivery counted but no failure, so the next read
+    /// takes them and they spend none of the group's attempts
+    /// (`max_deliver`).
     pub fn stop(self: *Self) void {
         std.log.info("[flo-stream-worker] Stopping...", .{});
         @atomicStore(bool, &self.running, false, .monotonic);
@@ -669,6 +683,7 @@ pub const StreamWorker = struct {
             .lease = item.lease,
             .allocator = self.allocator,
             .client = conn,
+            .running = &self.running,
         };
 
         // The handler's outcome alone decides ack or nack: an ack that can't
@@ -680,6 +695,14 @@ pub const StreamWorker = struct {
             _ = self.messages_processed.fetchAdd(1, .monotonic);
             self.report(conn, item, .ack);
         } else |err| {
+            // Decided by the worker's own stop, not the error: a handler cut
+            // short by a stop didn't fail, and a nack would spend an attempt
+            // (dead-lettering it at max_deliver 1) on a rolling restart.
+            if (!@atomicLoad(bool, &self.running, .monotonic)) {
+                std.log.info("[flo-stream-worker] Stopping: record {} cut short ({}); handed back unstarted", .{ item.record.id, err });
+                self.report(conn, item, .abandon);
+                return;
+            }
             _ = self.messages_failed.fetchAdd(1, .monotonic);
             types.logWorkerError("[flo-stream-worker] Record {} failed: {}", .{ item.record.id, err });
             self.report(conn, item, .nack);
@@ -1868,6 +1891,37 @@ test "StreamWorker stopped mid-batch finishes the record it started and abandons
     try std.testing.expect(group_test.reportNames(srv.requestOf(.stream_group_nack, 1), 9));
     // Abandoned, not failed: the abandon flag (0x34) alone.
     for (0..2) |i| try std.testing.expectEqualSlices(u8, "\x34\x00", @import("test_server.zig").optionsOf(srv.requestOf(.stream_group_nack, @intCast(i))));
+}
+
+test "StreamWorker abandons a record whose handler returns an error after its stop, and the rest unstarted" {
+    const cut = struct {
+        var worker: ?*StreamWorker = null;
+        var saw_stopping = std.atomic.Value(bool).init(false);
+        fn handle(ctx: *StreamContext) anyerror!void {
+            worker.?.stop();
+            saw_stopping.store(ctx.stopping(), .monotonic);
+            return error.Cancelled;
+        }
+    };
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .stream_group_read, .nth = 0, .action = .{ .reply = .{ .status = 0, .body = comptime group_test.answer(&.{ 7, 8 }) } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, cut.handle);
+    defer w.deinit();
+    cut.worker = &w;
+    cut.saw_stopping.store(false, .monotonic);
+    w.running = true;
+    try w.pollAndProcess("events");
+    try std.testing.expect(cut.saw_stopping.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_ack));
+    try std.testing.expectEqual(@as(u32, 2), srv.countOf(.stream_group_nack));
+    try std.testing.expect(group_test.reportNames(srv.requestOf(.stream_group_nack, 0), 7));
+    for (0..2) |i| try std.testing.expectEqualSlices(u8, "\x34\x00", @import("test_server.zig").optionsOf(srv.requestOf(.stream_group_nack, @intCast(i))));
+    // Not a failure.
+    try std.testing.expectEqual(@as(u64, 0), w.messages_failed.load(.monotonic));
 }
 
 test "StreamWorker nacks a record its handler failed, without abandon" {

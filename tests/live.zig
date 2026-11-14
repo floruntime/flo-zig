@@ -1341,9 +1341,11 @@ const StopAfterOne = struct {
     var worker: ?*flo.StreamWorker = null;
     var handled = std.atomic.Value(u32).init(0);
 
-    fn handle(_: *flo.StreamContext) anyerror!void {
+    /// Cut short by the stop, as a long handler checking `stopping` is.
+    fn handle(ctx: *flo.StreamContext) anyerror!void {
         _ = handled.fetchAdd(1, .monotonic);
         worker.?.stop();
+        if (ctx.stopping()) return error.Stopped;
     }
 
     fn run(w: *flo.StreamWorker) void {
@@ -1351,7 +1353,7 @@ const StopAfterOne = struct {
     }
 };
 
-test "live: a stream worker stopped mid-batch abandons its unstarted records: read again with deliveries 2, none dead" {
+test "live: a stream worker stopped mid-batch abandons the record its stop cut short and those unstarted: read again with deliveries 2, none dead" {
     var live: Live = .{ .client = undefined };
     try live.init();
     defer live.deinit();
@@ -1371,12 +1373,12 @@ test "live: a stream worker stopped mid-batch abandons its unstarted records: re
     // Ready at once, not after the 30 s lease.
     var again = try stream.groupRead("stopping", "g", "c2", .{ .count = 10, .block_ms = 1000 });
     defer again.deinit();
-    try testing.expectEqual(@as(usize, 2), again.records.len);
-    try testing.expectEqualStrings("b", again.records[0].payload);
+    try testing.expectEqual(@as(usize, 3), again.records.len);
+    try testing.expectEqualStrings("a", again.records[0].payload);
     for (again.records) |r| try testing.expectEqual(@as(u32, 2), r.deliveries);
     const info = try stream.groupInfo("stopping", "g", .{});
     try testing.expectEqual(@as(u64, 0), info.dead);
-    try testing.expectEqual(@as(u64, 2), info.leased);
+    try testing.expectEqual(@as(u64, 3), info.leased);
 }
 
 test "live: a record abandoned more times than max_deliver is not dead; a nack is" {

@@ -11,16 +11,22 @@
   caps or the shard's. It drains as messages are acked, so the client retries
   it, as before.
 - New reason `group_held_full` (37), under `overloaded`: a group read took
-  nothing new because its consumers hold too many records unacked (or it holds
-  dead ones). `groupRead` returns the new `error.GroupHeldFull`, never retried;
-  the stream worker logs it once and backs off, as for `limit`.
+  nothing new because the group is at its caps (leased, ready and dead records
+  together; dead ones stay until the group is deleted or a trim cuts them), or
+  the shard's queues and groups are at their shared cap. `groupRead` returns the
+  new `error.GroupHeldFull`, never retried; the stream worker logs it once and
+  backs off, as for `limit`.
+- `Ran` is non-exhaustive: an unknown value keeps the refusal's status and
+  message, and is never retried.
 - **Breaking:** a group nack's error travels in the body, up to 1024 bytes
   (`MAX_NACK_ERROR`); a longer one is `error.ValueTooLarge` before sending. The
   `error_text` option tag is gone.
 - New `StreamGroupNackOptions.abandon`: hands records back unstarted, ready at
   once, the delivery counted but no failure, so they never dead-letter. It
   takes no `delay_ms`, `dead` or error (`error.BadRequest`). The stream
-  worker's `stop()` now abandons its unstarted records rather than nacking them.
+  worker's `stop()` now abandons its unstarted records rather than nacking them,
+  and a record whose handler returns an error after the stop too; the new
+  `StreamContext.stopping()` lets a long handler cut itself short.
 - A group ack, nack or touch for a group that isn't there is `error.NotFound`
   as a whole, not every record `gone`; the stream worker logs it as such.
 - **Breaking:** `PeekedMessage.attempts` and `DeadLetter.attempts` are

@@ -1476,7 +1476,6 @@ test "a refusal whose body isn't [reason][ran][message] is refused, not guessed 
     var srv = try test_server.OkServer.listen();
     srv.replies = &.{
         .{ .status = 3, .body = "\x01\x00" },
-        .{ .status = 3, .body = "\x01\x00\x09x" },
     };
     try srv.start();
     defer srv.deinit();
@@ -1485,13 +1484,11 @@ test "a refusal whose body isn't [reason][ran][message] is refused, not guessed 
     defer client.deinit();
     try client.connect();
     var kv = KV.init(&client);
-    for (0..2) |_| {
-        try std.testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
-        try std.testing.expect(client.lastError() == null);
-    }
+    try std.testing.expectError(FloError.IncompleteResponse, kv.get("k", .{}));
+    try std.testing.expect(client.lastError() == null);
 }
 
-test "a reason this SDK predates decodes as its number, with its status and message" {
+test "a reason or ran this SDK predates decodes as its number, with its status and message" {
     var srv = try test_server.OkServer.listen();
     srv.replies = &.{
         // Reason 257: read as a byte it would pass as unknown_op.
@@ -1499,6 +1496,8 @@ test "a reason this SDK predates decodes as its number, with its status and mess
         .{ .status = 3, .body = "\xff\xff\x02x" },
         // An unknown status and an unknown reason.
         .{ .status = 200, .body = "\x63\x00\x00both new" },
+        // An unknown ran, under overloaded: kept, and not retried.
+        .{ .status = 10, .body = "\x06\x00\x09busy" },
     };
     try srv.start();
     defer srv.deinit();
@@ -1524,6 +1523,12 @@ test "a reason this SDK predates decodes as its number, with its status and mess
     try std.testing.expectEqual(@as(u8, 200), last.code);
     try std.testing.expectEqual(@as(u16, 99), @intFromEnum(last.reason));
     try std.testing.expectEqualStrings("both new", last.message);
+
+    try std.testing.expectError(FloError.Overloaded, kv.get("k", .{}));
+    last = client.lastError().?;
+    try std.testing.expectEqual(@as(u8, 9), @intFromEnum(last.ran));
+    try std.testing.expectEqualStrings("busy", last.message);
+    try std.testing.expectEqual(@as(u32, 4), srv.requests.load(.acquire));
 }
 
 test "values up to the server's bounds go out in one frame; a frame over it is refused unsent" {

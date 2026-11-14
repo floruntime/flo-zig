@@ -371,11 +371,15 @@ deleted) is `error.NotFound` as a whole. Groups have no join, leave or
 claim. The first read of a group creates it at the defaults; a group name
 is at most 256 bytes.
 
-A group whose consumers hold too many records unacked, or that holds dead
-ones, takes nothing new: a read returns `error.GroupHeldFull` (status
-`overloaded`, reason `group_held_full`). Reading again won't help until they
-ack or nack, so the client doesn't retry it; the stream worker logs it once
-and backs off.
+A group holding as many records as its caps allow (leased, ready and dead
+together), or a shard whose queues and groups together hold their cap of
+bytes, takes nothing new: a read returns `error.GroupHeldFull` (status
+`overloaded`, reason `group_held_full`; the message says which cap). Reading
+again won't help, so the client doesn't retry it; the stream worker logs it
+once and backs off. The group's room comes back as its consumers ack or nack,
+but dead records count too and stay until the group is deleted or a trim of
+the stream cuts them. At the shard's cap, it clears as other groups and
+queues on the shard drain.
 
 A nack carries an error of up to 1024 bytes. A nack with `.abandon = true`
 hands records back unstarted: ready at once, the delivery counted but no
@@ -662,7 +666,7 @@ All operations return `flo.FloError` which includes:
 - `StaleNotFound` - `get` or `jsonGet` on a halted shard: the key is missing as of the halt, which isn't the same as missing
 - `StaleReport` - An action complete, fail or touch for a delivery that has moved on (never resent)
 - `Limit` - The node or shard is at a limit on what it holds (status `limit`); `lastError().?.reason` names which: `memory_budget`, `too_many_actions` (counted per shard), `too_many_workflow_definitions` or `too_many_workflow_runs`. The limits are built into the server, not settings: retrying won't clear it until something is deleted (or, for the memory budget, the node gets more memory), so nothing retries it. It doesn't mean permanent. It never ran
-- `GroupHeldFull` - A group read took nothing new: the group's consumers hold too many records unacked, or it holds dead ones (status `overloaded`, reason `group_held_full`). Not retried: it clears once they ack or nack
+- `GroupHeldFull` - A group read took nothing new (status `overloaded`, reason `group_held_full`): the group is at its caps, leased, ready and dead records together, or the shard's queues and groups are at their shared cap. Not retried. It clears as the group's records are acked or nacked, its dead records removed (deleting the group, or a stream trim), or, at the shard's cap, as other groups and queues drain
 - `UnexpectedResponse` - Unexpected response format
 - `ServerError` - Generic server error, including status codes this SDK doesn't know
 
@@ -759,8 +763,12 @@ lease (at least 100 ms apart, counted from the batch's arrival), re-pacing off e
 touch answer's expiry. A touch refused conflict, not_found or bad_request stops the
 touching; any other failure is tried again with back-off, and a record the server
 refuses is dropped from it. A record left past its lease is read again, by this
-consumer or another. `stop()` lets started records finish and abandons the
-unstarted ones: ready at once for the next read, spending none of their attempts.
+consumer or another. `stop()` lets started records finish (it can't interrupt a
+handler; a long one can check `ctx.stopping()` and return an error) and abandons
+the unstarted ones: ready at once for the next read, spending none of their
+attempts. A record whose handler returns an error after the stop is abandoned
+too, not nacked, so a rolling restart doesn't spend an attempt on it (at
+`max_deliver` 1 it would be dead); an error while the worker runs is still a nack.
 A report refused `not_found` (the group was deleted) is logged as such, not taken
 as done.
 

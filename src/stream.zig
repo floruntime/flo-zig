@@ -370,9 +370,10 @@ pub const Stream = struct {
     /// lease, or touch it: one left past `result.expires_at_ms` is ready
     /// again for the next read, and one nacked or expired as many times as
     /// the group's attempts is dead. None within `block_ms` is an empty
-    /// result. A group whose consumers hold too many records unacked (or
-    /// that holds dead ones) takes nothing new: `FloError.GroupHeldFull`,
-    /// not retried, as reading again won't help until they ack or nack.
+    /// result. A group at its caps (leased, ready and dead records
+    /// together), or a shard whose queues and groups are at theirs, takes
+    /// nothing new: `FloError.GroupHeldFull`, not retried, as reading again
+    /// won't help (see the error for what clears it).
     /// **Caller owns the returned `GroupReadResult` and must call `result.deinit()`.**
     pub fn groupRead(
         self: *Stream,
@@ -1196,12 +1197,13 @@ test "an abandon is the abandon flag alone, and refused unsent with a delay, dea
 
     const lease: types.GroupLease = .{ .term = 3, .index = 9 };
     const recs = [_]types.StreamRecord{.{ .id = .{ .timestamp_ms = 100, .sequence = 7 }, .payload = "", .deliveries = 2 }};
+    const named = "\x01\x00g\x02\x00c1" ++ le(@as(u64, 3)) ++ le(@as(u64, 9)) ++ le(@as(u32, 1)) ++ le(@as(u64, 100)) ++ le(@as(u64, 7)) ++ le(@as(u32, 2));
     var back = try stream.groupNack("events", "g", lease, &recs, .{ .consumer = "c1", .abandon = true });
     defer back.deinit();
     try std.testing.expectEqual(@as(u16, 0x159), srv.last_op);
     // abandon (0x34), void; the body ends with an empty error.
     try std.testing.expectEqualSlices(u8, "\x34\x00", srv.lastOptions());
-    try std.testing.expect(std.mem.endsWith(u8, srv.lastValue(), "\x00\x00"));
+    try std.testing.expectEqualSlices(u8, named ++ "\x00\x00", srv.lastValue());
 
     try std.testing.expectError(FloError.BadRequest, stream.groupNack("events", "g", lease, &recs, .{ .abandon = true, .dead = true }));
     try std.testing.expectError(FloError.BadRequest, stream.groupNack("events", "g", lease, &recs, .{ .abandon = true, .delay_ms = 1 }));
