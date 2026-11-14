@@ -15,10 +15,11 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0xc688167b51fcc846;
+pub const TABLE_HASH: u64 = 0xc1f93eb0ed86a281;
 
-/// Why the server refused a request. Mirrors the server's list; the table
-/// hash covers it, so a server can't send one this SDK doesn't know.
+/// Why the server refused a request. Mirrors the server's list. A reason
+/// this SDK predates still decodes, as its number (`_`), with the status
+/// and message beside it: the status says whether to retry.
 pub const Reason = enum(u16) {
     unknown_op = 1,
     malformed = 2,
@@ -82,12 +83,23 @@ pub const Reason = enum(u16) {
     job_running = 31,
     /// Status limit: the node's memory budget is spent.
     memory_budget = 32,
-    /// Status limit: the node holds as many actions as it registers.
+    /// Status limit: the shard holds as many actions as it registers.
     too_many_actions = 33,
     /// Status limit: the node holds as many workflow definitions as it keeps.
     too_many_workflow_definitions = 34,
     /// Status limit: the node holds as many workflow runs as it keeps.
     too_many_workflow_runs = 35,
+    /// Status overloaded: the queue holds as many messages or bytes as its
+    /// caps allow, or the shard's queues and groups together do. It drains
+    /// as messages are acked, so the client retries it.
+    queue_full = 36,
+    /// Status overloaded: a group read took nothing new. Either the group
+    /// holds as many records as its caps allow, leased, ready and dead
+    /// together, or the shard's queues and groups together hold their cap
+    /// of bytes. See `FloError.GroupHeldFull`; never retried.
+    group_held_full = 37,
+
+    _,
 };
 
 /// Whether a refused request took effect: retry logic reads this, not the
@@ -98,6 +110,8 @@ pub const Ran = enum(u8) {
     yes = 1,
     /// It may still take effect; check before resending.
     unknown = 2,
+    /// A value this SDK predates: treated as unknown, so never retried.
+    _,
 };
 
 /// Size limits (for client-side validation)
@@ -210,7 +224,7 @@ pub fn pauseUnlessHalted(running: *const bool, halt: ?*const bool, ms: u64) void
 /// not once per tick, even when reasons alternate. `clear` after a call
 /// that succeeds, so a limit hit again later is logged again.
 pub const LimitNotice = struct {
-    /// The reasons logged since the last clear; the server has four.
+    /// The reasons logged since the last clear.
     seen: [8]Reason = undefined,
     seen_len: usize = 0,
 
@@ -223,7 +237,8 @@ pub const LimitNotice = struct {
             self.seen[self.seen_len] = last.reason;
             self.seen_len += 1;
         }
-        std.log.warn(what ++ " refused at a limit ({s}): {s}; backing off, not retrying it until it passes", .{ std.enums.tagName(Reason, last.reason) orelse "unknown", last.message });
+        const hint = if (last.reason == .group_held_full) " (it clears as the group's records are acked or nacked, its dead records removed by deleting the group or trimming the stream, or, at the shard's cap, as other groups and queues drain)" else "";
+        std.log.warn(what ++ " refused at a limit ({s}): {s}; backing off, not retrying it until it passes{s}", .{ std.enums.tagName(Reason, last.reason) orelse "unknown", last.message, hint });
     }
 
     pub fn logged(self: *const LimitNotice, reason: Reason) bool {
@@ -397,9 +412,10 @@ pub const StatusCode = enum(u8) {
     /// missing key. Reads, lists and scans in a namespace never created
     /// answer this; a write creates the namespace.
     no_namespace = 14,
-    /// The node is at a limit on what it holds; the reason names which.
-    /// Terminal: retrying won't clear it until something is deleted, the
-    /// node is given more room, or the setting is raised. It never ran.
+    /// The node or shard is at a limit on what it holds; the reason names
+    /// which. The limits are built into the server, not settings: retrying
+    /// won't clear it until something is deleted (the memory budget: or the
+    /// node is given more memory). It never ran.
     limit = 15,
 
     // The server may send codes this SDK predates; `_` keeps them a value
@@ -424,7 +440,7 @@ pub const StatusCode = enum(u8) {
             .unavailable => "Unavailable: no leader or the shard isn't taking writes; retry",
             .outcome_pending => "Committed, not applied: its shard halted; don't resend it unchanged",
             .no_namespace => "No such namespace",
-            .limit => "At a limit: delete something, give the node more room, or raise the setting",
+            .limit => "At a limit: delete something first",
             // No buffer to format the code into; Client.lastError has it.
             _ => "Unknown status",
         };
@@ -476,7 +492,7 @@ pub const OptionTag = enum(u8) {
     ack_timeout_ms = 0x30, // u32: A group's lease: a record not acked this long is redelivered (5 s to 12 h)
     max_deliver = 0x31, // u8: A group's attempts: a record is dead once nacked or expired this many times (1 to 255)
     dead = 0x32, // void: A nack's records are dead now
-    error_text = 0x33, // string: Why a nack's records failed
+    abandon = 0x34, // void: A nack hands its records back unstarted: ready at once, no failure counted
 
     // Time-Series Options (0x60 - 0x6F)
     ts_from_ms = 0x60, // i64: Start of time range (inclusive, unix ms)
@@ -560,13 +576,24 @@ pub const FloError = error{
     /// (status conflict, reason stale_report); Client.lastError's message
     /// says how. Not resent: it would be refused again.
     StaleReport,
-    /// The node is at a limit on what it holds (status limit); the reason
-    /// (`Client.lastError`) names which: memory_budget, too_many_actions,
-    /// too_many_workflow_definitions or too_many_workflow_runs, and its
-    /// message says more. Terminal: retrying won't clear it until
-    /// something is deleted, the node is given more room, or the setting is
-    /// raised, so it is never retried. Not permanent. It never ran.
+    /// The node or shard is at a limit on what it holds (status limit);
+    /// the reason (`Client.lastError`) names which: memory_budget,
+    /// too_many_actions (counted per shard), too_many_workflow_definitions
+    /// or too_many_workflow_runs, and its message says more. The limits are
+    /// built into the server, not settings: retrying won't clear it until
+    /// something is deleted (or, for the memory budget, the node is given
+    /// more memory), so it is never retried. Not permanent. It never ran.
     Limit,
+    /// A group read took nothing new (status overloaded, reason
+    /// group_held_full): the group holds as many records as its caps
+    /// allow, leased, ready and dead together, or the shard's queues and
+    /// groups together hold their cap of bytes. Reading again won't help,
+    /// so it is never retried; back off, as for `Limit`. The group's room
+    /// comes back as its consumers ack or nack, but dead records count too
+    /// and stay until the group is deleted or a trim of the stream cuts
+    /// them. At the shard's cap, it clears as other groups and queues on
+    /// the shard drain. The message says which cap.
+    GroupHeldFull,
     UnexpectedResponse,
 
     // Transaction errors
@@ -968,7 +995,8 @@ pub const DeadLetter = struct {
     size: u32,
     payload: []const u8,
     enqueued_at_ms: i64,
-    attempts: u32,
+    /// Times it was delivered.
+    deliveries: u32,
     priority: u8,
     /// When it was moved to the DLQ, in Unix milliseconds.
     moved_at_ms: i64,
@@ -1004,7 +1032,8 @@ pub const PeekOptions = struct {
 pub const PeekedMessage = struct {
     seq: u64,
     priority: u32,
-    attempts: u32,
+    /// Times it was delivered.
+    deliveries: u32,
     enqueued_at_ms: i64,
     /// The payload's whole length; `payload` holds at most 4 KiB of it.
     size: u32,
@@ -1246,9 +1275,18 @@ pub const StreamGroupNackOptions = struct {
     delay_ms: u64 = 0,
     /// Dead now, attempts left or not.
     dead: bool = false,
-    /// Why they failed, at most 255 bytes.
+    /// Why they failed, at most `MAX_NACK_ERROR` bytes.
     error_message: []const u8 = "",
+    /// Hand them back unstarted: ready at once, the delivery counted but
+    /// no failure, so an abandoned record never dead-letters. Only for
+    /// records the worker never started (it is stopping); a record that
+    /// failed is nacked without it, or a poison record cycles forever.
+    /// Takes no `delay_ms`, `dead` or `error_message`.
+    abandon: bool = false,
 };
+
+/// The longest error a group nack carries.
+pub const MAX_NACK_ERROR: usize = 1024;
 
 /// The delivery a group read made: an ack, nack or touch names it back.
 pub const GroupLease = struct {
@@ -2174,9 +2212,12 @@ test "limit is its own terminal error, its reasons decode by name, and the txn r
         .{ 34, .too_many_workflow_definitions },
         .{ 35, .too_many_workflow_runs },
     }) |c| try std.testing.expectEqual(c[1], std.enums.fromInt(Reason, c[0]).?);
-    var next: u16 = 36;
-    _ = &next;
-    try std.testing.expect(std.enums.fromInt(Reason, next) == null);
+    // One this SDK predates is kept as its number.
+    const next: Reason = @enumFromInt(38);
+    try std.testing.expectEqual(@as(u16, 38), @intFromEnum(next));
+    try std.testing.expect(std.enums.tagName(Reason, next) == null);
+    try std.testing.expectEqual(Reason.queue_full, @as(Reason, @enumFromInt(36)));
+    try std.testing.expectEqual(Reason.group_held_full, @as(Reason, @enumFromInt(37)));
     try std.testing.expect(!@hasField(Reason, "wrong_routing_key"));
     // The removed group ops are gone from the SDK.
     for ([_]u16{ 0x151, 0x152, 0x155, 0x157 }) |code| {

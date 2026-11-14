@@ -369,6 +369,15 @@ pub fn valueOf(req: []const u8) []const u8 {
     return req[off + 4 ..][0..len];
 }
 
+/// The options of a request logged by ScriptServer, which must not be a
+/// table op's: `[options_len:u16][options]` after the value.
+pub fn optionsOf(req: []const u8) []const u8 {
+    const value = valueOf(req);
+    const off = @intFromPtr(value.ptr) - @intFromPtr(req.ptr) + value.len;
+    const len = std.mem.readInt(u16, req[off..][0..2], .little);
+    return req[off + 2 ..][0..len];
+}
+
 /// Whether two requests are the same apart from their request id and the
 /// header CRC32C that covers it.
 pub fn sameApartFromId(a: []const u8, b: []const u8) bool {

@@ -35,9 +35,12 @@ pub fn nsFromMs(ms: u64) u64 {
 /// Whether an answer with `status` and the refusal body's `ran` and
 /// `reason` is one the server says it didn't run, of a kind worth sending
 /// again. A halted shard's refusal isn't: it takes no writes until an
-/// operator repairs it.
+/// operator repairs it. Nor is a group read at its held cap: it clears
+/// as the group's records are acked, nacked or removed, or the shard's
+/// other groups and queues drain, not by reading again. Nor is a `ran`
+/// this SDK predates: only `no` is safe to resend.
 pub fn isRefusedUnrun(status: types.StatusCode, ran: types.Ran, reason: types.Reason) bool {
-    return (status == .overloaded or status == .unavailable) and ran == .no and reason != .shard_halted;
+    return (status == .overloaded or status == .unavailable) and ran == .no and reason != .shard_halted and reason != .group_held_full;
 }
 
 /// A capped, doubling, fully jittered wait.
@@ -91,12 +94,16 @@ pub fn seededPrng() std.Random.DefaultPrng {
     return std.Random.DefaultPrng.init(seed);
 }
 
-test "isRefusedUnrun: only overloaded or unavailable with ran = no, and not a halted shard" {
+test "isRefusedUnrun: only overloaded or unavailable with ran = no, not a halted shard or a group at its held cap" {
     try std.testing.expect(isRefusedUnrun(.overloaded, .no, .shard_busy));
     try std.testing.expect(isRefusedUnrun(.unavailable, .no, .leader_unknown));
     try std.testing.expect(!isRefusedUnrun(.unavailable, .no, .shard_halted));
     try std.testing.expect(!isRefusedUnrun(.outcome_pending, .unknown, .shard_halted));
     try std.testing.expect(!isRefusedUnrun(.overloaded, .unknown, .shard_busy));
+    try std.testing.expect(isRefusedUnrun(.overloaded, .no, .queue_full));
+    try std.testing.expect(!isRefusedUnrun(.overloaded, .no, .group_held_full));
+    try std.testing.expect(isRefusedUnrun(.overloaded, .no, @enumFromInt(999)));
+    try std.testing.expect(!isRefusedUnrun(.overloaded, @enumFromInt(9), .shard_busy));
     try std.testing.expect(!isRefusedUnrun(.unavailable, .yes, .unclassified));
     try std.testing.expect(!isRefusedUnrun(.conflict, .no, .unclassified));
     try std.testing.expect(!isRefusedUnrun(.internal_error, .no, .internal));

@@ -304,7 +304,7 @@ pub const ActionWorker = struct {
     /// Registering replaces the action's settings, so workers
     /// that register one action with different options leave it with
     /// whichever registered last. `options.namespace` is ignored: the action
-    /// goes in the worker's. A node at its action limit returns
+    /// goes in the worker's. A shard at its action limit returns
     /// `error.Limit` after one request, registering nothing.
     pub fn registerAction(self: *Self, action_name: []const u8, handler: ActionHandler, options: types.ActionRegisterOptions) !void {
         if (self.handlers.contains(action_name)) {

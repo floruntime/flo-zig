@@ -289,10 +289,12 @@ defer taken.deinit();
 // Remove every message, ready, leased and dead; returns how many
 const removed = try queue.purge("queue-name", .{});
 
-// A queue holds at most its cap of messages and bytes (server settings). Past
-// one, an enqueue is refused `overloaded` without running; the client retries
-// it like any such refusal (about 350 ms), then returns error.Overloaded, and
-// `client.lastError()` names the cap.
+// A queue holds at most its cap of messages and bytes, and a shard's queues
+// and groups together a cap of bytes (server settings). Past one, an enqueue
+// is refused `overloaded`, reason `queue_full`, without running. It drains as
+// messages are acked, so the client retries it like any such refusal (about
+// 350 ms), then returns error.Overloaded, and `client.lastError()` names the
+// cap: back off and send again.
 
 // The next ready messages, 1 to 100, in dequeue order, without taking them;
 // each shows up to 4 KiB of its payload (`size` is its whole length)
@@ -364,8 +366,26 @@ record nacked or expired `max_deliver` times (5 by default) is dead, and
 stays until the group is deleted. Ack, nack and touch name the read's
 `lease` and each record's `deliveries`; one for a delivery that has moved
 on applies nothing, and its `GroupReport` says why (`delivered_again`,
-`expired`, ...). Groups have no join, leave or claim. The first read of a
-group creates it at the defaults; a group name is at most 256 bytes.
+`expired`, ...). A report to a group that isn't there (never made, or
+deleted) is `error.NotFound` as a whole. Groups have no join, leave or
+claim. The first read of a group creates it at the defaults; a group name
+is at most 256 bytes.
+
+A group holding as many records as its caps allow (leased, ready and dead
+together), or a shard whose queues and groups together hold their cap of
+bytes, takes nothing new: a read returns `error.GroupHeldFull` (status
+`overloaded`, reason `group_held_full`; the message says which cap). Reading
+again won't help, so the client doesn't retry it; the stream worker logs it
+once and backs off. The group's room comes back as its consumers ack or nack,
+but dead records count too and stay until the group is deleted or a trim of
+the stream cuts them. At the shard's cap, it clears as other groups and
+queues on the shard drain.
+
+A nack carries an error of up to 1024 bytes. A nack with `.abandon = true`
+hands records back unstarted: ready at once, the delivery counted but no
+failure, so it never dead-letters. Abandon only records you never started
+(a worker stopping); nack a failure without it, or a poison record cycles
+forever. It takes no `delay_ms`, `dead` or error.
 
 ```zig
 var stream = flo.Stream.init(&client);
@@ -394,7 +414,7 @@ if (batch.records.len > 0) {
 }
 
 // Or: nack (ready again after delay_ms, or dead), or touch to keep holding
-// var n = try stream.groupNack("events", "my-group", batch.lease, batch.records, .{ .consumer = "worker-1", .delay_ms = 1000 });
+// var n = try stream.groupNack("events", "my-group", batch.lease, batch.records, .{ .consumer = "worker-1", .delay_ms = 1000, .error_message = "timeout" });
 
 // The group's records by state, its consumers holding records, and the
 // stream's groups
@@ -645,19 +665,23 @@ All operations return `flo.FloError` which includes:
 - `OutcomePending` - The write committed but hasn't applied, because its shard halted (never retried)
 - `StaleNotFound` - `get` or `jsonGet` on a halted shard: the key is missing as of the halt, which isn't the same as missing
 - `StaleReport` - An action complete, fail or touch for a delivery that has moved on (never resent)
-- `Limit` - The node is at a limit on what it holds (status `limit`); `lastError().?.reason` names which: `memory_budget`, `too_many_actions`, `too_many_workflow_definitions` or `too_many_workflow_runs`. Terminal: retrying won't clear it until something is deleted, the node gets more room, or the setting is raised, so nothing retries it. It doesn't mean permanent. It never ran
+- `Limit` - The node or shard is at a limit on what it holds (status `limit`); `lastError().?.reason` names which: `memory_budget`, `too_many_actions` (counted per shard), `too_many_workflow_definitions` or `too_many_workflow_runs`. The limits are built into the server, not settings: retrying won't clear it until something is deleted (or, for the memory budget, the node gets more memory), so nothing retries it. It doesn't mean permanent. It never ran
+- `GroupHeldFull` - A group read took nothing new (status `overloaded`, reason `group_held_full`): the group is at its caps, leased, ready and dead records together, or the shard's queues and groups are at their shared cap. Not retried. It clears as the group's records are acked or nacked, its dead records removed (deleting the group, or a stream trim), or, at the shard's cap, as other groups and queues drain
 - `UnexpectedResponse` - Unexpected response format
 - `ServerError` - Generic server error, including status codes this SDK doesn't know
 
 Zig errors carry no payload: after a failed call, `client.lastError()` gives the
-numeric status and the server's message.
+numeric status, the reason and the server's message. A status or reason this
+SDK predates still decodes, keeping its number (`std.enums.tagName` is null for
+it).
 
 ### Retries
 
 When the server refuses a request as `overloaded` or `unavailable` and says it
 didn't run it (`client.lastError().?.ran == .no`), the client sends it again
 itself, as a new request with a new request id, after a jittered wait. Because
-the server never ran it, this is safe for writes too. Any other refusal, or one
+the server never ran it, this is safe for writes too. A group read refused
+`group_held_full` is the exception: it is returned at once. Any other refusal, or one
 that may have run, comes straight back.
 
 The client never retries two refusals from a halted shard. `unavailable` with
@@ -702,7 +726,7 @@ The action and stream workers wait the same way between failed polls, from
 ends a wait within about 10 ms. A group read refused `unavailable` without
 running (its records are still being read from disk, say) is read again with
 the same group and consumer: it leased nothing. For `limit`, start fails with the limit error; a limit hit while running is
-logged and backed off: a registration refused `limit` makes `start()` return
+logged and backed off (a group read refused `group_held_full` too): a registration refused `limit` makes `start()` return
 `error.Limit` after one request, with the reason and message in
 `lastError()`, and a poll refused `limit` is backed off the same way as any
 other, never spun on, and logged once per reason until a poll succeeds. `WorkerConfig` and `StreamWorkerConfig` take a `retry` field
@@ -739,8 +763,14 @@ lease (at least 100 ms apart, counted from the batch's arrival), re-pacing off e
 touch answer's expiry. A touch refused conflict, not_found or bad_request stops the
 touching; any other failure is tried again with back-off, and a record the server
 refuses is dropped from it. A record left past its lease is read again, by this
-consumer or another. `stop()` lets started records finish and hands the unstarted
-ones back at once with a nack, which spends one of their attempts.
+consumer or another. `stop()` lets started records finish (it can't interrupt a
+handler; a long one can check `ctx.stopping()` and return an error) and abandons
+the unstarted ones: ready at once for the next read, spending none of their
+attempts. A record whose handler returns an error after the stop is abandoned
+too, not nacked, so a rolling restart doesn't spend an attempt on it (at
+`max_deliver` 1 it would be dead); an error while the worker runs is still a nack.
+A report refused `not_found` (the group was deleted) is logged as such, not taken
+as done.
 
 A worker polls and tells the server of its own `drain()` on one connection, so the
 drain goes out once the held poll returns, up to `block_ms`. A drain sent from

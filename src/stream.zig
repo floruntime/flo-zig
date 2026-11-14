@@ -370,7 +370,10 @@ pub const Stream = struct {
     /// lease, or touch it: one left past `result.expires_at_ms` is ready
     /// again for the next read, and one nacked or expired as many times as
     /// the group's attempts is dead. None within `block_ms` is an empty
-    /// result.
+    /// result. A group at its caps (leased, ready and dead records
+    /// together), or a shard whose queues and groups are at theirs, takes
+    /// nothing new: `FloError.GroupHeldFull`, not retried, as reading again
+    /// won't help (see the error for what clears it).
     /// **Caller owns the returned `GroupReadResult` and must call `result.deinit()`.**
     pub fn groupRead(
         self: *Stream,
@@ -394,12 +397,17 @@ pub const Stream = struct {
 
         var response = try self.client.sendRequest(.stream_group_read, self.client.getNamespace(options.namespace), stream_name, w.buffered(), builder.getOptions());
         defer response.deinit();
-        if (response.status != .ok) return response.status.toError();
+        if (response.status != .ok) {
+            if (response.status == .overloaded) if (self.client.lastError()) |last| if (last.reason == .group_held_full) return FloError.GroupHeldFull;
+            return response.status.toError();
+        }
         return parseGroupReadResponse(self.client.allocator, response.data);
     }
 
     /// Ack records a group read leased: they are done. Each record is
     /// applied or refused on its own; one refused `gone` was acked already.
+    /// A report to a group that isn't there (never made, or deleted) is
+    /// `FloError.NotFound` as a whole, not each record gone.
     /// **Caller owns the returned `GroupReport` and must call `report.deinit()`.**
     pub fn groupAck(
         self: *Stream,
@@ -409,12 +417,20 @@ pub const Stream = struct {
         records: []const types.StreamRecord,
         options: types.StreamGroupReportOptions,
     ) FloError!types.GroupReport {
-        return self.groupReport(.stream_group_ack, stream_name, group, lease, records, options.consumer, options.namespace, "");
+        return self.groupReport(.stream_group_ack, stream_name, group, lease, records, options.consumer, options.namespace, "", null);
     }
 
     /// Nack records a group read leased: ready again after
     /// `options.delay_ms`, or dead once the group's attempts are spent (or
-    /// at once with `options.dead`).
+    /// at once with `options.dead`). `options.error_message` (at most
+    /// `MAX_NACK_ERROR` bytes) is kept with them.
+    ///
+    /// `options.abandon` hands them back unstarted instead: ready at once,
+    /// the delivery counted but no failure, so they never dead-letter. Use
+    /// it only for records never started (a worker stopping); nack a
+    /// failure without it, or a poison record cycles forever. The server
+    /// refuses it with `delay_ms`, `dead` or an error; so does this, before
+    /// sending.
     /// **Caller owns the returned `GroupReport` and must call `report.deinit()`.**
     pub fn groupNack(
         self: *Stream,
@@ -425,12 +441,14 @@ pub const Stream = struct {
         options: types.StreamGroupNackOptions,
     ) FloError!types.GroupReport {
         if (options.delay_ms > types.MAX_FAIL_DELAY_MS) return FloError.BadRequest;
-        var opts_buf: [16 + 2 + 255]u8 = undefined;
+        if (options.error_message.len > types.MAX_NACK_ERROR) return FloError.ValueTooLarge;
+        if (options.abandon and (options.dead or options.delay_ms > 0 or options.error_message.len > 0)) return FloError.BadRequest;
+        var opts_buf: [16]u8 = undefined;
         var builder = wire.OptionsBuilder.init(&opts_buf);
         if (options.delay_ms > 0) try builder.addU64(.delay_ms, options.delay_ms);
         if (options.dead) try builder.addFlag(.dead);
-        if (options.error_message.len > 0) try builder.addBytes(.error_text, options.error_message);
-        return self.groupReport(.stream_group_nack, stream_name, group, lease, records, options.consumer, options.namespace, builder.getOptions());
+        if (options.abandon) try builder.addFlag(.abandon);
+        return self.groupReport(.stream_group_nack, stream_name, group, lease, records, options.consumer, options.namespace, builder.getOptions(), options.error_message);
     }
 
     /// Keep records a group read leased: with half their lease or less
@@ -446,7 +464,7 @@ pub const Stream = struct {
         records: []const types.StreamRecord,
         options: types.StreamGroupReportOptions,
     ) FloError!types.GroupReport {
-        return self.groupReport(.stream_group_touch, stream_name, group, lease, records, options.consumer, options.namespace, "");
+        return self.groupReport(.stream_group_touch, stream_name, group, lease, records, options.consumer, options.namespace, "", null);
     }
 
     fn groupReport(
@@ -459,9 +477,11 @@ pub const Stream = struct {
         consumer: []const u8,
         namespace: ?[]const u8,
         options: []const u8,
+        /// A nack's error, `[error_len:u16][error]` after the records.
+        nack_error: ?[]const u8,
     ) FloError!types.GroupReport {
         if (records.len < 1 or records.len > types.MAX_GROUP_BATCH) return FloError.BadRequest;
-        var buf: [4 + types.MAX_GROUP_NAME + types.MAX_GROUP_CONSUMER + 20 + types.MAX_GROUP_BATCH * 20]u8 = undefined;
+        var buf: [4 + types.MAX_GROUP_NAME + types.MAX_GROUP_CONSUMER + 20 + types.MAX_GROUP_BATCH * 20 + 2 + types.MAX_NACK_ERROR]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         try writeName(&w, group, types.MAX_GROUP_NAME);
         try writeName(&w, consumer, types.MAX_GROUP_CONSUMER);
@@ -472,6 +492,10 @@ pub const Stream = struct {
             w.writeInt(u64, rec.id.timestamp_ms, .little) catch unreachable;
             w.writeInt(u64, rec.id.sequence, .little) catch unreachable;
             w.writeInt(u32, rec.deliveries, .little) catch unreachable;
+        }
+        if (nack_error) |text| {
+            w.writeInt(u16, @intCast(text.len), .little) catch unreachable;
+            w.writeAll(text) catch unreachable;
         }
         var response = try self.client.sendRequest(op, self.client.getNamespace(namespace), stream_name, w.buffered(), options);
         defer response.deinit();
@@ -1107,9 +1131,10 @@ test "ack, nack and touch name the read's lease and each record's deliveries, an
     var stale = try stream.groupNack("events", "g", lease, &recs, .{ .consumer = "c1", .delay_ms = 1000, .dead = true, .error_message = "bad" });
     defer stale.deinit();
     try std.testing.expectEqual(@as(u16, 0x159), srv.last_op);
-    try std.testing.expectEqualSlices(u8, named, srv.lastValue());
-    // delay_ms (0x11, u64), dead (0x32), error_text (0x33).
-    try std.testing.expectEqualSlices(u8, "\x11\x08" ++ le(@as(u64, 1000)) ++ "\x32\x00\x33\x03bad", srv.lastOptions());
+    // The error follows the records in the body; delay_ms (0x11, u64) and
+    // dead (0x32) are options.
+    try std.testing.expectEqualSlices(u8, named ++ "\x03\x00bad", srv.lastValue());
+    try std.testing.expectEqualSlices(u8, "\x11\x08" ++ le(@as(u64, 1000)) ++ "\x32\x00", srv.lastOptions());
     try std.testing.expectEqual(@as(u32, 0), stale.applied);
     try std.testing.expectEqual(types.GroupRefusalWhy.delivered_again, stale.refused[0].why);
     try std.testing.expectEqual(types.StreamID{ .timestamp_ms = 100, .sequence = 7 }, stale.refused[0].id);
@@ -1126,8 +1151,103 @@ test "ack, nack and touch name the read's lease and each record's deliveries, an
 
     try std.testing.expectError(FloError.BadRequest, stream.groupAck("events", "g", lease, &.{}, .{}));
     try std.testing.expectError(FloError.BadRequest, stream.groupNack("events", "g", lease, &recs, .{ .delay_ms = types.MAX_FAIL_DELAY_MS + 1 }));
-    try std.testing.expectError(FloError.OptionValueTooLarge, stream.groupNack("events", "g", lease, &recs, .{ .error_message = "e" ** 256 }));
     try std.testing.expectEqual(@as(u32, 4), srv.requests.load(.acquire));
+}
+
+test "a nack carries an error of up to 1024 bytes in its body, 0 for none; a longer one is refused unsent" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    const applied = le(@as(u32, 1)) ++ le(@as(u32, 0));
+    srv.replies = &.{ .{ .status = 0, .body = &applied }, .{ .status = 0, .body = &applied } };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    const lease: types.GroupLease = .{ .term = 3, .index = 9 };
+    const recs = [_]types.StreamRecord{.{ .id = .{ .timestamp_ms = 100, .sequence = 7 }, .payload = "", .deliveries = 2 }};
+    const named = "\x01\x00g\x02\x00c1" ++ le(@as(u64, 3)) ++ le(@as(u64, 9)) ++ le(@as(u32, 1)) ++ le(@as(u64, 100)) ++ le(@as(u64, 7)) ++ le(@as(u32, 2));
+
+    const longest = "e" ** types.MAX_NACK_ERROR;
+    var full = try stream.groupNack("events", "g", lease, &recs, .{ .consumer = "c1", .error_message = longest });
+    defer full.deinit();
+    try std.testing.expectEqualSlices(u8, named ++ le(@as(u16, types.MAX_NACK_ERROR)) ++ longest, srv.lastValue());
+    try std.testing.expectEqualSlices(u8, "", srv.lastOptions());
+
+    var none = try stream.groupNack("events", "g", lease, &recs, .{ .consumer = "c1" });
+    defer none.deinit();
+    try std.testing.expectEqualSlices(u8, named ++ "\x00\x00", srv.lastValue());
+
+    try std.testing.expectError(FloError.ValueTooLarge, stream.groupNack("events", "g", lease, &recs, .{ .error_message = longest ++ "e" }));
+    try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.acquire));
+}
+
+test "an abandon is the abandon flag alone, and refused unsent with a delay, dead or an error" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{.{ .status = 0, .body = &(le(@as(u32, 1)) ++ le(@as(u32, 0))) }};
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    const lease: types.GroupLease = .{ .term = 3, .index = 9 };
+    const recs = [_]types.StreamRecord{.{ .id = .{ .timestamp_ms = 100, .sequence = 7 }, .payload = "", .deliveries = 2 }};
+    const named = "\x01\x00g\x02\x00c1" ++ le(@as(u64, 3)) ++ le(@as(u64, 9)) ++ le(@as(u32, 1)) ++ le(@as(u64, 100)) ++ le(@as(u64, 7)) ++ le(@as(u32, 2));
+    var back = try stream.groupNack("events", "g", lease, &recs, .{ .consumer = "c1", .abandon = true });
+    defer back.deinit();
+    try std.testing.expectEqual(@as(u16, 0x159), srv.last_op);
+    // abandon (0x34), void; the body ends with an empty error.
+    try std.testing.expectEqualSlices(u8, "\x34\x00", srv.lastOptions());
+    try std.testing.expectEqualSlices(u8, named ++ "\x00\x00", srv.lastValue());
+
+    try std.testing.expectError(FloError.BadRequest, stream.groupNack("events", "g", lease, &recs, .{ .abandon = true, .dead = true }));
+    try std.testing.expectError(FloError.BadRequest, stream.groupNack("events", "g", lease, &recs, .{ .abandon = true, .delay_ms = 1 }));
+    try std.testing.expectError(FloError.BadRequest, stream.groupNack("events", "g", lease, &recs, .{ .abandon = true, .error_message = "x" }));
+    try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
+}
+
+test "a report to a group that isn't there is NotFound as a whole" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    // not_found, reason not_found (13), ran no.
+    const missing: test_server.Reply = .{ .status = @intFromEnum(types.StatusCode.not_found), .body = "\x0d\x00\x00not found: no such consumer group" };
+    srv.replies = &.{ missing, missing, missing };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    const lease: types.GroupLease = .{ .term = 3, .index = 9 };
+    const recs = [_]types.StreamRecord{.{ .id = .{ .timestamp_ms = 100, .sequence = 7 }, .payload = "", .deliveries = 1 }};
+    try std.testing.expectError(FloError.NotFound, stream.groupAck("events", "gone", lease, &recs, .{}));
+    try std.testing.expectError(FloError.NotFound, stream.groupNack("events", "gone", lease, &recs, .{}));
+    try std.testing.expectError(FloError.NotFound, stream.groupTouch("events", "gone", lease, &recs, .{}));
+    try std.testing.expectEqual(types.Reason.not_found, client.lastError().?.reason);
+}
+
+test "a group read at its held cap is GroupHeldFull, sent once and not retried" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    // overloaded, reason group_held_full (37), ran no.
+    srv.replies = &.{.{ .status = @intFromEnum(types.StatusCode.overloaded), .body = "\x25\x00\x00overloaded: group 'g' on stream 'events' is full" }};
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{ .retry = .{ .max_attempts = 4, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    try std.testing.expectError(FloError.GroupHeldFull, stream.groupRead("events", "g", "c1", .{}));
+    try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
+    try std.testing.expectEqual(types.Reason.group_held_full, client.lastError().?.reason);
+    try std.testing.expect(!client.refusedUnrun(FloError.Overloaded));
 }
 
 test "a group report answer cut anywhere or overlong is refused" {
