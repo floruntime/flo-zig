@@ -6,6 +6,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
 const Client = @import("client.zig").Client;
+const kv_mod = @import("kv.zig");
 
 const FloError = types.FloError;
 
@@ -95,7 +96,9 @@ pub const Stream = struct {
     /// `FloError.NotFound`; one that is there with nothing to read is an
     /// empty result. A blocking read of a stream not created yet waits for
     /// its first append. A reader that may start before its stream exists
-    /// should catch not found and read again.
+    /// should catch not found and read again. A not-found marked stale is
+    /// `FloError.StaleNotFound`: the stream may exist, but the node that
+    /// answered hasn't seen it yet; read again rather than treat it as gone.
     /// **Caller owns the returned `StreamReadResult` and must call `result.deinit()`.**
     pub fn read(
         self: *Stream,
@@ -148,9 +151,7 @@ pub const Stream = struct {
         );
         defer response.deinit();
 
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
+        if (response.status != .ok) return kv_mod.refusalError(&response);
 
         return parseStreamReadResponse(self.client.allocator, response.data);
     }
@@ -892,6 +893,26 @@ test "a read answered not found is error.NotFound, and an ok empty answer is an 
     var empty = try stream.read("events", .{});
     defer empty.deinit();
     try std.testing.expectEqual(@as(usize, 0), empty.records.len);
+}
+
+test "a read's not found marked stale is StaleNotFound; unmarked it stays NotFound" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    // not_found, reason unclassified (12), ran no; the first marked stale.
+    const missing = "\x0c\x00\x00stream not found";
+    srv.replies = &.{
+        .{ .status = @intFromEnum(types.StatusCode.not_found), .body = missing, .flags = 1 },
+        .{ .status = @intFromEnum(types.StatusCode.not_found), .body = missing },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+    try std.testing.expectError(FloError.StaleNotFound, stream.read("events", .{}));
+    try std.testing.expectError(FloError.NotFound, stream.read("events", .{}));
 }
 
 test "info of a stream the server doesn't know is not found, not an empty stream" {

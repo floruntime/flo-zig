@@ -631,8 +631,17 @@ fn txnBody(txn: u64) [8]u8 {
 fn absent(client: *const Client, response: *const wire.RawResponse) FloError!bool {
     if (response.status == .ok) return false;
     if (response.status == .not_found and client.last_error_reason == .not_found) {
-        return if (response.stale) FloError.StaleNotFound else true;
+        if (response.stale) return refusalError(response);
+        return true;
     }
+    return response.status.toError();
+}
+
+/// The error a refused read returns: its status's, except that a not-found
+/// marked stale is `StaleNotFound`, since the node answering may not have
+/// seen what it looked for yet.
+pub fn refusalError(response: *const wire.RawResponse) FloError {
+    if (response.status == .not_found and response.stale) return FloError.StaleNotFound;
     return response.status.toError();
 }
 

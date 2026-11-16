@@ -462,7 +462,8 @@ isn't the 16 bytes a page answered is refused bad_request. `readAll` returns any
 from `next`, so a not-found read ends it with `error.NotFound`, not as the
 end of the points. A read is not found when the field has no series matching
 the tag filter (a measurement never written, say); a series with no points in
-the range is an empty page.
+the range is an empty page. A not-found marked stale is `error.StaleNotFound`
+(see Error Handling): read again rather than treat the series as gone.
 
 A FloQL query whose answer holds more than 4096 raw points is refused
 bad_request: aggregate them, narrow the query, or page them with `read`.
@@ -708,7 +709,7 @@ All operations return `flo.FloError` which includes:
 - `Unavailable` - No leader yet, records still being read from disk, or the shard isn't taking writes or is offline, and the client's retries ran out (an offline shard needs an operator)
 - `InternalError` - Internal server error (not retryable: the write may have committed)
 - `OutcomePending` - The write committed but hasn't applied, because its shard halted (never retried)
-- `StaleNotFound` - `get` or `jsonGet` on a halted shard: the key is missing as of the halt, which isn't the same as missing
+- `StaleNotFound` - A not-found answer marked stale: `get` or `jsonGet` on a halted shard (the key is missing as of the halt, which isn't the same as missing), or a `stream.read` or `ts.read` whose stream or series the answering node hasn't seen yet. It may exist: read again rather than treat it as gone
 - `StaleReport` - An action complete, fail or touch for a delivery that has moved on (never resent)
 - `Limit` - The node or shard is at a limit on what it holds (status `limit`); `lastError().?.reason` names which: `memory_budget`, `too_many_actions` (counted per shard), `too_many_workflow_definitions` or `too_many_workflow_runs`. The limits are built into the server, not settings: retrying won't clear it until something is deleted (or, for the memory budget, the node gets more memory), so nothing retries it. It doesn't mean permanent. It never ran
 - `GroupHeldFull` - A group read took nothing new (status `overloaded`, reason `group_held_full`): the group is at its caps, leased, ready and dead records together, or the shard's queues and groups are at their shared cap. Not retried. It clears as the group's records are acked or nacked, its dead records removed (deleting the group, or a stream trim), or, at the shard's cap, as this group's records and the shard's other groups and queues are acked, consumed or purged
@@ -751,8 +752,10 @@ applied. Such a read succeeds with `stale` set on its result (`GetResult`,
 `MGetEntry`, `ScanResult`, `HistoryResult`, `ExistsResult`): it is not an error,
 but it doesn't hold anything written since. A key missing from such an answer
 may exist since, so `get` and `jsonGet` return `error.StaleNotFound` rather than
-null. Only the KV reads carry the flag for now: other reads (streams,
-queues, actions, workers) drop it.
+null. A not-found from `stream.read` or `ts.read` marked stale is
+`error.StaleNotFound` too: the stream or series may exist, but the node
+that answered hasn't seen it yet, so read again. Other reads (queues,
+actions, workers) drop the flag.
 
 | `RetryPolicy` field | Default | |
 |---|---|---|

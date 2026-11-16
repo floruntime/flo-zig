@@ -16,7 +16,8 @@ const std = @import("std");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
 const Client = @import("client.zig").Client;
-const Reader = @import("kv.zig").Reader;
+const kv = @import("kv.zig");
+const Reader = kv.Reader;
 
 const Allocator = std.mem.Allocator;
 const FloError = types.FloError;
@@ -153,14 +154,16 @@ pub const TimeSeries = struct {
     /// cursor (before it, newest first), so a point there for the whole
     /// read is read once. A field with no series matching the tag filter
     /// is `FloError.NotFound`; one with series but no points in range is
-    /// an empty page.
+    /// an empty page. A not-found marked stale is `FloError.StaleNotFound`:
+    /// the series may exist, but the node that answered hasn't seen it
+    /// yet; read again rather than treat it as gone.
     /// **Caller owns the returned `ReadPage` and must call `page.deinit()`.**
     pub fn read(self: *TimeSeries, measurement: []const u8, options: ReadOptions) FloError!ReadPage {
         var buf: [MAX_READ_BODY]u8 = undefined;
         const body = try encodeReadBody(&buf, options);
         var response = try self.client.sendRequest(.ts_read, self.client.getNamespace(options.namespace), measurement, body, "");
         defer response.deinit();
-        if (response.status != .ok) return response.status.toError();
+        if (response.status != .ok) return kv.refusalError(&response);
         var page = try decodeReadAnswer(self.client.allocator, response.data);
         page.stale = response.stale;
         return page;
@@ -504,6 +507,30 @@ test "a read of a series that isn't there is error.NotFound; an empty page is ok
     defer empty.deinit();
     try testing.expectEqual(@as(usize, 0), empty.points.len);
     try testing.expect(empty.cursor == null);
+}
+
+test "a not-found marked stale is StaleNotFound, from read and from the iterator; unmarked it stays NotFound" {
+    var srv = try test_server.OkServer.listen();
+    const missing = "\x0d\x00\x00not found: 'cpu' has no series of field 'value'";
+    const not_found = @intFromEnum(types.StatusCode.not_found);
+    srv.replies = &.{
+        .{ .status = not_found, .body = missing, .flags = 1 },
+        .{ .status = not_found, .body = missing },
+        .{ .status = 0, .body = "\x01\x00" ++ pointBytes(1, 1) ++ "\x01\x10" ++ cursor_a },
+        .{ .status = not_found, .body = missing, .flags = 1 },
+    };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var ts = TimeSeries.init(&client);
+    try testing.expectError(FloError.StaleNotFound, ts.read("cpu", .{}));
+    try testing.expectError(FloError.NotFound, ts.read("cpu", .{}));
+    var it = ts.readAll("cpu", .{});
+    defer it.deinit();
+    try testing.expectEqual(@as(i64, 1), (try it.next()).?.time_ns);
+    try testing.expectError(FloError.StaleNotFound, it.next());
 }
 
 test "a not-found read ends the iterator with the error, not as the end" {
