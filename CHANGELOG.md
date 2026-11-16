@@ -30,7 +30,7 @@
   answered not found, rather than reading again.
 - The `group_held_full` docs say the shard's cap clears as any of its groups
   and queues drain, this group included.
-- **Breaking:** pinned to the table hash of flo `fd771c1d` (`0xc1f93eb0ed86a281`);
+- **Breaking:** pinned to the table hash of flo `ad198c29` (`0x17f3632347cd6dd9`);
   this SDK and older servers refuse each other.
 - `Reason` is non-exhaustive: a reason this SDK predates decodes as its number,
   with the status and message in `lastError()`, rather than failing the call as
