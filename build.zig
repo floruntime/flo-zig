@@ -11,13 +11,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Unit tests
+    // Unit tests. LLVM, because the self-hosted x86_64 backend in 0.15.2
+    // fails to emit two processing tests ("no encoding found for: mov r64 m128").
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/flo.zig"),
             .target = target,
             .optimize = optimize,
         }),
+        .use_llvm = true,
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
