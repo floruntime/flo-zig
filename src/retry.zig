@@ -36,8 +36,9 @@ pub fn nsFromMs(ms: u64) u64 {
 /// `reason` is one the server says it didn't run, of a kind worth sending
 /// again. A halted shard's refusal isn't: it takes no writes until an
 /// operator repairs it. Nor is a group read at its held cap: it clears
-/// as the group's records are acked, nacked or removed, or the shard's
-/// other groups and queues drain, not by reading again. Nor is a `ran`
+/// as the group's records are acked, nacked or removed, or, at the
+/// shard's cap, as any of the shard's groups and queues, this one
+/// included, drain; not by reading again. Nor is a `ran`
 /// this SDK predates: only `no` is safe to resend.
 pub fn isRefusedUnrun(status: types.StatusCode, ran: types.Ran, reason: types.Reason) bool {
     return (status == .overloaded or status == .unavailable) and ran == .no and reason != .shard_halted and reason != .group_held_full;

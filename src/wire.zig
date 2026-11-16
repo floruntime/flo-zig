@@ -237,6 +237,7 @@ pub fn isTableOp(op: OpCode) bool {
         .stream_group_list, .stream_group_members, .queue_peek, .queue_dequeue, .queue_complete, .queue_fail, .queue_touch => true,
         .action_status, .action_await, .action_complete, .action_fail, .action_touch, .action_info => true,
         .worker_list, .worker_info, .processing_remove => true,
+        .ts_read, .ts_info => true,
         else => false,
     };
 }
@@ -462,7 +463,7 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
-    try std.testing.expectEqual(@as(u64, 0xc1f93eb0ed86a281), header.table_hash);
+    try std.testing.expectEqual(@as(u64, 0x17f3632347cd6dd9), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
 }
 

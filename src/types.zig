@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0xc1f93eb0ed86a281;
+pub const TABLE_HASH: u64 = 0x17f3632347cd6dd9;
 
 /// Why the server refused a request. Mirrors the server's list. A reason
 /// this SDK predates still decodes, as its number (`_`), with the status
@@ -237,7 +237,7 @@ pub const LimitNotice = struct {
             self.seen[self.seen_len] = last.reason;
             self.seen_len += 1;
         }
-        const hint = if (last.reason == .group_held_full) " (it clears as the group's records are acked or nacked, its dead records removed by deleting the group or trimming the stream, or, at the shard's cap, as other groups and queues drain)" else "";
+        const hint = if (last.reason == .group_held_full) " (it clears as the group's records are acked or nacked, its dead records removed by deleting the group or trimming the stream, or, at the shard's cap, as this group's records and the shard's other groups and queues are acked, consumed or purged)" else "";
         std.log.warn(what ++ " refused at a limit ({s}): {s}; backing off, not retrying it until it passes{s}", .{ std.enums.tagName(Reason, last.reason) orelse "unknown", last.message, hint });
     }
 
@@ -343,6 +343,7 @@ pub const OpCode = enum(u16) {
     ts_list = 0x1A4,
     ts_delete = 0x1A5,
     ts_retention = 0x1A6,
+    ts_info = 0x1A7,
 
     // ── Actions (0x300 – 0x31F) ──
     action_register = 0x300,
@@ -495,13 +496,13 @@ pub const OptionTag = enum(u8) {
     abandon = 0x34, // void: A nack hands its records back unstarted: ready at once, no failure counted
 
     // Time-Series Options (0x60 - 0x6F)
-    ts_from_ms = 0x60, // i64: Start of time range (inclusive, unix ms)
-    ts_to_ms = 0x61, // i64: End of time range (inclusive, 0 = now)
-    ts_window_ms = 0x62, // i64: Aggregation window size (ms)
+    ts_from_ns = 0x60, // i64: A query's start, inclusive, in Unix ns (0 = no bound)
+    ts_to_ns = 0x61, // i64: A query's end, inclusive, in Unix ns (0 = no bound)
+    ts_window_ns = 0x62, // i64: A query's window, in ns (absent = a minute; 0 is refused)
     ts_aggregation = 0x63, // string: Aggregation function name (avg, sum, count, min, max)
     ts_field = 0x64, // string: Field name filter (empty = "value")
     ts_tags = 0x65, // string: Comma-separated tag filters "key=val,key2=val2"
-    ts_timestamp = 0x67, // i64: Explicit timestamp for write (0 = server-assigned)
+    ts_timestamp_ns = 0x67, // i64: A write's time in Unix ns (0 = the server's time; before 1970 is refused)
     ts_raw_ttl = 0x68, // string: Raw data TTL (e.g., "7d")
     ts_downsample = 0x69, // string: refused by the server; downsampling isn't supported
 
@@ -591,8 +592,9 @@ pub const FloError = error{
     /// so it is never retried; back off, as for `Limit`. The group's room
     /// comes back as its consumers ack or nack, but dead records count too
     /// and stay until the group is deleted or a trim of the stream cuts
-    /// them. At the shard's cap, it clears as other groups and queues on
-    /// the shard drain. The message says which cap.
+    /// them. At the shard's cap, it clears as any of the shard's groups and
+    /// queues, this one included, are acked, consumed or purged. The
+    /// message says which cap.
     GroupHeldFull,
     UnexpectedResponse,
 
@@ -2060,6 +2062,13 @@ pub const ProcessingStatusResult = struct {
     tick_max_us: u64,
     /// Since the earliest of this node's pipelines started.
     uptime_ms: u64,
+    /// The job's time-series sources count points that arrive later than
+    /// a lateness edge: at least `late_points` of them came more than
+    /// `late_edge_ms` behind their field's newest point. maxInt(u64) when
+    /// none of this node's pipelines reads a TS source with a window: no
+    /// count. `late()` reads the two together.
+    late_edge_ms: u64,
+    late_points: u64,
     /// The definition as submitted.
     yaml: []const u8,
     allocator: std.mem.Allocator,
@@ -2071,6 +2080,23 @@ pub const ProcessingStatusResult = struct {
         if (self.reason) |r| self.allocator.free(r);
         self.allocator.free(self.yaml);
     }
+
+    /// The late-point count, or null when there is none to show: the job
+    /// isn't running here, or none of its TS sources reports one.
+    pub fn late(self: ProcessingStatusResult) ?LatePoints {
+        if (!self.running or self.late_edge_ms == NO_LATE_EDGE) return null;
+        return .{ .edge_ms = self.late_edge_ms, .at_least = self.late_points };
+    }
+};
+
+/// `ProcessingStatusResult.late_edge_ms` when there is no count.
+pub const NO_LATE_EDGE = std.math.maxInt(u64);
+
+/// At least `at_least` points came more than `edge_ms` behind their
+/// field's newest point.
+pub const LatePoints = struct {
+    edge_ms: u64,
+    at_least: u64,
 };
 
 /// Entry in a processing job list.

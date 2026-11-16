@@ -227,6 +227,7 @@ pub const Processing = struct {
 ///   [reason_len:u16][reason]
 ///   [running:u8][records_in:u64][records_out:u64][watermark_ms:i64]
 ///   [tick_avg_us:u64][tick_max_us:u64][uptime_ms:u64]
+///   [late_edge_ms:u64][late_points:u64]
 ///   [yaml_len:u32][yaml]
 fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.ProcessingStatusResult {
     var r: Reader = .{ .data = data };
@@ -245,6 +246,8 @@ fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.Processi
     const tick_avg_us = try r.int(u64);
     const tick_max_us = try r.int(u64);
     const uptime_ms = try r.int(u64);
+    const late_edge_ms = try r.int(u64);
+    const late_points = try r.int(u64);
     const yaml = try r.lenBytes(u32);
     try r.end();
 
@@ -271,6 +274,8 @@ fn parseProcessingStatus(allocator: Allocator, data: []const u8) !types.Processi
         .tick_avg_us = tick_avg_us,
         .tick_max_us = tick_max_us,
         .uptime_ms = uptime_ms,
+        .late_edge_ms = late_edge_ms,
+        .late_points = late_points,
         .yaml = try allocator.dupe(u8, yaml),
         .allocator = allocator,
     };
@@ -426,8 +431,14 @@ test "list pages on past a short page until has_more is clear, sending each page
 }
 
 /// The runtime and definition every status answer ends with: running, 10
-/// in, 8 out, watermark 5, ticks 3 and 9 us, up 60 ms; yaml "y: 1".
-const test_status_tail = "\x01" ++ le(@as(u64, 10)) ++ le(@as(u64, 8)) ++ le(@as(i64, 5)) ++ le(@as(u64, 3)) ++ le(@as(u64, 9)) ++ le(@as(u64, 60)) ++ le(@as(u32, 4)) ++ "y: 1";
+/// in, 8 out, watermark 5, ticks 3 and 9 us, up 60 ms, at least 7 points
+/// later than 30 s; yaml "y: 1".
+const test_status_tail = statusTail(30_000, 7);
+
+fn statusTail(comptime late_edge_ms: u64, comptime late_points: u64) []const u8 {
+    return "\x01" ++ le(@as(u64, 10)) ++ le(@as(u64, 8)) ++ le(@as(i64, 5)) ++ le(@as(u64, 3)) ++ le(@as(u64, 9)) ++ le(@as(u64, 60)) ++
+        le(late_edge_ms) ++ le(late_points) ++ le(@as(u32, 4)) ++ "y: 1";
+}
 
 test "status and list answers decode per the server's layouts" {
     const a = std.testing.allocator;
@@ -449,6 +460,7 @@ test "status and list answers decode per the server's layouts" {
     try std.testing.expectEqual(@as(u64, 3), st.tick_avg_us);
     try std.testing.expectEqual(@as(u64, 9), st.tick_max_us);
     try std.testing.expectEqual(@as(u64, 60), st.uptime_ms);
+    try std.testing.expectEqual(types.LatePoints{ .edge_ms = 30_000, .at_least = 7 }, st.late().?);
     try std.testing.expectEqualStrings("y: 1", st.yaml);
 
     const list_body = "\x01\x00\x00\x00" ++ test_list_entry ++ "\x00\x00\x00";
@@ -495,6 +507,19 @@ test "a status answer cut anywhere, overlong, or short of memory leaks nothing" 
     for (0..failed_status_answer.len) |n| try std.testing.expectError(FloError.IncompleteResponse, parseStatusAndFree(a, failed_status_answer[0..n]));
     try std.testing.expectError(FloError.IncompleteResponse, parseStatusAndFree(a, failed_status_answer ++ "\x00"));
     try std.testing.checkAllAllocationFailures(a, parseStatusAndFree, .{@as([]const u8, failed_status_answer)});
+}
+
+test "a status whose late edge is maxInt(u64) has no late count" {
+    const a = std.testing.allocator;
+    const head = "\x02\x00j1\x01\x00p\x00" ++ le(@as(u32, 50)) ++ le(@as(u64, 0)) ++ le(@as(i64, 99)) ++ "\x00\x00";
+    var none = try parseProcessingStatus(a, head ++ comptime statusTail(types.NO_LATE_EDGE, 0));
+    defer none.deinit();
+    try std.testing.expectEqual(types.NO_LATE_EDGE, none.late_edge_ms);
+    try std.testing.expectEqual(@as(?types.LatePoints, null), none.late());
+    // An edge with no late points yet is a count of zero, not none.
+    var zero = try parseProcessingStatus(a, head ++ comptime statusTail(60_000, 0));
+    defer zero.deinit();
+    try std.testing.expectEqual(types.LatePoints{ .edge_ms = 60_000, .at_least = 0 }, zero.late().?);
 }
 
 test "a job status byte this client doesn't know refuses the answer" {

@@ -58,6 +58,10 @@ pub const Workflow = @import("workflow.zig").Workflow;
 // Processing API
 pub const Processing = @import("processing.zig").Processing;
 
+// Time series
+pub const timeseries = @import("timeseries.zig");
+pub const TimeSeries = timeseries.TimeSeries;
+
 // High-level Worker API
 const worker_mod = @import("worker.zig");
 pub const ActionWorker = worker_mod.ActionWorker;
@@ -124,6 +128,8 @@ pub const ProcessingStatusResult = types.ProcessingStatusResult;
 pub const ProcessingListEntry = types.ProcessingListEntry;
 pub const ProcessingListResult = types.ProcessingListResult;
 pub const ProcessingSyncResult = types.ProcessingSyncResult;
+pub const LatePoints = types.LatePoints;
+pub const NO_LATE_EDGE = types.NO_LATE_EDGE;
 
 // Option types - KV
 pub const PutOptions = types.PutOptions;
@@ -251,6 +257,7 @@ test {
     _ = @import("client.zig");
     _ = @import("retry.zig");
     _ = @import("kv.zig");
+    _ = @import("timeseries.zig");
     _ = @import("queue.zig");
     _ = @import("stream.zig");
     _ = @import("actions.zig");

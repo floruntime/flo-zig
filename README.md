@@ -378,8 +378,8 @@ bytes, takes nothing new: a read returns `error.GroupHeldFull` (status
 again won't help, so the client doesn't retry it; the stream worker logs it
 once and backs off. The group's room comes back as its consumers ack or nack,
 but dead records count too and stay until the group is deleted or a trim of
-the stream cuts them. At the shard's cap, it clears as other groups and
-queues on the shard drain.
+the stream cuts them. At the shard's cap, it clears as any of the shard's
+groups and queues, this one included, are acked, consumed or purged.
 
 A nack carries an error of up to 1024 bytes. A nack with `.abandon = true`
 hands records back unstarted: ready at once, the delivery counted but no
@@ -425,6 +425,62 @@ defer members.deinit();
 var groups = try stream.groupList("events", .{});
 defer groups.deinit();
 ```
+
+### Time Series
+
+Every time and window is nanoseconds, as `i64`, on the way in and out.
+
+```zig
+var ts = flo.TimeSeries.init(&client);
+
+// A point at a time of your choosing, in ns; leave time_ns 0 for the
+// server's time. A time before 1970 is refused bad_request.
+const w = try ts.write("cpu", 0.42, .{ .field = "user", .tags = "host=web-1,dc=eu", .time_ns = 1_700_000_000_123_456_789 });
+std.debug.print("written at {d} ns\n", .{w.time_ns});
+
+// One page, newest first: up to `limit` (1 to 4096) points of every series
+// matching the tag filter, merged in time order, then write order.
+var page = try ts.read("cpu", .{ .field = "user", .tags = "host=web-1", .limit = 100, .order = .newest_first });
+defer page.deinit();
+// Pass page.cursor back as .cursor for the next page; null means the last.
+
+// Every point, page by page.
+var it = ts.readAll("cpu", .{ .field = "user", .from_ns = 1_700_000_000_000_000_000 });
+defer it.deinit();
+while (try it.next()) |p| std.debug.print("{d} {d}\n", .{ p.time_ns, p.value });
+
+// Windows of 5 minutes (in ns), summed; each bucket's start_ns is aligned
+// to the epoch. No window means a minute; more than 1024 windows is refused.
+var q = try ts.query("cpu", .{ .field = "user", .from_ns = 1_700_000_000_000_000_000, .window_ns = 5 * std.time.ns_per_min, .aggregation = .sum });
+defer q.deinit();
+for (q.buckets) |b| std.debug.print("{d} {d}\n", .{ b.start_ns, b.value });
+
+// A measurement's series, fields, points, and oldest_ns and newest_ns.
+var info = try ts.info("cpu", .{});
+defer info.deinit();
+
+// FloQL; its answer's times are ns.
+var result = try ts.floql("cpu{host=\"web-1\"}[1h] | window(5m) | avg()", .{});
+defer result.deinit();
+```
+
+A page continues strictly after the cursor (before it, newest first), so
+a point that was there for the whole read is read once, none skipped. Page
+until the cursor is null, not until a page comes back short: a page can be
+short, or empty, with more to come. The cursor is opaque bytes; one that
+isn't the 16 bytes a page answered is refused bad_request. `readAll` returns any refusal
+from `next`, so a not-found read ends it with `error.NotFound`, not as the
+end of the points. A read is not found when the field has no series matching
+the tag filter (a measurement never written, say); a series with no points in
+the range is an empty page. A not-found marked stale is `error.StaleNotFound`
+(see Error Handling): read again rather than treat the series as gone.
+
+In FloQL text, `[1h]` and `[2h..1h]` count back from now, and a bare number
+in a range is epoch milliseconds (`cpu[1700000000000..1700000060000]`); a
+range whose start is after its end, or a bare number past the year 3000, is
+refused. A FloQL query whose answer holds more than 4096 raw points is refused
+bad_request: aggregate them, narrow the query, or page them with `read`.
+`client.lastError()` carries the server's text.
 
 ### Action Operations
 
@@ -619,6 +675,9 @@ std.debug.print("Job {s}: {s} (processed {d} records)\n", .{
 });
 // Why a failed job failed, or why this node holds a running one
 if (status.reason) |reason| std.debug.print("{s}\n", .{reason});
+// A job reading a time-series source with a lateness window counts points
+// that came later than it; null when there is no count to show.
+if (status.late()) |late| std.debug.print("at least {d} points later than {d} ms\n", .{ late.at_least, late.edge_ms });
 
 // A stopped, cancelled or failed job keeps its slot until it is removed
 try processing.remove(job_id, .{});
@@ -663,10 +722,10 @@ All operations return `flo.FloError` which includes:
 - `Unavailable` - No leader yet, records still being read from disk, or the shard isn't taking writes or is offline, and the client's retries ran out (an offline shard needs an operator)
 - `InternalError` - Internal server error (not retryable: the write may have committed)
 - `OutcomePending` - The write committed but hasn't applied, because its shard halted (never retried)
-- `StaleNotFound` - `get` or `jsonGet` on a halted shard: the key is missing as of the halt, which isn't the same as missing
+- `StaleNotFound` - A not-found answer marked stale: `get` or `jsonGet` on a halted shard (the key is missing as of the halt, which isn't the same as missing), or a `stream.read` or `ts.read` whose stream or series the answering node hasn't seen yet. It may exist: read again rather than treat it as gone
 - `StaleReport` - An action complete, fail or touch for a delivery that has moved on (never resent)
 - `Limit` - The node or shard is at a limit on what it holds (status `limit`); `lastError().?.reason` names which: `memory_budget`, `too_many_actions` (counted per shard), `too_many_workflow_definitions` or `too_many_workflow_runs`. The limits are built into the server, not settings: retrying won't clear it until something is deleted (or, for the memory budget, the node gets more memory), so nothing retries it. It doesn't mean permanent. It never ran
-- `GroupHeldFull` - A group read took nothing new (status `overloaded`, reason `group_held_full`): the group is at its caps, leased, ready and dead records together, or the shard's queues and groups are at their shared cap. Not retried. It clears as the group's records are acked or nacked, its dead records removed (deleting the group, or a stream trim), or, at the shard's cap, as other groups and queues drain
+- `GroupHeldFull` - A group read took nothing new (status `overloaded`, reason `group_held_full`): the group is at its caps, leased, ready and dead records together, or the shard's queues and groups are at their shared cap. Not retried. It clears as the group's records are acked or nacked, its dead records removed (deleting the group, or a stream trim), or, at the shard's cap, as this group's records and the shard's other groups and queues are acked, consumed or purged
 - `UnexpectedResponse` - Unexpected response format
 - `ServerError` - Generic server error, including status codes this SDK doesn't know
 
@@ -706,8 +765,10 @@ applied. Such a read succeeds with `stale` set on its result (`GetResult`,
 `MGetEntry`, `ScanResult`, `HistoryResult`, `ExistsResult`): it is not an error,
 but it doesn't hold anything written since. A key missing from such an answer
 may exist since, so `get` and `jsonGet` return `error.StaleNotFound` rather than
-null. Only the KV reads carry the flag for now: other reads (streams,
-queues, actions, workers) drop it.
+null. A not-found from `stream.read` or `ts.read` marked stale is
+`error.StaleNotFound` too: the stream or series may exist, but the node
+that answered hasn't seen it yet, so read again. Other reads (queues,
+actions, workers) drop the flag.
 
 | `RetryPolicy` field | Default | |
 |---|---|---|
@@ -753,6 +814,17 @@ worker handles at once (at most `batch_size`). Above 1, each runs on a thread wi
 connection of its own for its ack or nack, so a batch's records are handled out of order,
 and handlers and the worker's allocator must be thread-safe. The next read waits for the
 whole batch. `drain()` and `stop()` are safe to call from any thread.
+
+A group read answered not found ends the worker's run: `start()` returns
+`error.NotFound` rather than reading again or stopping as if there were no
+more records. A worker that may start before its stream exists should catch
+it and start again.
+
+A `stream.read` without `block_ms` of a stream that isn't there (never
+created by a create or a first append, or deleted) is `error.NotFound`; one
+that is there with nothing to read is empty. A blocking read of a stream not
+created yet waits for its first append. A reader that may start before its
+stream exists should catch not found and read again.
 
 A stream worker acks a record whose handler returns, and nacks one whose handler
 fails, naming the read's lease. The group's lease runs for the whole batch from its

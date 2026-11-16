@@ -302,7 +302,9 @@ pub const StreamWorker = struct {
     /// `error.BadRequest`, with the reason and message in
     /// `client.lastError()`), so the worker never serves unregistered:
     /// start fails with the limit error; a limit hit while running is
-    /// logged and backed off.
+    /// logged and backed off. A group read answered not found ends the run
+    /// with `error.NotFound`: a worker that may start before its stream
+    /// exists should catch it and start again.
     pub fn start(self: *Self) !void {
         const stream_list = self.config.getStreams();
 
@@ -380,6 +382,13 @@ pub const StreamWorker = struct {
                 halted.reset();
                 self.limit_notice.clear();
             } else |err| {
+                // Not found won't pass by reading again, and stopping
+                // quietly would look like no more records: start returns
+                // it, and the caller decides whether to start over.
+                if (err == FloError.NotFound) {
+                    std.log.warn("[flo-stream-worker] group read of '{s}' not found: {s}", .{ stream_list[stream_idx], if (self.client.lastError()) |last| last.message else "" });
+                    return err;
+                }
                 if (client_mod.isConnectionError(err)) {
                     std.log.warn("[flo-stream-worker] Connection lost: {}, reconnecting...", .{err});
                     self.client.disconnect();
@@ -1943,6 +1952,20 @@ test "StreamWorker nacks a record its handler failed, without abandon" {
     try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_nack));
     try std.testing.expect(group_test.reportNames(srv.requestOf(.stream_group_nack, 0), 7));
     try std.testing.expectEqualSlices(u8, "", @import("test_server.zig").optionsOf(srv.requestOf(.stream_group_nack, 0)));
+}
+
+test "StreamWorker.start returns a group read's not found rather than reading again or stopping quietly" {
+    const ScriptServer = @import("test_server.zig").ScriptServer;
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{.{ .op = .stream_group_read, .action = .{ .reply = .{ .status = 2, .body = "\x0d\x00\x00not found: no such stream" } } }};
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try StreamWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .stream = "events", .block_ms = 100 }, drain_gap_test.handle);
+    defer w.deinit();
+    try std.testing.expectError(FloError.NotFound, w.start());
+    try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_read));
+    try std.testing.expect(!w.running);
 }
 
 test "StreamWorker backs off a group read whose group holds too many records, logging it once, and the client never retries it" {

@@ -2,7 +2,35 @@
 
 ## Unreleased
 
-- **Breaking:** pinned to the table hash of flo `fd771c1d` (`0xc1f93eb0ed86a281`);
+- A non-blocking `stream.read` of a stream that isn't there, and a `ts.read`
+  of a field with no matching series, are `error.NotFound` (the server now
+  answers not found, not an empty result); a blocking read still waits for a
+  stream's first append. Catch not found and start again if a reader may
+  start first. A not-found marked stale is `error.StaleNotFound`, as for
+  `get`: the stream or series may exist but the node that answered hasn't
+  seen it yet, so read again.
+- New `TimeSeries`: `write`, `read` (one page), `readAll` (an iterator over
+  every page), `query` (windows of `window_ns`, with an `Aggregation`),
+  `info` (with `oldest_ns`, `newest_ns`) and `floql`. Every time and window
+  is Unix nanoseconds as `i64`; a write's
+  `time_ns` of 0 takes the server's time, and one before 1970 is refused
+  bad_request. A read takes a field, a tag filter, an inclusive ns range, a
+  limit (1 to 4096), an `Order` (`oldest_first`, `newest_first`) and an
+  opaque cursor; page until the cursor is null. A query window of 0, or one
+  making more than 1024 windows, is refused bad_request. FloQL answers in ns
+  (a bare number in a FloQL range is still epoch ms), and a raw answer of
+  more than 4096 points is refused bad_request.
+- **Breaking:** option tags `ts_timestamp` (0x67), `ts_from_ms` (0x60),
+  `ts_to_ms` (0x61) and `ts_window_ms` (0x62) are `ts_timestamp_ns`,
+  `ts_from_ns`, `ts_to_ns` and `ts_window_ns`, each an i64 of nanoseconds.
+- `ProcessingStatusResult` gains `late_edge_ms` and `late_points`, and
+  `late()`: at least that many of a job's TS source points came later than
+  the edge; null (edge `NO_LATE_EDGE`) when there is no count.
+- `StreamWorker.start()` returns `error.NotFound` when a group read is
+  answered not found, rather than reading again.
+- The `group_held_full` docs say the shard's cap clears as any of its groups
+  and queues drain, this group included.
+- **Breaking:** pinned to the table hash of flo `ad198c29` (`0x17f3632347cd6dd9`);
   this SDK and older servers refuse each other.
 - `Reason` is non-exhaustive: a reason this SDK predates decodes as its number,
   with the status and message in `lastError()`, rather than failing the call as
