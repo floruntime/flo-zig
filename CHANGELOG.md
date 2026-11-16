@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-dev.5 - 2026-11-16
 
 - A non-blocking `stream.read` of a stream that isn't there, and a `ts.read`
   of a field with no matching series, are `error.NotFound` (the server now
