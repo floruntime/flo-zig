@@ -460,7 +460,9 @@ until the cursor is null, not until a page comes back short: a page can be
 short, or empty, with more to come. The cursor is opaque bytes; one that
 isn't the 16 bytes a page answered is refused bad_request. `readAll` returns any refusal
 from `next`, so a not-found read ends it with `error.NotFound`, not as the
-end of the points.
+end of the points. A read is not found when the field has no series matching
+the tag filter (a measurement never written, say); a series with no points in
+the range is an empty page.
 
 A FloQL query whose answer holds more than 4096 raw points is refused
 bad_request: aggregate them, narrow the query, or page them with `read`.
@@ -800,7 +802,13 @@ whole batch. `drain()` and `stop()` are safe to call from any thread.
 A group read answered not found ends the worker's run: `start()` returns
 `error.NotFound` rather than reading again or stopping as if there were no
 more records. A worker that may start before its stream exists should catch
-it and start again. `stream.read` returns `error.NotFound` the same way.
+it and start again.
+
+A `stream.read` without `block_ms` of a stream that isn't there (never
+created by a create or a first append, or deleted) is `error.NotFound`; one
+that is there with nothing to read is empty. A blocking read of a stream not
+created yet waits for its first append. A reader that may start before its
+stream exists should catch not found and read again.
 
 A stream worker acks a record whose handler returns, and nacks one whose handler
 fails, naming the read's lease. The group's lease runs for the whole batch from its

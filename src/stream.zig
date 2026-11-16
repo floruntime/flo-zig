@@ -90,8 +90,12 @@ pub const Stream = struct {
         return buf;
     }
 
-    /// Read records from a stream. A not-found answer is `FloError.NotFound`,
-    /// never an empty result.
+    /// Read records from a stream. Without `block_ms`, a stream that isn't
+    /// there (never created by a create or a first append, or deleted) is
+    /// `FloError.NotFound`; one that is there with nothing to read is an
+    /// empty result. A blocking read of a stream not created yet waits for
+    /// its first append. A reader that may start before its stream exists
+    /// should catch not found and read again.
     /// **Caller owns the returned `StreamReadResult` and must call `result.deinit()`.**
     pub fn read(
         self: *Stream,
@@ -865,6 +869,29 @@ test "delete sends the stream as the key, with the force flag only when asked; a
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 2, 0, 0x2C, 0 }, srv.lastBody());
 
     try std.testing.expectError(FloError.Conflict, stream.delete("events", .{}));
+}
+
+test "a read answered not found is error.NotFound, and an ok empty answer is an empty result" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    // not_found, reason not_found (13), ran no.
+    srv.replies = &.{
+        .{ .status = @intFromEnum(types.StatusCode.not_found), .body = "\x0d\x00\x00stream not found" },
+        .{ .status = 0, .body = "\x00\x00\x00\x00" },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    try std.testing.expectError(FloError.NotFound, stream.read("nope", .{}));
+    try std.testing.expectEqualStrings("stream not found", client.lastError().?.message);
+    var empty = try stream.read("events", .{});
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.records.len);
 }
 
 test "info of a stream the server doesn't know is not found, not an empty stream" {

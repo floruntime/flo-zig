@@ -1596,3 +1596,41 @@ test "live: the server refuses a ts write before 1970 and a read cursor it didn'
     try testing.expectError(flo.FloError.BadRequest, ts.read("refused", .{ .cursor = "short" }));
     try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "a cursor is the 16 bytes a page answered") != null);
 }
+
+test "live: a non-blocking read of a stream never written is not found; one read past its end is empty; a blocking one waits" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    try live.createNamespace();
+    var stream = flo.Stream.init(&live.client);
+    try testing.expectError(flo.FloError.NotFound, stream.read("never-written", .{}));
+    try testing.expectEqual(flo.StatusCode.not_found, @as(flo.StatusCode, @enumFromInt(live.client.lastError().?.code)));
+
+    const last = (try stream.append("written", "one", .{})).id;
+    var past = try stream.read("written", .{ .start = last });
+    defer past.deinit();
+    try testing.expectEqual(@as(usize, 0), past.records.len);
+
+    // A blocking read of a stream not there yet waits, then answers empty.
+    var waited = try stream.read("not-yet", .{ .block_ms = 200 });
+    defer waited.deinit();
+    try testing.expectEqual(@as(usize, 0), waited.records.len);
+}
+
+test "live: a ts.read of a measurement never written is not found; a range with no points is an empty page" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    try live.createNamespace();
+    var ts = flo.TimeSeries.init(&live.client);
+    try testing.expectError(flo.FloError.NotFound, ts.read("never-written", .{}));
+    var it = ts.readAll("never-written", .{});
+    defer it.deinit();
+    try testing.expectError(flo.FloError.NotFound, it.next());
+
+    _ = try ts.write("real", 1, .{ .time_ns = 1_000_000_000 });
+    var none = try ts.read("real", .{ .from_ns = 2_000_000_000 });
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.points.len);
+    try testing.expect(none.cursor == null);
+}

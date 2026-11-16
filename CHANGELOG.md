@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A non-blocking `stream.read` of a stream that isn't there, and a `ts.read`
+  of a field with no matching series, are `error.NotFound` (the server now
+  answers not found, not an empty result); a blocking read still waits for a
+  stream's first append. Catch not found and start again if a reader may
+  start first.
 - New `TimeSeries`: `write`, `read` (one page), `readAll` (an iterator over
   every page) and `floql`. Times are Unix nanoseconds as `i64`; a write's
   `time_ns` of 0 takes the server's time, and one before 1970 is refused

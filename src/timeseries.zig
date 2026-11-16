@@ -151,7 +151,9 @@ pub const TimeSeries = struct {
     /// `cursor` back for the next page, and stop when it is null, not when
     /// a page comes back short. A page continues strictly after the
     /// cursor (before it, newest first), so a point there for the whole
-    /// read is read once.
+    /// read is read once. A field with no series matching the tag filter
+    /// is `FloError.NotFound`; one with series but no points in range is
+    /// an empty page.
     /// **Caller owns the returned `ReadPage` and must call `page.deinit()`.**
     pub fn read(self: *TimeSeries, measurement: []const u8, options: ReadOptions) FloError!ReadPage {
         var buf: [MAX_READ_BODY]u8 = undefined;
@@ -482,6 +484,26 @@ test "a refused cursor is bad_request with the server's text, from read and from
     var it = ts.readAll("cpu", .{ .cursor = "short" });
     defer it.deinit();
     try testing.expectError(FloError.BadRequest, it.next());
+}
+
+test "a read of a series that isn't there is error.NotFound; an empty page is ok" {
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        .{ .status = @intFromEnum(types.StatusCode.not_found), .body = "\x0d\x00\x00not found: 'cpu' has no series of field 'value'" },
+        .{ .status = 0, .body = "\x00\x00\x00" },
+    };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var ts = TimeSeries.init(&client);
+    try testing.expectError(FloError.NotFound, ts.read("cpu", .{}));
+    try testing.expectEqualStrings("not found: 'cpu' has no series of field 'value'", client.lastError().?.message);
+    var empty = try ts.read("cpu", .{ .from_ns = 5, .to_ns = 6 });
+    defer empty.deinit();
+    try testing.expectEqual(@as(usize, 0), empty.points.len);
+    try testing.expect(empty.cursor == null);
 }
 
 test "a not-found read ends the iterator with the error, not as the end" {
