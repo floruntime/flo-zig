@@ -151,7 +151,7 @@ pub const Stream = struct {
         );
         defer response.deinit();
 
-        if (response.status != .ok) return kv_mod.refusalError(&response);
+        if (response.status != .ok) return kv_mod.refusalError(self.client, &response);
 
         return parseStreamReadResponse(self.client.allocator, response.data);
     }
@@ -895,14 +895,16 @@ test "a read answered not found is error.NotFound, and an ok empty answer is an 
     try std.testing.expectEqual(@as(usize, 0), empty.records.len);
 }
 
-test "a read's not found marked stale is StaleNotFound; unmarked it stays NotFound" {
+test "a read's not found marked stale is StaleNotFound; unmarked, or with another reason, it stays NotFound" {
     const test_server = @import("test_server.zig");
     var srv = try test_server.OkServer.listen();
-    // not_found, reason unclassified (12), ran no; the first marked stale.
-    const missing = "\x0c\x00\x00stream not found";
+    // not_found, ran no: reason not_found (13), then unclassified (12).
+    const missing = "\x0d\x00\x00stream not found";
+    const unclassified = "\x0c\x00\x00stream not found";
     srv.replies = &.{
         .{ .status = @intFromEnum(types.StatusCode.not_found), .body = missing, .flags = 1 },
         .{ .status = @intFromEnum(types.StatusCode.not_found), .body = missing },
+        .{ .status = @intFromEnum(types.StatusCode.not_found), .body = unclassified, .flags = 1 },
     };
     try srv.start();
     defer srv.deinit();
@@ -912,6 +914,7 @@ test "a read's not found marked stale is StaleNotFound; unmarked it stays NotFou
     try client.connect();
     var stream = Stream.init(&client);
     try std.testing.expectError(FloError.StaleNotFound, stream.read("events", .{}));
+    try std.testing.expectError(FloError.NotFound, stream.read("events", .{}));
     try std.testing.expectError(FloError.NotFound, stream.read("events", .{}));
 }
 

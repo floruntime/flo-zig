@@ -163,7 +163,7 @@ pub const TimeSeries = struct {
         const body = try encodeReadBody(&buf, options);
         var response = try self.client.sendRequest(.ts_read, self.client.getNamespace(options.namespace), measurement, body, "");
         defer response.deinit();
-        if (response.status != .ok) return kv.refusalError(&response);
+        if (response.status != .ok) return kv.refusalError(self.client, &response);
         var page = try decodeReadAnswer(self.client.allocator, response.data);
         page.stale = response.stale;
         return page;
