@@ -378,8 +378,8 @@ bytes, takes nothing new: a read returns `error.GroupHeldFull` (status
 again won't help, so the client doesn't retry it; the stream worker logs it
 once and backs off. The group's room comes back as its consumers ack or nack,
 but dead records count too and stay until the group is deleted or a trim of
-the stream cuts them. At the shard's cap, it clears as other groups and
-queues on the shard drain.
+the stream cuts them. At the shard's cap, it clears as any of the shard's
+groups and queues, this one included, are acked, consumed or purged.
 
 A nack carries an error of up to 1024 bytes. A nack with `.abandon = true`
 hands records back unstarted: ready at once, the delivery counted but no
@@ -425,6 +425,46 @@ defer members.deinit();
 var groups = try stream.groupList("events", .{});
 defer groups.deinit();
 ```
+
+### Time Series
+
+Times are Unix nanoseconds, as `i64`, on the way in and out.
+
+```zig
+var ts = flo.TimeSeries.init(&client);
+
+// A point at a time of your choosing, in ns; leave time_ns 0 for the
+// server's time. A time before 1970 is refused bad_request.
+const w = try ts.write("cpu", 0.42, .{ .field = "user", .tags = "host=web-1,dc=eu", .time_ns = 1_700_000_000_123_456_789 });
+std.debug.print("written at {d} ns\n", .{w.time_ns});
+
+// One page, newest first: up to `limit` (1 to 4096) points of every series
+// matching the tag filter, merged in time order, then write order.
+var page = try ts.read("cpu", .{ .field = "user", .tags = "host=web-1", .limit = 100, .order = .newest_first });
+defer page.deinit();
+// Pass page.cursor back as .cursor for the next page; null means the last.
+
+// Every point, page by page.
+var it = ts.readAll("cpu", .{ .field = "user", .from_ns = 1_700_000_000_000_000_000 });
+defer it.deinit();
+while (try it.next()) |p| std.debug.print("{d} {d}\n", .{ p.time_ns, p.value });
+
+// FloQL. Its answer's times are ms.
+var result = try ts.floql("cpu{host=\"web-1\"}[1h] | window(5m) | avg()", .{});
+defer result.deinit();
+```
+
+A page continues strictly after the cursor (before it, newest first), so
+a point that was there for the whole read is read once, none skipped. Page
+until the cursor is null, not until a page comes back short: a page can be
+short, or empty, with more to come. The cursor is opaque bytes; one that
+isn't the 16 bytes a page answered is refused bad_request. `readAll` returns any refusal
+from `next`, so a not-found read ends it with `error.NotFound`, not as the
+end of the points.
+
+A FloQL query whose answer holds more than 4096 raw points is refused
+bad_request: aggregate them, narrow the query, or page them with `read`.
+`client.lastError()` carries the server's text.
 
 ### Action Operations
 
@@ -619,6 +659,9 @@ std.debug.print("Job {s}: {s} (processed {d} records)\n", .{
 });
 // Why a failed job failed, or why this node holds a running one
 if (status.reason) |reason| std.debug.print("{s}\n", .{reason});
+// A job reading a time-series source with a lateness window counts points
+// that came later than it; null when there is no count to show.
+if (status.late()) |late| std.debug.print("at least {d} points later than {d} ms\n", .{ late.at_least, late.edge_ms });
 
 // A stopped, cancelled or failed job keeps its slot until it is removed
 try processing.remove(job_id, .{});
@@ -666,7 +709,7 @@ All operations return `flo.FloError` which includes:
 - `StaleNotFound` - `get` or `jsonGet` on a halted shard: the key is missing as of the halt, which isn't the same as missing
 - `StaleReport` - An action complete, fail or touch for a delivery that has moved on (never resent)
 - `Limit` - The node or shard is at a limit on what it holds (status `limit`); `lastError().?.reason` names which: `memory_budget`, `too_many_actions` (counted per shard), `too_many_workflow_definitions` or `too_many_workflow_runs`. The limits are built into the server, not settings: retrying won't clear it until something is deleted (or, for the memory budget, the node gets more memory), so nothing retries it. It doesn't mean permanent. It never ran
-- `GroupHeldFull` - A group read took nothing new (status `overloaded`, reason `group_held_full`): the group is at its caps, leased, ready and dead records together, or the shard's queues and groups are at their shared cap. Not retried. It clears as the group's records are acked or nacked, its dead records removed (deleting the group, or a stream trim), or, at the shard's cap, as other groups and queues drain
+- `GroupHeldFull` - A group read took nothing new (status `overloaded`, reason `group_held_full`): the group is at its caps, leased, ready and dead records together, or the shard's queues and groups are at their shared cap. Not retried. It clears as the group's records are acked or nacked, its dead records removed (deleting the group, or a stream trim), or, at the shard's cap, as this group's records and the shard's other groups and queues are acked, consumed or purged
 - `UnexpectedResponse` - Unexpected response format
 - `ServerError` - Generic server error, including status codes this SDK doesn't know
 
@@ -753,6 +796,11 @@ worker handles at once (at most `batch_size`). Above 1, each runs on a thread wi
 connection of its own for its ack or nack, so a batch's records are handled out of order,
 and handlers and the worker's allocator must be thread-safe. The next read waits for the
 whole batch. `drain()` and `stop()` are safe to call from any thread.
+
+A group read answered not found ends the worker's run: `start()` returns
+`error.NotFound` rather than reading again or stopping as if there were no
+more records. A worker that may start before its stream exists should catch
+it and start again. `stream.read` returns `error.NotFound` the same way.
 
 A stream worker acks a record whose handler returns, and nacks one whose handler
 fails, naming the read's lease. The group's lease runs for the whole batch from its

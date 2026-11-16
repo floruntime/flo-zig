@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- New `TimeSeries`: `write`, `read` (one page), `readAll` (an iterator over
+  every page) and `floql`. Times are Unix nanoseconds as `i64`; a write's
+  `time_ns` of 0 takes the server's time, and one before 1970 is refused
+  bad_request. A read takes a field, a tag filter, an inclusive ns range, a
+  limit (1 to 4096), an `Order` (`oldest_first`, `newest_first`) and an
+  opaque cursor; page until the cursor is null. FloQL answers in ms, and a raw
+  answer of more than 4096 points is refused bad_request.
+- **Breaking:** option tag `ts_timestamp` (0x67) is `ts_timestamp_ns`, an i64
+  of nanoseconds.
+- `ProcessingStatusResult` gains `late_edge_ms` and `late_points`, and
+  `late()`: at least that many of a job's TS source points came later than
+  the edge; null (edge `NO_LATE_EDGE`) when there is no count.
+- `StreamWorker.start()` returns `error.NotFound` when a group read is
+  answered not found, rather than reading again.
+- The `group_held_full` docs say the shard's cap clears as any of its groups
+  and queues drain, this group included.
 - **Breaking:** pinned to the table hash of flo `fd771c1d` (`0xc1f93eb0ed86a281`);
   this SDK and older servers refuse each other.
 - `Reason` is non-exhaustive: a reason this SDK predates decodes as its number,

@@ -237,6 +237,7 @@ pub fn isTableOp(op: OpCode) bool {
         .stream_group_list, .stream_group_members, .queue_peek, .queue_dequeue, .queue_complete, .queue_fail, .queue_touch => true,
         .action_status, .action_await, .action_complete, .action_fail, .action_touch, .action_info => true,
         .worker_list, .worker_info, .processing_remove => true,
+        .ts_read => true,
         else => false,
     };
 }

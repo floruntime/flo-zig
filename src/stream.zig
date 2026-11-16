@@ -90,7 +90,8 @@ pub const Stream = struct {
         return buf;
     }
 
-    /// Read records from a stream.
+    /// Read records from a stream. A not-found answer is `FloError.NotFound`,
+    /// never an empty result.
     /// **Caller owns the returned `StreamReadResult` and must call `result.deinit()`.**
     pub fn read(
         self: *Stream,

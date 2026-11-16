@@ -1486,3 +1486,113 @@ test "live: a report to a deleted group is not found" {
     try testing.expectEqual(flo.Reason.not_found, live.client.lastError().?.reason);
     try testing.expectError(flo.FloError.NotFound, stream.groupNack("deleted-group", "g", got.lease, got.records, .{ .consumer = "c1", .abandon = true }));
 }
+
+/// 5000 points over three series, two to a time, each valued its write
+/// order, from `base` ns on: the write order is the (time, write) order.
+const ts_points = 5000;
+
+fn writeTsPoints(ts: *flo.TimeSeries, measurement: []const u8, base: i64) !void {
+    const hosts = [_][]const u8{ "host=a", "host=b", "host=c" };
+    for (0..ts_points) |i| {
+        const at = base + @as(i64, @intCast(i / 2)) * 1000;
+        const w = try ts.write(measurement, @floatFromInt(i), .{ .tags = hosts[i % 3], .time_ns = at });
+        try testing.expectEqual(at, w.time_ns);
+    }
+}
+
+test "live: ts.read pages 5000 points over three series in both orders, each once and in order" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    try live.createNamespace();
+    var ts = flo.TimeSeries.init(&live.client);
+    const base: i64 = @intCast(std.time.nanoTimestamp() - 10 * std.time.ns_per_min);
+    try writeTsPoints(&ts, "load", base);
+
+    // Oldest first, through the iterator.
+    var it = ts.readAll("load", .{ .limit = 700 });
+    defer it.deinit();
+    var n: usize = 0;
+    while (try it.next()) |p| : (n += 1) {
+        try testing.expectEqual(@as(f64, @floatFromInt(n)), p.value);
+        try testing.expectEqual(base + @as(i64, @intCast(n / 2)) * 1000, p.time_ns);
+    }
+    try testing.expectEqual(@as(usize, ts_points), n);
+
+    // Newest first, page by page until the cursor is none.
+    var cursor_buf: [flo.timeseries.CURSOR_LEN]u8 = undefined;
+    var cursor: ?[]const u8 = null;
+    var want: usize = ts_points;
+    var pages: usize = 0;
+    while (true) {
+        pages += 1;
+        var page = try ts.read("load", .{ .limit = 999, .order = .newest_first, .cursor = cursor });
+        defer page.deinit();
+        for (page.points) |p| {
+            want -= 1;
+            try testing.expectEqual(@as(f64, @floatFromInt(want)), p.value);
+        }
+        const next = page.cursor orelse break;
+        @memcpy(cursor_buf[0..next.len], next);
+        cursor = cursor_buf[0..next.len];
+    }
+    try testing.expectEqual(@as(usize, 0), want);
+    try testing.expect(pages >= 6);
+
+    // Newest first with limit 1 is the last point written.
+    var last = try ts.read("load", .{ .limit = 1, .order = .newest_first });
+    defer last.deinit();
+    try testing.expectEqual(@as(usize, 1), last.points.len);
+    try testing.expectEqual(@as(f64, ts_points - 1), last.points[0].value);
+    try testing.expect(last.cursor != null);
+
+    // A tag filter takes only its series.
+    var b = ts.readAll("load", .{ .tags = "host=b" });
+    defer b.deinit();
+    var b_count: usize = 0;
+    while (try b.next()) |p| : (b_count += 1) try testing.expectEqual(@as(f64, 1), @mod(p.value, 3));
+    // i % 3 == 1 for i below 5000.
+    try testing.expectEqual(@as(usize, (ts_points + 1) / 3), b_count);
+
+    // A raw FloQL answer of more than 4096 points is refused, with the server's text.
+    try testing.expectError(flo.FloError.BadRequest, ts.floql("load[1h]", .{}));
+    try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "the answer holds more than 4096 points; aggregate them, narrow the query, or page through them with ts read") != null);
+    // Within the cap it answers, in ms.
+    var small = try ts.floql("load{host=\"a\"}[1h] | window(1m) | count()", .{});
+    defer small.deinit();
+    try testing.expect(small.series.len >= 1);
+}
+
+test "live: a point written at a time that isn't a whole ms reads back at exactly that time" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    try live.createNamespace();
+    var ts = flo.TimeSeries.init(&live.client);
+    const at: i64 = 1_700_000_000_123_456_789;
+    const w = try ts.write("exact", 2.5, .{ .field = "f", .time_ns = at });
+    try testing.expectEqual(at, w.time_ns);
+    var page = try ts.read("exact", .{ .field = "f", .from_ns = at, .to_ns = at });
+    defer page.deinit();
+    try testing.expectEqual(@as(usize, 1), page.points.len);
+    try testing.expectEqual(flo.timeseries.Point{ .time_ns = at, .value = 2.5 }, page.points[0]);
+    try testing.expect(page.cursor == null);
+
+    // No time: the server's, now, in ns.
+    const before: i64 = @intCast(std.time.nanoTimestamp());
+    const now = try ts.write("exact", 1, .{ .field = "f" });
+    try testing.expect(now.time_ns >= before - std.time.ns_per_s and now.time_ns <= before + std.time.ns_per_min);
+}
+
+test "live: the server refuses a ts write before 1970 and a read cursor it didn't answer" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    try live.createNamespace();
+    var ts = flo.TimeSeries.init(&live.client);
+    try testing.expectError(flo.FloError.BadRequest, ts.write("refused", 1, .{ .time_ns = -1 }));
+    try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "ts write: a point's time must not be before 1970") != null);
+    _ = try ts.write("refused", 1, .{});
+    try testing.expectError(flo.FloError.BadRequest, ts.read("refused", .{ .cursor = "short" }));
+    try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "a cursor is the 16 bytes a page answered") != null);
+}
