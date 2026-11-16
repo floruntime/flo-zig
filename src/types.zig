@@ -343,6 +343,7 @@ pub const OpCode = enum(u16) {
     ts_list = 0x1A4,
     ts_delete = 0x1A5,
     ts_retention = 0x1A6,
+    ts_info = 0x1A7,
 
     // ── Actions (0x300 – 0x31F) ──
     action_register = 0x300,
@@ -495,9 +496,9 @@ pub const OptionTag = enum(u8) {
     abandon = 0x34, // void: A nack hands its records back unstarted: ready at once, no failure counted
 
     // Time-Series Options (0x60 - 0x6F)
-    ts_from_ms = 0x60, // i64: Start of time range (inclusive, unix ms)
-    ts_to_ms = 0x61, // i64: End of time range (inclusive, 0 = now)
-    ts_window_ms = 0x62, // i64: Aggregation window size (ms)
+    ts_from_ns = 0x60, // i64: A query's start, inclusive, in Unix ns (0 = no bound)
+    ts_to_ns = 0x61, // i64: A query's end, inclusive, in Unix ns (0 = no bound)
+    ts_window_ns = 0x62, // i64: A query's window, in ns (absent = a minute; 0 is refused)
     ts_aggregation = 0x63, // string: Aggregation function name (avg, sum, count, min, max)
     ts_field = 0x64, // string: Field name filter (empty = "value")
     ts_tags = 0x65, // string: Comma-separated tag filters "key=val,key2=val2"

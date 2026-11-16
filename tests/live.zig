@@ -1634,3 +1634,41 @@ test "live: a ts.read of a measurement never written is not found; a range with 
     try testing.expectEqual(@as(usize, 0), none.points.len);
     try testing.expect(none.cursor == null);
 }
+
+test "live: a ts query buckets points by an ns window, and FloQL and info answer the ns times written" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    try live.createNamespace();
+    var ts = flo.TimeSeries.init(&live.client);
+    const window: i64 = 1000;
+    // Ten minutes back, on a window boundary.
+    const base: i64 = @divFloor(@as(i64, @intCast(std.time.nanoTimestamp())) - 10 * std.time.ns_per_min, window) * window;
+    const offsets = [_]i64{ 0, 100, 1500, 2999 };
+    for (offsets, 0..) |o, i| _ = try ts.write("agg", @floatFromInt(i + 1), .{ .time_ns = base + o });
+
+    var got = try ts.query("agg", .{ .from_ns = base, .to_ns = base + 2999, .window_ns = window, .aggregation = .sum });
+    defer got.deinit();
+    try testing.expectEqualSlices(flo.timeseries.Bucket, &.{
+        .{ .start_ns = base, .value = 3 },
+        .{ .start_ns = base + 1000, .value = 3 },
+        .{ .start_ns = base + 2000, .value = 4 },
+    }, got.buckets);
+
+    var fq = try ts.floql("agg[1h]", .{});
+    defer fq.deinit();
+    try testing.expectEqual(@as(usize, 1), fq.series.len);
+    try testing.expectEqual(offsets.len, fq.series[0].points.len);
+    for (fq.series[0].points, offsets) |p, o| try testing.expectEqual(base + o, p.time_ns);
+
+    var info = try ts.info("agg", .{});
+    defer info.deinit();
+    try testing.expectEqual(@as(u64, offsets.len), info.points);
+    try testing.expectEqual(@as(?i64, base), info.oldest_ns);
+    try testing.expectEqual(@as(?i64, base + 2999), info.newest_ns);
+
+    // A point every ns for 1100 ns: a 1 ns window makes more than 1024 windows.
+    for (0..1100) |i| _ = try ts.write("many", 1, .{ .time_ns = base + @as(i64, @intCast(i)) });
+    try testing.expectError(flo.FloError.BadRequest, ts.query("many", .{ .from_ns = base, .window_ns = 1 }));
+    try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "widen the window (it is in nanoseconds)") != null);
+}

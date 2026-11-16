@@ -1,8 +1,9 @@
 //! Flo Time-Series Operations
 //!
 //! Write points, read a measurement field's points a page at a time (oldest
-//! or newest first), and run FloQL queries. Times are Unix nanoseconds, as
-//! i64, on the way in and out.
+//! or newest first), aggregate them into windows, describe a measurement,
+//! and run FloQL queries. Every time and window is nanoseconds, as i64, on
+//! the way in and out.
 //!
 //! ```zig
 //! var ts = flo.TimeSeries.init(&client);
@@ -94,6 +95,7 @@ pub const ReadPage = struct {
     }
 };
 
+/// Options for `floql` and `info`.
 pub const FloQLOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
@@ -122,10 +124,70 @@ pub const FloQLSeries = struct {
     }
 };
 
-/// A FloQL point. FloQL answers in Unix milliseconds.
+/// A FloQL point, its time in Unix nanoseconds.
 pub const FloQLPoint = struct {
-    time_ms: i64,
+    time_ns: i64,
     value: f64,
+};
+
+pub const Aggregation = enum { avg, sum, count, min, max };
+
+pub const QueryOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// The field aggregated; the server's default is "value".
+    field: ?[]const u8 = null,
+    /// Only series whose tags include every "key=value" pair of this
+    /// comma-separated list.
+    tags: ?[]const u8 = null,
+    /// The earliest time, inclusive, in Unix ns; null (or 0) for no bound.
+    from_ns: ?i64 = null,
+    /// The latest time, inclusive, in Unix ns; null (or 0) for no bound.
+    to_ns: ?i64 = null,
+    /// The window's width in ns; null for a minute. 0 or a negative width
+    /// is refused, and so is one that makes more than 1024 windows.
+    window_ns: ?i64 = null,
+    aggregation: Aggregation = .avg,
+};
+
+/// One window's aggregate: the window's start, in Unix ns, aligned to the
+/// epoch (time / window * window).
+pub const Bucket = struct {
+    start_ns: i64,
+    value: f64,
+};
+
+/// A query's windows, oldest first; a window with no points is left out.
+/// Free with `deinit`.
+pub const QueryResult = struct {
+    buckets: []Bucket,
+    allocator: Allocator,
+
+    pub fn deinit(self: *QueryResult) void {
+        self.allocator.free(self.buckets);
+    }
+};
+
+/// A measurement's summary. Free with `deinit`.
+pub const Info = struct {
+    /// Its series: each field of each tag set.
+    series: u32,
+    /// Its distinct fields, counted up to 256.
+    field_count: u32,
+    /// It has more fields than were counted or listed.
+    fields_capped: bool,
+    /// Its fields' names, up to 256 of them.
+    fields: [][]const u8,
+    points: u64,
+    /// Its oldest and newest points' times, in Unix ns; null without points.
+    oldest_ns: ?i64,
+    newest_ns: ?i64,
+    allocator: Allocator,
+
+    pub fn deinit(self: *Info) void {
+        for (self.fields) |f| self.allocator.free(f);
+        self.allocator.free(self.fields);
+    }
 };
 
 /// Time-series operations interface
@@ -184,12 +246,35 @@ pub const TimeSeries = struct {
         return it;
     }
 
-    /// Run a FloQL query. An answer of more than 4096 raw points is
+    /// Aggregate a field's points into windows of `window_ns`.
+    /// **Caller owns the returned `QueryResult` and must call `result.deinit()`.**
+    pub fn query(self: *TimeSeries, measurement: []const u8, options: QueryOptions) FloError!QueryResult {
+        var opts_buf: [2 * (2 + 255) + 3 * 10 + 2 + 5]u8 = undefined;
+        const opts = try encodeQueryOptions(&opts_buf, options);
+        var response = try self.client.sendRequest(.ts_query, self.client.getNamespace(options.namespace), measurement, "", opts);
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeQueryAnswer(self.client.allocator, response.data);
+    }
+
+    /// A measurement's series, fields, points and the times of its oldest
+    /// and newest points. One with no series is `FloError.NotFound`.
+    /// **Caller owns the returned `Info` and must call `info.deinit()`.**
+    pub fn info(self: *TimeSeries, measurement: []const u8, options: FloQLOptions) FloError!Info {
+        var response = try self.client.sendRequest(.ts_info, self.client.getNamespace(options.namespace), measurement, "", "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeInfoAnswer(self.client.allocator, response.data);
+    }
+
+    /// Run a FloQL query. In its text, a bare number in a range is epoch
+    /// milliseconds (`cpu[1700000000000..1700000060000]`); `[1h]` and
+    /// `[2h..1h]` count back from now. The answer's times are ns. An answer of more than 4096 raw points is
     /// refused bad_request (aggregate them, narrow the query, or page
     /// with `read`); `client.lastError()` carries the server's text.
     /// **Caller owns the returned `FloQLResult` and must call `result.deinit()`.**
-    pub fn floql(self: *TimeSeries, query: []const u8, options: FloQLOptions) FloError!FloQLResult {
-        var response = try self.client.sendRequest(.ts_floql, self.client.getNamespace(options.namespace), "", query, "");
+    pub fn floql(self: *TimeSeries, text: []const u8, options: FloQLOptions) FloError!FloQLResult {
+        var response = try self.client.sendRequest(.ts_floql, self.client.getNamespace(options.namespace), "", text, "");
         defer response.deinit();
         if (response.status != .ok) return response.status.toError();
         return decodeFloQLAnswer(self.client.allocator, response.data);
@@ -254,6 +339,17 @@ fn encodeWriteOptions(buf: []u8, options: WriteOptions) FloError![]const u8 {
     if (options.tags) |t| try builder.addBytes(.ts_tags, t);
     // 0 is the server's time; the option is left out for it.
     if (options.time_ns != 0) try builder.addU64(.ts_timestamp_ns, @bitCast(options.time_ns));
+    return builder.getOptions();
+}
+
+fn encodeQueryOptions(buf: []u8, options: QueryOptions) FloError![]const u8 {
+    var builder = wire.OptionsBuilder.init(buf);
+    if (options.field) |f| try builder.addBytes(.ts_field, f);
+    if (options.tags) |t| try builder.addBytes(.ts_tags, t);
+    if (options.from_ns) |t| try builder.addU64(.ts_from_ns, @bitCast(t));
+    if (options.to_ns) |t| try builder.addU64(.ts_to_ns, @bitCast(t));
+    if (options.window_ns) |w| try builder.addU64(.ts_window_ns, @bitCast(w));
+    try builder.addBytes(.ts_aggregation, @tagName(options.aggregation));
     return builder.getOptions();
 }
 
@@ -341,8 +437,50 @@ fn decodeReadAnswer(allocator: Allocator, data: []const u8) FloError!ReadPage {
     return .{ .points = points, .cursor = if (cursor) |c| try allocator.dupe(u8, c) else null, .allocator = allocator };
 }
 
+/// ts.query's answer: [series:u32], 0 or 1, then for the one
+/// [name_len:u32][name][buckets:u32]([start_ns:i64][value:f64])*.
+fn decodeQueryAnswer(allocator: Allocator, data: []const u8) FloError!QueryResult {
+    var r: Reader = .{ .data = data };
+    const series = try r.int(u32);
+    if (series > 1) return FloError.UnexpectedResponse;
+    var buckets: []Bucket = &.{};
+    if (series == 1) {
+        _ = try r.lenBytes(u32);
+        const n = try r.int(u32);
+        if (n > r.remaining() / 16) return FloError.IncompleteResponse;
+        buckets = try allocator.alloc(Bucket, n);
+        for (buckets) |*b| b.* = .{ .start_ns = r.int(i64) catch unreachable, .value = @bitCast(r.int(u64) catch unreachable) };
+    } else buckets = try allocator.alloc(Bucket, 0);
+    errdefer allocator.free(buckets);
+    try r.end();
+    return .{ .buckets = buckets, .allocator = allocator };
+}
+
+/// ts.info's answer: series, field_count, fields_capped, fields
+/// ([count:u16]([len:u16][name])*), points, oldest_ns, newest_ns.
+fn decodeInfoAnswer(allocator: Allocator, data: []const u8) FloError!Info {
+    var r: Reader = .{ .data = data };
+    const series = try r.int(u32);
+    const field_count = try r.int(u32);
+    const fields_capped = try r.boolean();
+    const count = try r.int(u16);
+    if (count > r.remaining() / 2) return FloError.IncompleteResponse;
+    const fields = try allocator.alloc([]const u8, count);
+    var filled: usize = 0;
+    errdefer {
+        for (fields[0..filled]) |f| allocator.free(f);
+        allocator.free(fields);
+    }
+    while (filled < count) : (filled += 1) fields[filled] = try allocator.dupe(u8, try r.lenBytes(u16));
+    const points = try r.int(u64);
+    const oldest_ns = try r.opt(i64);
+    const newest_ns = try r.opt(i64);
+    try r.end();
+    return .{ .series = series, .field_count = field_count, .fields_capped = fields_capped, .fields = fields, .points = points, .oldest_ns = oldest_ns, .newest_ns = newest_ns, .allocator = allocator };
+}
+
 /// A FloQL answer: [series:u32]([key_len:u32][key][field_len:u32][field]
-/// [points:u32]([time_ms:i64][value:f64])*)*.
+/// [points:u32]([time_ns:i64][value:f64])*)*.
 fn decodeFloQLAnswer(allocator: Allocator, data: []const u8) FloError!FloQLResult {
     var r: Reader = .{ .data = data };
     const count = try r.int(u32);
@@ -364,7 +502,7 @@ fn decodeFloQLAnswer(allocator: Allocator, data: []const u8) FloError!FloQLResul
         const field_copy = try allocator.dupe(u8, field);
         errdefer allocator.free(field_copy);
         const points = try allocator.alloc(FloQLPoint, n);
-        for (points) |*p| p.* = .{ .time_ms = r.int(i64) catch unreachable, .value = @bitCast(r.int(u64) catch unreachable) };
+        for (points) |*p| p.* = .{ .time_ns = r.int(i64) catch unreachable, .value = @bitCast(r.int(u64) catch unreachable) };
         series[filled] = .{ .key = key_copy, .field = field_copy, .points = points };
     }
     try r.end();
@@ -590,13 +728,13 @@ test "a write before 1970 is the server's bad_request, with its text" {
 test "a FloQL answer decodes; one cut anywhere or short of memory leaks nothing" {
     const a = testing.allocator;
     const answer = le(@as(u32, 1)) ++ le(@as(u32, 3)) ++ "cpu" ++ le(@as(u32, 5)) ++ "value" ++ le(@as(u32, 2)) ++
-        le(@as(i64, 1000)) ++ le(@as(f64, 1.5)) ++ le(@as(i64, 2000)) ++ le(@as(f64, 2.5));
+        le(@as(i64, 1000)) ++ le(@as(f64, 1.5)) ++ le(@as(i64, 1_700_000_000_123_456_789)) ++ le(@as(f64, 2.5));
     var got = try decodeFloQLAnswer(a, answer);
     defer got.deinit();
     try testing.expectEqual(@as(usize, 1), got.series.len);
     try testing.expectEqualStrings("cpu", got.series[0].key);
     try testing.expectEqualStrings("value", got.series[0].field);
-    try testing.expectEqual(FloQLPoint{ .time_ms = 2000, .value = 2.5 }, got.series[0].points[1]);
+    try testing.expectEqual(FloQLPoint{ .time_ns = 1_700_000_000_123_456_789, .value = 2.5 }, got.series[0].points[1]);
     for (0..answer.len) |n| try testing.expectError(FloError.IncompleteResponse, decodeFloQLAnswer(a, answer[0..n]));
     try testing.checkAllAllocationFailures(a, decodeAndFree, .{@as([]const u8, answer)});
 }
@@ -604,4 +742,93 @@ test "a FloQL answer decodes; one cut anywhere or short of memory leaks nothing"
 fn decodeAndFree(a: Allocator, data: []const u8) !void {
     var r = try decodeFloQLAnswer(a, data);
     r.deinit();
+}
+
+test "a query sends its times and window as i64 ns, a fraction of a ms included, and decodes its buckets" {
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 0, .body = &(le(@as(u32, 1)) ++ le(@as(u32, 3)) ++ "cpu".* ++ le(@as(u32, 2)) ++ le(@as(i64, 1_700_000_000_000_000_000)) ++ le(@as(f64, 1.5)) ++ le(@as(i64, 1_700_000_000_000_000_250)) ++ le(@as(f64, 4))) },
+        .{ .status = 0, .body = &le(@as(u32, 0)) },
+    };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var ts = TimeSeries.init(&client);
+
+    var got = try ts.query("cpu", .{ .field = "user", .tags = "host=a", .from_ns = 1_700_000_000_000_000_001, .to_ns = 1_700_000_000_123_456_789, .window_ns = 250, .aggregation = .max });
+    defer got.deinit();
+    try testing.expectEqual(@as(u16, 0x1A2), srv.last_op);
+    try testing.expectEqualStrings("cpu", srv.lastKey());
+    try testing.expectEqualSlices(u8, "\x64\x04user" ++ "\x65\x06host=a" ++ "\x60\x08" ++ le(@as(i64, 1_700_000_000_000_000_001)) ++
+        "\x61\x08" ++ le(@as(i64, 1_700_000_000_123_456_789)) ++ "\x62\x08" ++ le(@as(i64, 250)) ++ "\x63\x03max", srv.lastOptions());
+    try testing.expectEqualSlices(Bucket, &.{ .{ .start_ns = 1_700_000_000_000_000_000, .value = 1.5 }, .{ .start_ns = 1_700_000_000_000_000_250, .value = 4 } }, got.buckets);
+
+    // No bounds or window: the server's defaults; no windows answered.
+    var none = try ts.query("cpu", .{});
+    defer none.deinit();
+    try testing.expectEqualSlices(u8, "\x63\x03avg", srv.lastOptions());
+    try testing.expectEqual(@as(usize, 0), none.buckets.len);
+}
+
+test "a query whose window makes too many buckets is bad_request, with the server's text" {
+    const text = "bad request: the range holds more than 1024 windows of this width; widen the window (it is in nanoseconds) or narrow the range";
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{.{ .status = @intFromEnum(types.StatusCode.bad_request), .body = "\x0c\x00\x00" ++ text }};
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var ts = TimeSeries.init(&client);
+    try testing.expectError(FloError.BadRequest, ts.query("cpu", .{ .window_ns = 1 }));
+    try testing.expectEqualStrings(text, client.lastError().?.message);
+}
+
+test "a query answer cut anywhere is refused" {
+    const answer = le(@as(u32, 1)) ++ le(@as(u32, 1)) ++ "c".* ++ le(@as(u32, 1)) ++ le(@as(i64, 5)) ++ le(@as(f64, 1));
+    for (0..answer.len) |n| try testing.expectError(FloError.IncompleteResponse, decodeQueryAnswer(testing.allocator, answer[0..n]));
+    try testing.expectError(FloError.UnexpectedResponse, decodeQueryAnswer(testing.allocator, &le(@as(u32, 2))));
+}
+
+const info_answer = le(@as(u32, 3)) ++ le(@as(u32, 2)) ++ "\x00".* ++ le(@as(u16, 2)) ++ le(@as(u16, 4)) ++ "user".* ++ le(@as(u16, 5)) ++ "value".* ++
+    le(@as(u64, 9)) ++ "\x01".* ++ le(@as(i64, 1_700_000_000_123_456_789)) ++ "\x01".* ++ le(@as(i64, 1_700_000_000_999_999_999));
+
+test "info is a table op with no body, and its answer's times are ns" {
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{
+        .{ .status = 0, .body = &info_answer },
+        .{ .status = 0, .body = &(le(@as(u32, 0)) ++ le(@as(u32, 0)) ++ "\x00".* ++ le(@as(u16, 0)) ++ le(@as(u64, 0)) ++ "\x00\x00".*) },
+    };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var ts = TimeSeries.init(&client);
+    var got = try ts.info("cpu", .{});
+    defer got.deinit();
+    try testing.expectEqual(@as(u16, 0x1A7), srv.last_op);
+    try testing.expectEqualStrings("cpu", srv.lastKey());
+    try testing.expectEqualSlices(u8, "", srv.lastBody());
+    try testing.expectEqual(@as(u32, 3), got.series);
+    try testing.expectEqual(@as(usize, 2), got.fields.len);
+    try testing.expectEqualStrings("value", got.fields[1]);
+    try testing.expectEqual(@as(u64, 9), got.points);
+    try testing.expectEqual(@as(?i64, 1_700_000_000_123_456_789), got.oldest_ns);
+    try testing.expectEqual(@as(?i64, 1_700_000_000_999_999_999), got.newest_ns);
+    var empty = try ts.info("cpu", .{});
+    defer empty.deinit();
+    try testing.expectEqual(@as(?i64, null), empty.oldest_ns);
+}
+
+fn infoAndFree(a: Allocator, data: []const u8) !void {
+    var i = try decodeInfoAnswer(a, data);
+    i.deinit();
+}
+
+test "an info answer cut anywhere or short of memory leaks nothing" {
+    for (0..info_answer.len) |n| try testing.expectError(FloError.IncompleteResponse, infoAndFree(testing.allocator, info_answer[0..n]));
+    try testing.checkAllAllocationFailures(testing.allocator, infoAndFree, .{@as([]const u8, &info_answer)});
 }

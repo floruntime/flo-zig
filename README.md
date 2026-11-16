@@ -428,7 +428,7 @@ defer groups.deinit();
 
 ### Time Series
 
-Times are Unix nanoseconds, as `i64`, on the way in and out.
+Every time and window is nanoseconds, as `i64`, on the way in and out.
 
 ```zig
 var ts = flo.TimeSeries.init(&client);
@@ -449,7 +449,17 @@ var it = ts.readAll("cpu", .{ .field = "user", .from_ns = 1_700_000_000_000_000_
 defer it.deinit();
 while (try it.next()) |p| std.debug.print("{d} {d}\n", .{ p.time_ns, p.value });
 
-// FloQL. Its answer's times are ms.
+// Windows of 5 minutes (in ns), summed; each bucket's start_ns is aligned
+// to the epoch. No window means a minute; more than 1024 windows is refused.
+var q = try ts.query("cpu", .{ .field = "user", .from_ns = 1_700_000_000_000_000_000, .window_ns = 5 * std.time.ns_per_min, .aggregation = .sum });
+defer q.deinit();
+for (q.buckets) |b| std.debug.print("{d} {d}\n", .{ b.start_ns, b.value });
+
+// A measurement's series, fields, points, and oldest_ns and newest_ns.
+var info = try ts.info("cpu", .{});
+defer info.deinit();
+
+// FloQL; its answer's times are ns.
 var result = try ts.floql("cpu{host=\"web-1\"}[1h] | window(5m) | avg()", .{});
 defer result.deinit();
 ```
@@ -465,7 +475,10 @@ the tag filter (a measurement never written, say); a series with no points in
 the range is an empty page. A not-found marked stale is `error.StaleNotFound`
 (see Error Handling): read again rather than treat the series as gone.
 
-A FloQL query whose answer holds more than 4096 raw points is refused
+In FloQL text, `[1h]` and `[2h..1h]` count back from now, and a bare number
+in a range is epoch milliseconds (`cpu[1700000000000..1700000060000]`); a
+range whose start is after its end, or a bare number past the year 3000, is
+refused. A FloQL query whose answer holds more than 4096 raw points is refused
 bad_request: aggregate them, narrow the query, or page them with `read`.
 `client.lastError()` carries the server's text.
 

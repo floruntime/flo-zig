@@ -10,14 +10,19 @@
   `get`: the stream or series may exist but the node that answered hasn't
   seen it yet, so read again.
 - New `TimeSeries`: `write`, `read` (one page), `readAll` (an iterator over
-  every page) and `floql`. Times are Unix nanoseconds as `i64`; a write's
+  every page), `query` (windows of `window_ns`, with an `Aggregation`),
+  `info` (with `oldest_ns`, `newest_ns`) and `floql`. Every time and window
+  is Unix nanoseconds as `i64`; a write's
   `time_ns` of 0 takes the server's time, and one before 1970 is refused
   bad_request. A read takes a field, a tag filter, an inclusive ns range, a
   limit (1 to 4096), an `Order` (`oldest_first`, `newest_first`) and an
-  opaque cursor; page until the cursor is null. FloQL answers in ms, and a raw
-  answer of more than 4096 points is refused bad_request.
-- **Breaking:** option tag `ts_timestamp` (0x67) is `ts_timestamp_ns`, an i64
-  of nanoseconds.
+  opaque cursor; page until the cursor is null. A query window of 0, or one
+  making more than 1024 windows, is refused bad_request. FloQL answers in ns
+  (a bare number in a FloQL range is still epoch ms), and a raw answer of
+  more than 4096 points is refused bad_request.
+- **Breaking:** option tags `ts_timestamp` (0x67), `ts_from_ms` (0x60),
+  `ts_to_ms` (0x61) and `ts_window_ms` (0x62) are `ts_timestamp_ns`,
+  `ts_from_ns`, `ts_to_ns` and `ts_window_ns`, each an i64 of nanoseconds.
 - `ProcessingStatusResult` gains `late_edge_ms` and `late_points`, and
   `late()`: at least that many of a job's TS source points came later than
   the edge; null (edge `NO_LATE_EDGE`) when there is no count.
