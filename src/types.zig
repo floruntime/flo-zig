@@ -1503,7 +1503,10 @@ pub const TaskAssignment = struct {
 /// the worker holding the run, or last holding it; null until one takes it.
 /// Only the leader knows a take at once: another node may answer null, or
 /// an earlier worker, until the run's next update reaches it. `outcome` is
-/// the outcome a completed run's worker named; null for success.
+/// the outcome a completed run's worker named; null for success. `held`
+/// says why a lease past due isn't ended yet: the run's end waits for room
+/// on the shard of the workflow that called it, and the run isn't handed to
+/// another worker meanwhile.
 pub const ActionRunStatus = struct {
     run_id: []const u8,
     status: RunStatus,
@@ -1515,6 +1518,7 @@ pub const ActionRunStatus = struct {
     error_message: ?[]const u8,
     worker_id: ?[]const u8,
     outcome: ?[]const u8,
+    held: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ActionRunStatus) void {
@@ -1523,6 +1527,7 @@ pub const ActionRunStatus = struct {
         if (self.error_message) |e| self.allocator.free(e);
         if (self.worker_id) |w| self.allocator.free(w);
         if (self.outcome) |o| self.allocator.free(o);
+        if (self.held) |h| self.allocator.free(h);
     }
 };
 
@@ -1794,6 +1799,8 @@ pub const WorkerDrainOptions = struct {
 pub const MAX_AWAIT_ACTIONS: usize = 64;
 /// The longest action name a task or report carries.
 pub const MAX_ACTION_NAME: usize = 256;
+/// The longest note `ActionRunStatus.held` carries.
+pub const MAX_HELD_NOTE: usize = 128;
 /// The longest await request key.
 pub const MAX_REQUEST_KEY: usize = 64;
 /// The longest result a complete carries, and error a fail carries.

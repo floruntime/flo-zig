@@ -4,6 +4,17 @@
 
 - **Breaking:** pinned to the table hash of flo `1fd555dc` (`0xac07f1f7338c66bd`);
   this SDK and older servers refuse each other.
+- `ActionRunStatus` gains `held`: why a run's lease, past due, isn't ended
+  yet. The end of a run a workflow step called waits for room on the
+  calling workflow's shard, and meanwhile the run isn't handed to another
+  worker. Null otherwise.
+- A worker's complete or fail that would end a run a workflow step called
+  can be refused overloaded, without running, while the calling workflow's
+  shard has no room for the end. The action worker now sends the same
+  report again, with a backoff capped at 5 s, until the server takes it or
+  answers otherwise, logging each wait; these resends don't count toward
+  the three sends a lost result gets. A stopping worker gives up after
+  10 s.
 
 ## 0.1.0-dev.5 - 2026-11-16
 
