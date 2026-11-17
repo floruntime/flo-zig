@@ -178,6 +178,16 @@ pub const StreamGroupSummary = types.StreamGroupSummary;
 pub const StreamGroupMembers = types.StreamGroupMembers;
 pub const StreamGroupMember = types.StreamGroupMember;
 pub const StreamGroupMemberState = types.StreamGroupMemberState;
+pub const LeasedRecord = types.LeasedRecord;
+pub const StreamGroupStealOptions = types.StreamGroupStealOptions;
+pub const GroupStealResult = types.GroupStealResult;
+pub const GroupCommandRefusal = types.GroupCommandRefusal;
+pub const GroupDlqCursor = types.GroupDlqCursor;
+pub const GroupDlqListOptions = types.GroupDlqListOptions;
+pub const GroupDeadLetter = types.GroupDeadLetter;
+pub const GroupDlqPage = types.GroupDlqPage;
+pub const GroupDlqOptions = types.GroupDlqOptions;
+pub const GroupDlqResult = types.GroupDlqResult;
 
 // Option types - Worker/Action
 pub const ActionRegisterOptions = types.ActionRegisterOptions;

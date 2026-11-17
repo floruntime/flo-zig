@@ -322,6 +322,10 @@ pub const OpCode = enum(u16) {
     stream_group_delete = 0x15C,
     stream_group_list = 0x15D,
     stream_group_members = 0x15E,
+    stream_group_steal = 0x15F,
+    stream_group_dlq_list = 0x160,
+    stream_group_dlq_requeue = 0x161,
+    stream_group_dlq_delete = 0x162,
 
     // ── Queues (0x170 – 0x19F) ──
     queue_enqueue = 0x170,
@@ -1437,6 +1441,133 @@ pub const StreamGroupMembers = struct {
     pub fn deinit(self: *StreamGroupMembers) void {
         for (self.members) |m| self.allocator.free(m.id);
         self.allocator.free(self.members);
+    }
+};
+
+/// A record a group steal names: its id and the deliveries its holder has.
+pub const LeasedRecord = struct {
+    id: StreamID,
+    deliveries: u32,
+};
+
+/// Options for a group steal.
+pub const StreamGroupStealOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// The lease the records are taken for, 5 s to 12 h; the group's when
+    /// null.
+    lease_ms: ?u64 = null,
+};
+
+/// A record a steal or a dead-letter command left as it was: why, and the
+/// same said for a person.
+pub const GroupCommandRefusal = struct {
+    id: StreamID,
+    why: GroupRefusalWhy,
+    reason: []const u8,
+};
+
+fn freeCommandRefusals(allocator: std.mem.Allocator, refused: []GroupCommandRefusal) void {
+    for (refused) |f| allocator.free(f.reason);
+    allocator.free(refused);
+}
+
+/// What a group steal took, under one new lease, and what it left. Ack,
+/// nack or touch `stolen` naming `lease`, as for a group read: each record
+/// carries its id and new deliveries, but no payload or headers (read the
+/// stream for those). Free with `deinit`.
+pub const GroupStealResult = struct {
+    lease: GroupLease,
+    /// When the new lease runs out without a touch, in Unix milliseconds;
+    /// 0 when it took nothing.
+    expires_at_ms: i64,
+    stolen: []StreamRecord,
+    refused: []GroupCommandRefusal,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *GroupStealResult) void {
+        for (self.stolen) |*r| r.deinit(self.allocator);
+        self.allocator.free(self.stolen);
+        freeCommandRefusals(self.allocator, self.refused);
+    }
+};
+
+/// The most of a dead letter's last error a list shows, of a group or a
+/// queue.
+pub const MAX_DLQ_ERROR: usize = 256;
+
+/// Where a group's dead-letter list goes on. Opaque: pass back the one a
+/// page answered.
+pub const GroupDlqCursor = struct {
+    dead_ns: u64,
+    ms: u64,
+    seq: u64,
+};
+
+/// Options for a group's dead-letter list.
+pub const GroupDlqListOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Dead letters per page, 1 to 100.
+    limit: u32 = MAX_DLQ_PAGE,
+    /// The previous page's cursor; null for the first page.
+    after: ?GroupDlqCursor = null,
+};
+
+/// A group's dead letter: a record nacked or expired as many times as the
+/// group's attempts, or nacked dead.
+pub const GroupDeadLetter = struct {
+    id: StreamID,
+    /// Times it was delivered.
+    deliveries: u32,
+    /// Times it failed: nacked, or its lease ran out.
+    failures: u32,
+    /// When it died, in Unix milliseconds.
+    dead_at_ms: i64,
+    /// Its last error, at most its first 256 bytes.
+    error_message: []const u8,
+};
+
+/// One page of a group's dead letters, oldest dead first. Free with
+/// `deinit`.
+pub const GroupDlqPage = struct {
+    letters: []GroupDeadLetter,
+    /// Where the next page starts; null on the last page.
+    cursor: ?GroupDlqCursor,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *GroupDlqPage) void {
+        for (self.letters) |l| self.allocator.free(l.error_message);
+        self.allocator.free(self.letters);
+    }
+};
+
+/// Options for a group's dead-letter requeue or delete.
+pub const GroupDlqOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Instead of records named by id: the group's oldest dead letters, a
+    /// batch of up to `limit`. Name records or set this, not both.
+    all: bool = false,
+    /// With `all`, the most one batch takes, 1 to 100.
+    limit: u32 = MAX_GROUP_BATCH,
+    /// Delete only: say what it would delete, and delete nothing.
+    dry_run: bool = false,
+};
+
+/// What a dead-letter requeue or delete did. Free with `deinit`.
+pub const GroupDlqResult = struct {
+    /// How many it applied to; with dry_run, how many it would delete.
+    applied: u32,
+    /// The rest, and why: `gone` (not in the group, or a requeue of one a
+    /// trim cut) or `not_dead`.
+    refused: []GroupCommandRefusal,
+    /// With `all`: dead letters remain past this batch.
+    more: bool,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *GroupDlqResult) void {
+        freeCommandRefusals(self.allocator, self.refused);
     }
 };
 

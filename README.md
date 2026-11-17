@@ -363,12 +363,12 @@ each within the group's lease (its ack timeout, 5 s to 12 h, 30 s by
 default), or touch it to keep it: a record left past its lease is ready
 for the next read, by any consumer, so delivery is at least once. A
 record nacked or expired `max_deliver` times (5 by default) is dead, and
-stays until the group is deleted. Ack, nack and touch name the read's
+stays until it is requeued or deleted, or the group is. Ack, nack and touch name the read's
 `lease` and each record's `deliveries`; one for a delivery that has moved
 on applies nothing, and its `GroupReport` says why (`delivered_again`,
 `expired`, ...). A report to a group that isn't there (never made, or
-deleted) is `error.NotFound` as a whole. Groups have no join, leave or
-claim. The first read of a group creates it at the defaults; a group name
+deleted) is `error.NotFound` as a whole. Groups have no join or leave. The
+first read of a group creates it at the defaults; a group name
 is at most 256 bytes.
 
 A group holding as many records as its caps allow (leased, ready and dead
@@ -377,8 +377,8 @@ bytes, takes nothing new: a read returns `error.GroupHeldFull` (status
 `overloaded`, reason `group_held_full`; the message says which cap). Reading
 again won't help, so the client doesn't retry it; the stream worker logs it
 once and backs off. The group's room comes back as its consumers ack or nack,
-but dead records count too and stay until the group is deleted or a trim of
-the stream cuts them. At the shard's cap, it clears as any of the shard's
+but dead records count too and stay until they are requeued or deleted, the
+group is deleted, or a trim of the stream cuts them. At the shard's cap, it clears as any of the shard's
 groups and queues, this one included, are acked, consumed or purged.
 
 A nack carries an error of up to 1024 bytes. A nack with `.abandon = true`
@@ -424,6 +424,40 @@ var members = try stream.groupMembers("events", "my-group", .{});
 defer members.deinit();
 var groups = try stream.groupList("events", .{});
 defer groups.deinit();
+```
+
+An operator can take records from a consumer that holds them but has gone
+quiet, and handle a group's dead letters. `groupSteal` takes the records it
+names (each with the deliveries its holder has) that have been idle at least
+`min_idle_ms`: idle is the time since the holder's read, a steal or any
+touch, so a holder that touches more often is never stolen from (refused
+`not_idle`). What it takes is leased to the new consumer under one new lease,
+to ack as after a read. A read takes expired records by itself; steal is for
+not waiting out a lease.
+
+`groupDlqList` pages the dead letters, oldest dead first, by an opaque
+cursor. `groupDlqRequeue` makes them ready again with their failures reset;
+`groupDlqDelete` removes them (`dry_run` says what it would). Each takes
+records by id, or `.all = true` for the oldest up to `limit`, with `more` set
+while others remain; one that isn't dead is refused `not_dead`.
+
+```zig
+var dead = try stream.groupDlqList("events", "my-group", .{ .limit = 20 });
+defer dead.deinit();
+for (dead.letters) |d| std.debug.print("{} failed {d}x: {s}\n", .{ d.id, d.failures, d.error_message });
+// dead.cursor, if set, is the next page's .after
+
+var again = try stream.groupDlqRequeue("events", "my-group", &.{}, .{ .all = true });
+defer again.deinit();
+
+// Take what worker-1 has held untouched for a minute
+const held = [_]flo.LeasedRecord{.{ .id = some_id, .deliveries = 1 }};
+var taken = try stream.groupSteal("events", "my-group", "worker-2", 60_000, &held, .{});
+defer taken.deinit();
+if (taken.stolen.len > 0) {
+    var acked = try stream.groupAck("events", "my-group", taken.lease, taken.stolen, .{ .consumer = "worker-2" });
+    defer acked.deinit();
+}
 ```
 
 ### Time Series

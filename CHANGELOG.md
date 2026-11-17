@@ -18,6 +18,19 @@
 - `QueueRefusalWhy` and `GroupRefusalWhy` name `not_dead` (6): a dead-letter
   requeue or delete named something that isn't dead; and `not_idle` (7): a
   group steal named a record its holder touched within the idle time named.
+- New `Stream.groupSteal`: take records another consumer holds and has
+  left idle for at least `min_idle_ms`, each named with the deliveries its
+  holder has. Idle is the time since the holder's read, a steal or any
+  touch. What it takes is leased to the new consumer under one new lease
+  (`GroupStealResult.lease`, `stolen` with the new deliveries), to ack, nack
+  or touch as after a read; the rest are refused `not_idle`,
+  `delivered_again`, `gone`, ... with a reason.
+- New `Stream.groupDlqList`, `groupDlqRequeue` and `groupDlqDelete`: page a
+  group's dead letters (deliveries, failures, when it died, its last error)
+  by an opaque cursor, make them ready again with their failures reset, or
+  delete them (`dry_run` says what it would). Requeue and delete take
+  records by id, or `.all = true` for the oldest up to `limit`, answering
+  applied, refused (`not_dead`, `gone`) and `more`.
 
 ## 0.1.0-dev.5 - 2026-11-16
 

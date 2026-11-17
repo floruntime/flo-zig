@@ -1672,3 +1672,115 @@ test "live: a ts query buckets points by an ns window, and FloQL and info answer
     try testing.expectError(flo.FloError.BadRequest, ts.query("many", .{ .from_ns = base, .window_ns = 1 }));
     try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "widen the window (it is in nanoseconds)") != null);
 }
+
+test "live: a steal takes an idle holder's records under a new lease, and refuses those touched within the idle time or delivered since" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var stream = flo.Stream.init(&live.client);
+    _ = try stream.groupCreate("stolen", "g", .{ .ack_timeout_ms = 60_000 });
+    _ = try stream.append("stolen", "a", .{});
+    _ = try stream.append("stolen", "b", .{});
+    var held = try stream.groupRead("stolen", "g", "c1", .{ .count = 10 });
+    defer held.deinit();
+    try testing.expectEqual(@as(usize, 2), held.records.len);
+    const a: flo.LeasedRecord = .{ .id = held.records[0].id, .deliveries = held.records[0].deliveries };
+    const b: flo.LeasedRecord = .{ .id = held.records[1].id, .deliveries = held.records[1].deliveries };
+
+    // Read a moment ago: not idle for a minute.
+    var early = try stream.groupSteal("stolen", "g", "c2", 60_000, &.{ a, b }, .{});
+    defer early.deinit();
+    try testing.expectEqual(@as(usize, 0), early.stolen.len);
+    try testing.expectEqual(@as(i64, 0), early.expires_at_ms);
+    try testing.expectEqual(@as(usize, 2), early.refused.len);
+    for (early.refused) |r| try testing.expectEqual(flo.GroupRefusalWhy.not_idle, r.why);
+    try testing.expect(early.refused[0].reason.len > 0);
+
+    // Idle 50 ms: a is taken; b named with deliveries it doesn't have is
+    // refused delivered_again.
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+    const wrong_b: flo.LeasedRecord = .{ .id = b.id, .deliveries = b.deliveries + 1 };
+    var taken = try stream.groupSteal("stolen", "g", "c2", 50, &.{ a, wrong_b }, .{ .lease_ms = 30_000 });
+    defer taken.deinit();
+    try testing.expectEqual(@as(usize, 1), taken.stolen.len);
+    try testing.expectEqual(a.id, taken.stolen[0].id);
+    try testing.expectEqual(@as(u32, 2), taken.stolen[0].deliveries);
+    try testing.expect(taken.expires_at_ms > 0);
+    try testing.expectEqual(@as(usize, 1), taken.refused.len);
+    try testing.expectEqual(flo.GroupRefusalWhy.delivered_again, taken.refused[0].why);
+
+    // c1's delivery of a moved on; c2 acks the new one.
+    var stale = try stream.groupAck("stolen", "g", held.lease, held.records[0..1], .{ .consumer = "c1" });
+    defer stale.deinit();
+    try testing.expectEqual(@as(u32, 0), stale.applied);
+    var acked = try stream.groupAck("stolen", "g", taken.lease, taken.stolen, .{ .consumer = "c2" });
+    defer acked.deinit();
+    try testing.expectEqual(@as(u32, 1), acked.applied);
+
+    try testing.expectError(flo.FloError.NotFound, stream.groupSteal("stolen", "nobody", "c2", 1, &.{a}, .{}));
+}
+
+test "live: a group's dead letters list by page, requeue with failures reset, and delete; one not dead is refused not_dead" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var stream = flo.Stream.init(&live.client);
+    _ = try stream.groupCreate("deadgroup", "g", .{ .ack_timeout_ms = 60_000, .max_deliver = 3 });
+    for ([_][]const u8{ "a", "b", "c" }) |p| _ = try stream.append("deadgroup", p, .{});
+    var got = try stream.groupRead("deadgroup", "g", "c1", .{ .count = 10 });
+    defer got.deinit();
+    try testing.expectEqual(@as(usize, 3), got.records.len);
+
+    // a and b dead now, with an error; c still leased.
+    var killed = try stream.groupNack("deadgroup", "g", got.lease, got.records[0..2], .{ .consumer = "c1", .dead = true, .error_message = "boom" });
+    killed.deinit();
+    try testing.expectEqual(@as(u32, 2), killed.applied);
+
+    // Two pages of one, oldest dead first.
+    var first = try stream.groupDlqList("deadgroup", "g", .{ .limit = 1 });
+    defer first.deinit();
+    try testing.expectEqual(@as(usize, 1), first.letters.len);
+    try testing.expectEqual(got.records[0].id, first.letters[0].id);
+    try testing.expectEqualStrings("boom", first.letters[0].error_message);
+    try testing.expectEqual(@as(u32, 1), first.letters[0].deliveries);
+    try testing.expectEqual(@as(u32, 1), first.letters[0].failures);
+    try testing.expect(first.letters[0].dead_at_ms > 0);
+    try testing.expect(first.cursor != null);
+    var second = try stream.groupDlqList("deadgroup", "g", .{ .limit = 1, .after = first.cursor });
+    defer second.deinit();
+    try testing.expectEqual(@as(usize, 1), second.letters.len);
+    try testing.expectEqual(got.records[1].id, second.letters[0].id);
+    try testing.expectEqual(@as(?flo.GroupDlqCursor, null), second.cursor);
+
+    // A dry-run delete of a and c: a would go, c isn't dead. Nothing goes.
+    const ids = [_]flo.StreamID{ got.records[0].id, got.records[2].id };
+    var dry = try stream.groupDlqDelete("deadgroup", "g", &ids, .{ .dry_run = true });
+    defer dry.deinit();
+    try testing.expectEqual(@as(u32, 1), dry.applied);
+    try testing.expectEqual(@as(usize, 1), dry.refused.len);
+    try testing.expectEqual(got.records[2].id, dry.refused[0].id);
+    try testing.expectEqual(flo.GroupRefusalWhy.not_dead, dry.refused[0].why);
+    try testing.expectEqual(@as(u64, 2), (try stream.groupInfo("deadgroup", "g", .{})).dead);
+
+    // Requeue a and c: a is ready again; c is refused not_dead.
+    var requeued = try stream.groupDlqRequeue("deadgroup", "g", &ids, .{});
+    defer requeued.deinit();
+    try testing.expectEqual(@as(u32, 1), requeued.applied);
+    try testing.expectEqual(flo.GroupRefusalWhy.not_dead, requeued.refused[0].why);
+    var back = try stream.groupRead("deadgroup", "g", "c2", .{ .count = 10 });
+    defer back.deinit();
+    try testing.expectEqual(@as(usize, 1), back.records.len);
+    try testing.expectEqualStrings("a", back.records[0].payload);
+    try testing.expectEqual(@as(u32, 2), back.records[0].deliveries);
+
+    // Delete all, a batch of one at a time: b, then nothing more.
+    var gone = try stream.groupDlqDelete("deadgroup", "g", &.{}, .{ .all = true, .limit = 1 });
+    defer gone.deinit();
+    try testing.expectEqual(@as(u32, 1), gone.applied);
+    try testing.expect(!gone.more);
+    var empty = try stream.groupDlqList("deadgroup", "g", .{});
+    defer empty.deinit();
+    try testing.expectEqual(@as(usize, 0), empty.letters.len);
+    try testing.expectEqual(@as(u64, 0), (try stream.groupInfo("deadgroup", "g", .{})).dead);
+    try testing.expectError(flo.FloError.NotFound, stream.groupDlqList("deadgroup", "nobody", .{}));
+}
