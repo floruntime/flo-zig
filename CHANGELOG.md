@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Breaking:** pinned to the table hash of flo `1fd555dc` (`0xac07f1f7338c66bd`);
+  this SDK and older servers refuse each other.
+
 ## 0.1.0-dev.5 - 2026-11-16
 
 - A non-blocking `stream.read` of a stream that isn't there, and a `ts.read`
