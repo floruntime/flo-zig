@@ -15,6 +15,9 @@
   answers otherwise, logging each wait; these resends don't count toward
   the three sends a lost result gets. A stopping worker gives up after
   10 s.
+- `QueueRefusalWhy` and `GroupRefusalWhy` name `not_dead` (6): a dead-letter
+  requeue or delete named something that isn't dead; and `not_idle` (7): a
+  group steal named a record its holder touched within the idle time named.
 
 ## 0.1.0-dev.5 - 2026-11-16
 

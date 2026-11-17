@@ -1302,6 +1302,16 @@ test "a group read at its held cap is GroupHeldFull, sent once and not retried" 
     try std.testing.expect(!client.refusedUnrun(FloError.Overloaded));
 }
 
+test "a group report's not_dead and not_idle decode by name, and a why this SDK predates as its number" {
+    const data = le(@as(u32, 0)) ++ le(@as(u32, 3)) ++ le(@as(u64, 1)) ++ le(@as(u64, 1)) ++ "\x06" ++
+        le(@as(u64, 1)) ++ le(@as(u64, 2)) ++ "\x07" ++ le(@as(u64, 1)) ++ le(@as(u64, 3)) ++ "\x2a";
+    var r = try decodeGroupReport(std.testing.allocator, data, false);
+    defer r.deinit();
+    try std.testing.expectEqual(types.GroupRefusalWhy.not_dead, r.refused[0].why);
+    try std.testing.expectEqual(types.GroupRefusalWhy.not_idle, r.refused[1].why);
+    try std.testing.expectEqual(@as(u8, 42), @intFromEnum(r.refused[2].why));
+}
+
 test "a group report answer cut anywhere or overlong is refused" {
     const a = std.testing.allocator;
     const body = le(@as(i64, 1)) ++ le(@as(u32, 0)) ++ le(@as(u32, 1)) ++ le(@as(u64, 100)) ++ le(@as(u64, 7)) ++ "\x01";

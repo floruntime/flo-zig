@@ -603,6 +603,13 @@ test "complete, fail and touch name the lease and each message's delivery, and r
     try std.testing.expectEqual(@as(u32, 1), kept.applied);
 }
 
+test "not_dead and not_idle decode by name" {
+    var r = try decodeReportAnswer(std.testing.allocator, le(@as(u32, 0)) ++ "\x02" ++ le(@as(u64, 1)) ++ "\x06\x00" ++ le(@as(u64, 2)) ++ "\x07\x00", false);
+    defer r.deinit();
+    try std.testing.expectEqual(types.QueueRefusalWhy.not_dead, r.refused[0].why);
+    try std.testing.expectEqual(types.QueueRefusalWhy.not_idle, r.refused[1].why);
+}
+
 test "a refusal code this SDK predates is kept as its number" {
     var r = try decodeReportAnswer(std.testing.allocator, le(@as(u32, 0)) ++ "\x01" ++ le(@as(u64, 1)) ++ "\x2a" ++ "\x00", false);
     defer r.deinit();

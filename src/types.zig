@@ -782,6 +782,11 @@ pub const QueueRefusalWhy = enum(u8) {
     released = 4,
     /// Nobody holds it.
     not_held = 5,
+    /// A dead-letter requeue or delete named it, and it isn't dead.
+    not_dead = 6,
+    /// A group steal named it, and its holder touched it within the idle
+    /// time named. Not answered for a queue; the list is shared.
+    not_idle = 7,
     _,
 };
 
@@ -1325,6 +1330,11 @@ pub const GroupRefusalWhy = enum(u8) {
     released = 4,
     /// Nobody holds it.
     not_held = 5,
+    /// A dead-letter requeue or delete named it, and it isn't dead.
+    not_dead = 6,
+    /// A steal named it, and its holder touched it (its read, a steal or
+    /// any touch) within the idle time named.
+    not_idle = 7,
     _,
 };
 
