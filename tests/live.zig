@@ -446,17 +446,83 @@ test "live: peek shows the next ready messages in dequeue order without taking t
     try testing.expectEqual(high, taken.messages[0].seq);
 }
 
-test "live: a queue's DLQ pages back empty, with its trailer" {
+test "live: a queue's dead letters list by page, requeue with failures reset, and delete; one not dead is refused not_dead" {
     var live: Live = .{ .client = undefined };
     try live.init();
     defer live.deinit();
     var queue = flo.Queue.init(&live.client);
-    _ = try queue.enqueue("nodead", "x", .{});
-    var page = try queue.dlqList("nodead", .{ .limit = 5 });
-    defer page.deinit();
-    try testing.expectEqual(@as(usize, 0), page.letters.len);
-    try testing.expectEqual(@as(u64, 0), page.total);
-    try testing.expect(!page.has_more);
+    for ([_][]const u8{ "a", "b", "c" }) |p| _ = try queue.enqueue("deadq", p, .{ .priority = 3 });
+    try testing.expectError(flo.FloError.NotFound, queue.dlqList("noqueue", .{}));
+    var got = try queue.dequeue("deadq", 3, .{ .consumer = "c1" });
+    defer got.deinit();
+    try testing.expectEqual(@as(usize, 3), got.messages.len);
+
+    var none = try queue.dlqList("deadq", .{});
+    none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.letters.len);
+    try testing.expectEqual(@as(?flo.DlqCursor, null), none.cursor);
+
+    // a and b dead now, with an error; c still leased.
+    var killed = try queue.fail("deadq", got.lease, got.messages[0..2], .{ .consumer = "c1", .dead = true, .error_message = "boom" });
+    killed.deinit();
+    try testing.expectEqual(@as(u32, 2), killed.applied);
+
+    // Two pages of one, oldest dead first.
+    var first = try queue.dlqList("deadq", .{ .limit = 1 });
+    defer first.deinit();
+    try testing.expectEqual(@as(usize, 1), first.letters.len);
+    const d = first.letters[0];
+    try testing.expectEqual(got.messages[0].seq, d.seq);
+    try testing.expectEqualStrings("a", d.payload);
+    try testing.expectEqual(@as(u32, 1), d.size);
+    try testing.expectEqualStrings("boom", d.error_message);
+    try testing.expectEqual(@as(u32, 3), d.priority);
+    try testing.expectEqual(@as(u32, 1), d.deliveries);
+    try testing.expectEqual(@as(u32, 1), d.failures);
+    try testing.expect(d.dead_at_ms >= d.enqueued_at_ms and d.enqueued_at_ms > 0);
+    try testing.expect(first.cursor != null);
+    var second = try queue.dlqList("deadq", .{ .limit = 1, .after = first.cursor });
+    defer second.deinit();
+    try testing.expectEqual(@as(usize, 1), second.letters.len);
+    try testing.expectEqual(got.messages[1].seq, second.letters[0].seq);
+    try testing.expectEqual(@as(?flo.DlqCursor, null), second.cursor);
+
+    // A dry-run delete of a and c: a would go, c isn't dead. Nothing goes.
+    const seqs = [_]u64{ got.messages[0].seq, got.messages[2].seq };
+    var dry = try queue.dlqDelete("deadq", &seqs, .{ .dry_run = true });
+    defer dry.deinit();
+    try testing.expectEqual(@as(u32, 1), dry.applied);
+    try testing.expectEqual(@as(usize, 1), dry.refused.len);
+    try testing.expectEqual(got.messages[2].seq, dry.refused[0].seq);
+    try testing.expectEqual(flo.QueueRefusalWhy.not_dead, dry.refused[0].why);
+    var still = try queue.dlqList("deadq", .{});
+    defer still.deinit();
+    try testing.expectEqual(@as(usize, 2), still.letters.len);
+
+    // Requeue a and c: a is ready again; c is refused not_dead.
+    var requeued = try queue.dlqRequeue("deadq", &seqs, .{});
+    defer requeued.deinit();
+    try testing.expectEqual(@as(u32, 1), requeued.applied);
+    try testing.expectEqual(flo.QueueRefusalWhy.not_dead, requeued.refused[0].why);
+    var back = try queue.dequeue("deadq", 3, .{ .consumer = "c2" });
+    defer back.deinit();
+    try testing.expectEqual(@as(usize, 1), back.messages.len);
+    try testing.expectEqualStrings("a", back.messages[0].payload);
+    try testing.expectEqual(@as(u32, 2), back.messages[0].deliveries);
+
+    // Delete all, a batch of one at a time: b, then nothing more.
+    var gone = try queue.dlqDelete("deadq", &.{}, .{ .all = true, .limit = 1 });
+    defer gone.deinit();
+    try testing.expectEqual(@as(u32, 1), gone.applied);
+    try testing.expect(!gone.more);
+    var empty = try queue.dlqList("deadq", .{});
+    defer empty.deinit();
+    try testing.expectEqual(@as(usize, 0), empty.letters.len);
+    // A deleted one is gone.
+    var twice = try queue.dlqDelete("deadq", &.{got.messages[1].seq}, .{});
+    defer twice.deinit();
+    try testing.expectEqual(@as(u32, 0), twice.applied);
+    try testing.expectEqual(flo.QueueRefusalWhy.gone, twice.refused[0].why);
 }
 
 test "live: a group read leases records until acked; an expired lease is read again, a stale report applies nothing, and a nack past max_deliver is dead" {

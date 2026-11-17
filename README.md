@@ -301,12 +301,22 @@ const removed = try queue.purge("queue-name", .{});
 var next = try queue.peek("queue-name", 20, .{});
 defer next.deinit();
 
-// Dead messages wait in the DLQ until the queue is purged. dlqList pages it
-// oldest first, up to 100 at a time: pass the page's last_seq as `after`
-// while has_more is set.
+// Dead messages wait until they are requeued or deleted, or the queue is
+// purged. dlqList pages them oldest dead first, up to 100 at a time, each
+// with its failures, last error and up to 4 KiB of its payload: pass the
+// page's cursor as `after` until it is null.
 var dlq = try queue.dlqList("queue-name", .{ .limit = 50 });
 defer dlq.deinit();
-std.debug.print("{d} dead letters\n", .{dlq.total});
+for (dlq.letters) |d| std.debug.print("{d} failed {d}x: {s}\n", .{ d.seq, d.failures, d.error_message });
+
+// Ready again with their failures reset, or deleted for good (dry_run says
+// what it would delete). Name seqs, or .all = true for the oldest up to
+// `limit`, with `more` set while others remain; one not dead is refused
+// not_dead.
+var requeued = try queue.dlqRequeue("queue-name", &.{dlq.letters[0].seq}, .{});
+defer requeued.deinit();
+var deleted = try queue.dlqDelete("queue-name", &.{}, .{ .all = true });
+defer deleted.deinit();
 ```
 
 ### Stream Operations

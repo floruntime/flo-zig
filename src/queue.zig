@@ -174,9 +174,10 @@ pub const Queue = struct {
         return std.mem.readInt(u32, response.data[0..4], .little);
     }
 
-    /// A page of the queue's dead letters, oldest first: at most
-    /// `options.limit`, after the one whose seq is `options.after`. Pass the
-    /// page's `last_seq` as `after` while `has_more` is set.
+    /// A page of the queue's dead letters, oldest dead first, each with its
+    /// deliveries, failures, when it died, its last error and up to 4 KiB
+    /// of its payload. Pass the page's `cursor` as `options.after` until it
+    /// is null. A queue that doesn't exist is `FloError.NotFound`.
     /// **Caller owns the returned `DlqPage` and must call `page.deinit()`.**
     pub fn dlqList(
         self: *Queue,
@@ -184,28 +185,61 @@ pub const Queue = struct {
         options: types.DlqListOptions,
     ) FloError!types.DlqPage {
         if (options.limit < 1 or options.limit > types.MAX_DLQ_PAGE) return FloError.BadRequest;
-        const ns = self.client.getNamespace(options.namespace);
-
-        // [limit:u32][after_seq:u64]?, in the value.
-        var value_buf: [12]u8 = undefined;
-        std.mem.writeInt(u32, value_buf[0..4], options.limit, .little);
-        if (options.after) |a| std.mem.writeInt(u64, value_buf[4..12], a, .little);
-        const value = value_buf[0..if (options.after != null) 12 else 4];
-
-        var response = try self.client.sendRequest(
-            .queue_dlq_list,
-            ns,
-            queue_name,
-            value,
-            "",
-        );
+        // A table op: limit, sent present, then the cursor if any.
+        var body: [5 + 17]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&body);
+        w.writeByte(1) catch unreachable;
+        w.writeInt(u32, options.limit, .little) catch unreachable;
+        if (options.after) |c| {
+            w.writeByte(1) catch unreachable;
+            w.writeInt(u64, c.dead_ns, .little) catch unreachable;
+            w.writeInt(u64, c.seq, .little) catch unreachable;
+        } else w.writeByte(0) catch unreachable;
+        var response = try self.client.sendRequest(.queue_dlq_list, self.client.getNamespace(options.namespace), queue_name, w.buffered(), "");
         defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
-
+        if (response.status != .ok) return response.status.toError();
         return decodeDlqPage(self.client.allocator, response.data);
+    }
+
+    /// Make dead letters ready again at once, at their priority, their
+    /// failures reset to 0 (deliveries and last error kept): those named in
+    /// `seqs`, or with `options.all` the queue's oldest, up to
+    /// `options.limit`, with `more` set while others remain. One not dead
+    /// is refused `not_dead`; one not in the queue, `gone`.
+    /// **Caller owns the returned `DlqResult` and must call `result.deinit()`.**
+    pub fn dlqRequeue(self: *Queue, queue_name: []const u8, seqs: []const u64, options: types.DlqOptions) FloError!types.DlqResult {
+        if (options.dry_run) return FloError.BadRequest;
+        return self.dead(.queue_dlq_requeue, queue_name, seqs, options);
+    }
+
+    /// Delete dead letters for good: those named in `seqs`, or with
+    /// `options.all` the queue's oldest, up to `options.limit`, with `more`
+    /// set while others remain. One not dead is refused `not_dead`; one not
+    /// in the queue, `gone`. With `options.dry_run`, `applied` is how many
+    /// it would delete, and nothing is deleted.
+    /// **Caller owns the returned `DlqResult` and must call `result.deinit()`.**
+    pub fn dlqDelete(self: *Queue, queue_name: []const u8, seqs: []const u64, options: types.DlqOptions) FloError!types.DlqResult {
+        return self.dead(.queue_dlq_delete, queue_name, seqs, options);
+    }
+
+    fn dead(self: *Queue, op: types.OpCode, queue_name: []const u8, seqs: []const u64, options: types.DlqOptions) FloError!types.DlqResult {
+        // Messages or all, as the server takes them.
+        if (options.all == (seqs.len > 0)) return FloError.BadRequest;
+        if (seqs.len > types.MAX_QUEUE_BATCH) return FloError.BadRequest;
+        if (options.limit < 1 or options.limit > types.MAX_QUEUE_BATCH) return FloError.BadRequest;
+        var buf: [2 + types.MAX_QUEUE_BATCH * 8 + 2 + 5 + 2]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        if (seqs.len > 0) {
+            w.writeAll(&.{ 1, @intCast(seqs.len) }) catch unreachable;
+            for (seqs) |seq| w.writeInt(u64, seq, .little) catch unreachable;
+        } else w.writeByte(0) catch unreachable;
+        w.writeAll(&.{ 1, @intFromBool(options.all), 1 }) catch unreachable;
+        w.writeInt(u32, options.limit, .little) catch unreachable;
+        if (op == .queue_dlq_delete) w.writeAll(&.{ 1, @intFromBool(options.dry_run) }) catch unreachable;
+        var response = try self.client.sendRequest(op, self.client.getNamespace(options.namespace), queue_name, w.buffered(), "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeDeadAnswer(self.client.allocator, response.data);
     }
 
     /// The queue's next ready messages, 1 to 100 of them, in the order a
@@ -293,6 +327,33 @@ fn decodeReportAnswer(allocator: Allocator, data: []const u8, touch: bool) FloEr
     var r: Reader = .{ .data = data };
     const expires_at_ms: i64 = if (touch) try r.int(i64) else 0;
     const applied = try r.int(u32);
+    const refused = try decodeRefusals(allocator, &r);
+    errdefer freeRefusals(allocator, refused);
+    try r.end();
+    return .{ .applied = applied, .refused = refused, .expires_at_ms = expires_at_ms, .allocator = allocator };
+}
+
+/// A dead-letter requeue's or delete's answer: applied, refused, more.
+fn decodeDeadAnswer(allocator: Allocator, data: []const u8) FloError!types.DlqResult {
+    var r: Reader = .{ .data = data };
+    const applied = try r.int(u32);
+    const refused = try decodeRefusals(allocator, &r);
+    errdefer freeRefusals(allocator, refused);
+    const more = try r.boolean();
+    try r.end();
+    return .{ .applied = applied, .refused = refused, .more = more, .allocator = allocator };
+}
+
+fn freeRefusals(allocator: Allocator, refused: []types.QueueRefusal) void {
+    for (refused) |f| allocator.free(f.reason);
+    allocator.free(refused);
+}
+
+/// The longest reason a refusal carries.
+const max_refusal_reason = 128;
+
+/// A refused list (u8 count), each {seq, why, reason (u8 len)}.
+fn decodeRefusals(allocator: Allocator, r: *Reader) FloError![]types.QueueRefusal {
     const n = try r.int(u8);
     if (n > types.MAX_QUEUE_BATCH or n > r.remaining() / min_refusal) return FloError.IncompleteResponse;
     const refused = try allocator.alloc(types.QueueRefusal, n);
@@ -305,57 +366,64 @@ fn decodeReportAnswer(allocator: Allocator, data: []const u8, touch: bool) FloEr
         const seq = try r.int(u64);
         const why: types.QueueRefusalWhy = @enumFromInt(try r.int(u8));
         const reason = try r.lenBytes(u8);
+        if (reason.len > max_refusal_reason) return FloError.IncompleteResponse;
         refused[got] = .{ .seq = seq, .why = why, .reason = try allocator.dupe(u8, reason) };
     }
-    try r.end();
-    return .{ .applied = applied, .refused = refused, .expires_at_ms = expires_at_ms, .allocator = allocator };
+    return refused;
 }
 
 /// The most of a payload a peek or DLQ page shows.
 const max_shown_payload = 4096;
 
-/// A dead letter's smallest encoding: an empty payload.
-const min_dead_letter = 8 + 4 + 4 + 8 + 4 + 1 + 8;
+/// A dead letter's smallest encoding: an empty payload and error.
+const min_dead_letter = 8 + 4 + 4 + 4 + 8 + 8 + 4 + 2 + 2;
 
-/// queue_dlq_list's answer:
-///   [count:u32]([seq:u64][size:u32][len:u32][payload][enqueued_at_ms:i64]
-///   [deliveries:u32][priority:u8][moved_at_ms:i64])*
-///   [total:u64][has_more:u8][last_seq:u64]
+/// queue.dlq_list's answer: dead (u8 count), each {seq, priority,
+/// deliveries, failures, enqueued_at_ms, dead_at_ms, size, payload (u16
+/// len), error (u16 len)}, then cursor? {dead_ns, seq}.
 fn decodeDlqPage(allocator: Allocator, data: []const u8) FloError!types.DlqPage {
     var r: Reader = .{ .data = data };
-    const n = try r.int(u32);
+    const n = try r.int(u8);
     // A count the data can't hold is refused before it sizes an allocation.
     if (n > types.MAX_DLQ_PAGE or n > r.remaining() / min_dead_letter) return FloError.IncompleteResponse;
     const letters = try allocator.alloc(types.DeadLetter, n);
     var got: usize = 0;
     errdefer {
-        for (letters[0..got]) |l| allocator.free(l.payload);
+        for (letters[0..got]) |l| {
+            allocator.free(l.payload);
+            allocator.free(l.error_message);
+        }
         allocator.free(letters);
     }
     while (got < n) : (got += 1) {
         const seq = try r.int(u64);
-        const size = try r.int(u32);
-        const payload = try r.lenBytes(u32);
-        if (payload.len > max_shown_payload or payload.len > size) return FloError.IncompleteResponse;
-        const enqueued_at_ms = try r.int(i64);
+        const priority = try r.int(u32);
         const deliveries = try r.int(u32);
-        const priority = try r.int(u8);
-        const moved_at_ms = try r.int(i64);
+        const failures = try r.int(u32);
+        const enqueued_at_ms = try r.int(i64);
+        const dead_at_ms = try r.int(i64);
+        const size = try r.int(u32);
+        const payload = try r.lenBytes(u16);
+        if (payload.len > max_shown_payload or payload.len > size) return FloError.IncompleteResponse;
+        const err_text = try r.lenBytes(u16);
+        if (err_text.len > types.MAX_DLQ_ERROR) return FloError.IncompleteResponse;
+        const payload_copy = try allocator.dupe(u8, payload);
+        errdefer allocator.free(payload_copy);
         letters[got] = .{
             .seq = seq,
-            .size = size,
-            .payload = try allocator.dupe(u8, payload),
-            .enqueued_at_ms = enqueued_at_ms,
-            .deliveries = deliveries,
             .priority = priority,
-            .moved_at_ms = moved_at_ms,
+            .deliveries = deliveries,
+            .failures = failures,
+            .enqueued_at_ms = enqueued_at_ms,
+            .dead_at_ms = dead_at_ms,
+            .size = size,
+            .payload = payload_copy,
+            .error_message = try allocator.dupe(u8, err_text),
         };
     }
-    const total = try r.int(u64);
-    const has_more = try r.boolean();
-    const last_seq = try r.int(u64);
+    const cursor: ?types.DlqCursor = if (try r.boolean()) .{ .dead_ns = try r.int(u64), .seq = try r.int(u64) } else null;
     try r.end();
-    return .{ .letters = letters, .total = total, .has_more = has_more, .last_seq = last_seq, .allocator = allocator };
+    return .{ .letters = letters, .cursor = cursor, .allocator = allocator };
 }
 
 /// A peeked message's smallest encoding: an empty payload.
@@ -398,19 +466,20 @@ fn decodePeekAnswer(allocator: Allocator, data: []const u8) FloError!types.PeekR
 const test_server = @import("test_server.zig");
 const le = std.mem.toBytes;
 
-/// Two dead letters, the first cut to 2 bytes of 5, then 9 in all and more.
-const test_dlq_page = le(@as(u32, 2)) ++
-    le(@as(u64, 7)) ++ le(@as(u32, 5)) ++ le(@as(u32, 2)) ++ "ab" ++ le(@as(i64, 100)) ++ le(@as(u32, 3)) ++ "\x04" ++ le(@as(i64, 200)) ++
-    le(@as(u64, 8)) ++ le(@as(u32, 0)) ++ le(@as(u32, 0)) ++ le(@as(i64, 101)) ++ le(@as(u32, 1)) ++ "\x00" ++ le(@as(i64, 201)) ++
-    le(@as(u64, 9)) ++ "\x01" ++ le(@as(u64, 8));
+/// Two dead letters: seq 7, priority 4, 3 deliveries, 3 failures, the
+/// payload cut to 2 bytes of 5, error "boom"; seq 8, nothing shown; then a
+/// cursor.
+const test_dlq_page = "\x02" ++
+    le(@as(u64, 7)) ++ le(@as(u32, 4)) ++ le(@as(u32, 3)) ++ le(@as(u32, 3)) ++ le(@as(i64, 100)) ++ le(@as(i64, 200)) ++ le(@as(u32, 5)) ++
+    le(@as(u16, 2)) ++ "ab" ++ le(@as(u16, 4)) ++ "boom" ++
+    le(@as(u64, 8)) ++ le(@as(u32, 0)) ++ le(@as(u32, 1)) ++ le(@as(u32, 1)) ++ le(@as(i64, 101)) ++ le(@as(i64, 201)) ++ le(@as(u32, 0)) ++
+    le(@as(u16, 0)) ++ le(@as(u16, 0)) ++
+    "\x01" ++ le(@as(u64, 201_000_000)) ++ le(@as(u64, 8));
 
-/// An empty last page.
-const test_dlq_empty = le(@as(u32, 0)) ++ le(@as(u64, 9)) ++ "\x00" ++ le(@as(u64, 0));
-
-test "dlqList sends its limit and after in the value and reads the page and its trailer" {
+test "dlqList sends its limit and cursor as the body and reads the page and its cursor" {
     const a = std.testing.allocator;
     var srv = try test_server.OkServer.listen();
-    srv.replies = &.{ .{ .status = 0, .body = test_dlq_page }, .{ .status = 0, .body = test_dlq_empty } };
+    srv.replies = &.{ .{ .status = 0, .body = test_dlq_page }, .{ .status = 0, .body = "\x00\x00" } };
     try srv.start();
     defer srv.deinit();
     var client = Client.init(a, srv.endpoint, .{});
@@ -420,27 +489,72 @@ test "dlqList sends its limit and after in the value and reads the page and its 
 
     var page = try queue.dlqList("jobs", .{ .limit = 2 });
     defer page.deinit();
-    try std.testing.expectEqualSlices(u8, &le(@as(u32, 2)), srv.lastValue());
+    try std.testing.expectEqual(@as(u16, 0x185), srv.last_op);
+    try std.testing.expectEqualStrings("jobs", srv.lastKey());
+    try std.testing.expectEqualSlices(u8, "\x01" ++ le(@as(u32, 2)) ++ "\x00", srv.lastBody());
     try std.testing.expectEqual(@as(usize, 2), page.letters.len);
     const first = page.letters[0];
     try std.testing.expectEqual(@as(u64, 7), first.seq);
+    try std.testing.expectEqual(@as(u32, 4), first.priority);
+    try std.testing.expectEqual(@as(u32, 3), first.deliveries);
+    try std.testing.expectEqual(@as(u32, 3), first.failures);
+    try std.testing.expectEqual(@as(i64, 100), first.enqueued_at_ms);
+    try std.testing.expectEqual(@as(i64, 200), first.dead_at_ms);
     try std.testing.expectEqual(@as(u32, 5), first.size);
     try std.testing.expectEqualStrings("ab", first.payload);
-    try std.testing.expectEqual(@as(u32, 3), first.deliveries);
-    try std.testing.expectEqual(@as(u8, 4), first.priority);
-    try std.testing.expectEqual(@as(i64, 200), first.moved_at_ms);
-    try std.testing.expectEqual(@as(u64, 9), page.total);
-    try std.testing.expect(page.has_more);
-    try std.testing.expectEqual(@as(u64, 8), page.last_seq);
+    try std.testing.expectEqualStrings("boom", first.error_message);
+    try std.testing.expectEqual(types.DlqCursor{ .dead_ns = 201_000_000, .seq = 8 }, page.cursor.?);
 
-    var next = try queue.dlqList("jobs", .{ .after = page.last_seq });
+    var next = try queue.dlqList("jobs", .{ .after = page.cursor });
     defer next.deinit();
-    try std.testing.expectEqualSlices(u8, &(le(@as(u32, 100)) ++ le(@as(u64, 8))), srv.lastValue());
+    try std.testing.expectEqualSlices(u8, "\x01" ++ le(@as(u32, 100)) ++ "\x01" ++ le(@as(u64, 201_000_000)) ++ le(@as(u64, 8)), srv.lastBody());
     try std.testing.expectEqual(@as(usize, 0), next.letters.len);
-    try std.testing.expect(!next.has_more);
+    try std.testing.expectEqual(@as(?types.DlqCursor, null), next.cursor);
 
     try std.testing.expectError(FloError.BadRequest, queue.dlqList("jobs", .{ .limit = 0 }));
     try std.testing.expectError(FloError.BadRequest, queue.dlqList("jobs", .{ .limit = 101 }));
+}
+
+/// Applied 1; seq 9 refused not_dead; more.
+const test_dead_answer = le(@as(u32, 1)) ++ "\x01" ++ le(@as(u64, 9)) ++ "\x06" ++ "\x08not dead" ++ "\x01";
+
+test "dlqRequeue and dlqDelete name seqs or all, and read applied, refused and more" {
+    const a = std.testing.allocator;
+    var srv = try test_server.OkServer.listen();
+    srv.body = test_dead_answer;
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var queue = Queue.init(&client);
+
+    var requeued = try queue.dlqRequeue("jobs", &.{ 7, 9 }, .{});
+    defer requeued.deinit();
+    try std.testing.expectEqual(@as(u16, 0x186), srv.last_op);
+    try std.testing.expectEqualSlices(u8, "\x01\x02" ++ le(@as(u64, 7)) ++ le(@as(u64, 9)) ++ "\x01\x00" ++ "\x01" ++ le(@as(u32, 100)), srv.lastBody());
+    try std.testing.expectEqual(@as(u32, 1), requeued.applied);
+    try std.testing.expectEqual(@as(u64, 9), requeued.refused[0].seq);
+    try std.testing.expectEqual(types.QueueRefusalWhy.not_dead, requeued.refused[0].why);
+    try std.testing.expectEqualStrings("not dead", requeued.refused[0].reason);
+    try std.testing.expect(requeued.more);
+
+    var deleted = try queue.dlqDelete("jobs", &.{}, .{ .all = true, .limit = 5, .dry_run = true });
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(u16, 0x187), srv.last_op);
+    try std.testing.expectEqualSlices(u8, "\x00" ++ "\x01\x01" ++ "\x01" ++ le(@as(u32, 5)) ++ "\x01\x01", srv.lastBody());
+
+    // Seqs or all, not both or neither; a requeue has no dry run.
+    try std.testing.expectError(FloError.BadRequest, queue.dlqRequeue("jobs", &.{}, .{}));
+    try std.testing.expectError(FloError.BadRequest, queue.dlqDelete("jobs", &.{7}, .{ .all = true }));
+    try std.testing.expectError(FloError.BadRequest, queue.dlqRequeue("jobs", &.{7}, .{ .dry_run = true }));
+    try std.testing.expectError(FloError.BadRequest, queue.dlqDelete("jobs", &.{}, .{ .all = true, .limit = 101 }));
+    try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.monotonic));
+}
+
+fn decodeDeadAndFree(a: Allocator, data: []const u8) !void {
+    var r = try decodeDeadAnswer(a, data);
+    r.deinit();
 }
 
 fn decodeDlqAndFree(a: Allocator, data: []const u8) !void {
@@ -448,12 +562,16 @@ fn decodeDlqAndFree(a: Allocator, data: []const u8) !void {
     page.deinit();
 }
 
-test "a DLQ page cut anywhere, overlong or short of memory is refused and leaks nothing" {
+test "a DLQ page or a requeue's or delete's answer cut anywhere, overlong or short of memory is refused and leaks nothing" {
     const a = std.testing.allocator;
     const data: []const u8 = test_dlq_page;
     for (0..data.len) |n| try std.testing.expectError(FloError.IncompleteResponse, decodeDlqAndFree(a, data[0..n]));
     try std.testing.expectError(FloError.IncompleteResponse, decodeDlqAndFree(a, test_dlq_page ++ "\x00"));
     try std.testing.checkAllAllocationFailures(a, decodeDlqAndFree, .{data});
+    const dead: []const u8 = test_dead_answer;
+    for (0..dead.len) |n| try std.testing.expectError(FloError.IncompleteResponse, decodeDeadAndFree(a, dead[0..n]));
+    try std.testing.expectError(FloError.IncompleteResponse, decodeDeadAndFree(a, test_dead_answer ++ "\x00"));
+    try std.testing.checkAllAllocationFailures(a, decodeDeadAndFree, .{dead});
 }
 
 /// Two ready messages, the second cut to 1 byte of 3, and more.

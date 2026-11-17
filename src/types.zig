@@ -329,7 +329,6 @@ pub const OpCode = enum(u16) {
 
     // ── Queues (0x170 – 0x19F) ──
     queue_enqueue = 0x170,
-    queue_dlq_list = 0x176,
     queue_stats = 0x17B,
     queue_purge = 0x17F,
     queue_peek = 0x180,
@@ -337,6 +336,9 @@ pub const OpCode = enum(u16) {
     queue_complete = 0x182,
     queue_fail = 0x183,
     queue_touch = 0x184,
+    queue_dlq_list = 0x185,
+    queue_dlq_requeue = 0x186,
+    queue_dlq_delete = 0x187,
     queue_list = 0x198,
 
     // ── Time-Series (0x1A0 – 0x1BF) ──
@@ -989,44 +991,85 @@ pub const PurgeOptions = struct {
 /// The most dead letters one DLQ list page holds.
 pub const MAX_DLQ_PAGE: u32 = 100;
 
+/// Where a queue's dead-letter list goes on. Opaque: pass back the one a
+/// page answered.
+pub const DlqCursor = struct {
+    dead_ns: u64,
+    seq: u64,
+};
+
 /// Options for DLQ list operations
 pub const DlqListOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
     /// Dead letters per page, 1 to 100.
     limit: u32 = MAX_DLQ_PAGE,
-    /// The previous page's `last_seq`; null for the first page.
-    after: ?u64 = null,
+    /// The previous page's cursor; null for the first page.
+    after: ?DlqCursor = null,
 };
 
-/// A message moved to a queue's dead letter queue.
+/// A queue's dead letter: a message failed or expired as many times as its
+/// attempts, or failed dead.
 pub const DeadLetter = struct {
     seq: u64,
+    priority: u32,
+    /// Times it was delivered.
+    deliveries: u32,
+    /// Times it failed: failed by its consumer, or its lease ran out.
+    failures: u32,
+    enqueued_at_ms: i64,
+    /// When it died, in Unix milliseconds.
+    dead_at_ms: i64,
     /// The payload's whole length; `payload` holds at most 4 KiB of it.
     size: u32,
     payload: []const u8,
-    enqueued_at_ms: i64,
-    /// Times it was delivered.
-    deliveries: u32,
-    priority: u8,
-    /// When it was moved to the DLQ, in Unix milliseconds.
-    moved_at_ms: i64,
+    /// Its last error, at most its first 256 bytes.
+    error_message: []const u8,
 };
 
-/// One page of a queue's dead letters, oldest first. Free with `deinit`.
+/// One page of a queue's dead letters, oldest dead first. Free with
+/// `deinit`.
 pub const DlqPage = struct {
     letters: []DeadLetter,
-    /// Dead letters the queue holds in all.
-    total: u64,
-    /// More follow: ask again with `after` set to `last_seq`.
-    has_more: bool,
-    /// The seq of the page's last dead letter.
-    last_seq: u64,
+    /// Where the next page starts; null on the last page.
+    cursor: ?DlqCursor,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *DlqPage) void {
-        for (self.letters) |l| self.allocator.free(l.payload);
+        for (self.letters) |l| {
+            self.allocator.free(l.payload);
+            self.allocator.free(l.error_message);
+        }
         self.allocator.free(self.letters);
+    }
+};
+
+/// Options for a queue's dead-letter requeue or delete.
+pub const DlqOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Instead of messages named by seq: the queue's oldest dead letters, a
+    /// batch of up to `limit`. Name messages or set this, not both.
+    all: bool = false,
+    /// With `all`, the most one batch takes, 1 to 100.
+    limit: u32 = MAX_QUEUE_BATCH,
+    /// Delete only: say what it would delete, and delete nothing.
+    dry_run: bool = false,
+};
+
+/// What a dead-letter requeue or delete did. Free with `deinit`.
+pub const DlqResult = struct {
+    /// How many it applied to; with dry_run, how many it would delete.
+    applied: u32,
+    /// The rest, and why: `gone` (not in the queue) or `not_dead`.
+    refused: []QueueRefusal,
+    /// With `all`: dead letters remain past this batch.
+    more: bool,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *DlqResult) void {
+        for (self.refused) |f| self.allocator.free(f.reason);
+        self.allocator.free(self.refused);
     }
 };
 

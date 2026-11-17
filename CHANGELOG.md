@@ -31,6 +31,17 @@
   delete them (`dry_run` says what it would). Requeue and delete take
   records by id, or `.all = true` for the oldest up to `limit`, answering
   applied, refused (`not_dead`, `gone`) and `more`.
+- **Breaking:** queue dead letters moved to the server's op table
+  (`queue.dlq_list`, 0x185). `dlqList` keeps its name: a page holds up to
+  100, oldest dead first, and goes on by an opaque `DlqCursor` (`page.cursor`
+  as the next `after`, until null); `total`, `has_more` and `last_seq` are
+  gone. `DeadLetter` gains `failures`, `dead_at_ms` (was `moved_at_ms`) and
+  `error_message` (its first 256 bytes); `priority` is a `u32`. A queue that
+  doesn't exist is `error.NotFound`.
+- New `Queue.dlqRequeue` and `dlqDelete`: make dead letters ready again with
+  their failures reset, or delete them (`dry_run` says what it would). Each
+  takes seqs, or `.all = true` for the oldest up to `limit`, answering
+  applied, refused (`not_dead`, `gone`) and `more`.
 
 ## 0.1.0-dev.5 - 2026-11-16
 
