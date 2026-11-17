@@ -1762,8 +1762,8 @@ test "live: a steal takes an idle holder's records under a new lease, and refuse
     for (early.refused) |r| try testing.expectEqual(flo.GroupRefusalWhy.not_idle, r.why);
     try testing.expect(early.refused[0].reason.len > 0);
 
-    // Idle 50 ms: a is taken; b named with deliveries it doesn't have is
-    // refused delivered_again.
+    // Idle 100 ms, past the 50 named: a is taken; b, named with deliveries
+    // it doesn't have, is refused delivered_again.
     std.Thread.sleep(100 * std.time.ns_per_ms);
     const wrong_b: flo.LeasedRecord = .{ .id = b.id, .deliveries = b.deliveries + 1 };
     var taken = try stream.groupSteal("stolen", "g", "c2", 50, &.{ a, wrong_b }, .{ .lease_ms = 30_000 });
@@ -1849,4 +1849,35 @@ test "live: a group's dead letters list by page, requeue with failures reset, an
     try testing.expectEqual(@as(usize, 0), empty.letters.len);
     try testing.expectEqual(@as(u64, 0), (try stream.groupInfo("deadgroup", "g", .{})).dead);
     try testing.expectError(flo.FloError.NotFound, stream.groupDlqList("deadgroup", "nobody", .{}));
+}
+
+test "live: an alter on a stream an append made works, and info shows it; a create must then name the same settings" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var stream = flo.Stream.init(&live.client);
+    _ = try stream.append("appended", "x", .{});
+    try stream.alter("appended", .{ .retention_count = 1000, .retention_age_s = 3600 });
+    const info = try stream.info("appended", .{});
+    try testing.expectEqual(@as(u64, 1000), info.retention_count);
+    try testing.expectEqual(@as(u64, 3600), info.retention_age_s);
+    try testing.expectEqual(@as(u64, 1), info.count);
+
+    // An alter of one bound keeps the other.
+    try stream.alter("appended", .{ .retention_count = 500 });
+    const altered = try stream.info("appended", .{});
+    try testing.expectEqual(@as(u64, 500), altered.retention_count);
+    try testing.expectEqual(@as(u64, 3600), altered.retention_age_s);
+
+    // A create naming other settings is refused; the same ones succeed.
+    try testing.expectError(flo.FloError.Conflict, stream.create("appended", .{}));
+    try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "other settings") != null);
+    try stream.create("appended", .{ .retention_count = 500, .retention_age_s = 3600 });
+
+    // A create of one an append made, never altered, gives it settings.
+    _ = try stream.append("appended-too", "x", .{});
+    try stream.create("appended-too", .{ .retention_count = 10 });
+    try testing.expectEqual(@as(u64, 10), (try stream.info("appended-too", .{})).retention_count);
+
+    try testing.expectError(flo.FloError.NotFound, stream.alter("never-made", .{ .retention_count = 1 }));
 }

@@ -42,6 +42,14 @@
   their failures reset, or delete them (`dry_run` says what it would). Each
   takes seqs, or `.all = true` for the oldest up to `limit`, answering
   applied, refused (`not_dead`, `gone`) and `more`.
+- New `Stream.create` and `Stream.alter`, taking `StreamSettingsOptions`
+  (`retention_age_s`, `retention_count`); `StreamInfo` gains both. An alter
+  works on a stream an append made (the server used to answer not found).
+  Creating a stream again with the settings it has succeeds; with others,
+  including after an alter changed them, it is `error.Conflict` ("the stream
+  exists with other settings"). A create whose name's 64-bit hash another
+  stream's name has is `error.Conflict` too. `info` now requires the
+  server's whole answer, retention included.
 
 ## 0.1.0-dev.5 - 2026-11-16
 

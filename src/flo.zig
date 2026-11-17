@@ -163,6 +163,7 @@ pub const Header = types.Header;
 pub const StreamReadOptions = types.StreamReadOptions;
 pub const StreamTrimOptions = types.StreamTrimOptions;
 pub const StreamInfoOptions = types.StreamInfoOptions;
+pub const StreamSettingsOptions = types.StreamSettingsOptions;
 pub const StreamDeleteOptions = types.StreamDeleteOptions;
 pub const StreamGroupCreateOptions = types.StreamGroupCreateOptions;
 pub const StreamGroupOptions = types.StreamGroupOptions;

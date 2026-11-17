@@ -182,8 +182,8 @@ pub const Stream = struct {
             return response.status.toError();
         }
 
-        // Parse response: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32][retention_age_s:u64][retention_count:u64][retention_bytes:u64]; the retention fields are not read yet
-        if (response.data.len < 52) {
+        // Parse response: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32][retention_age_s:u64][retention_count:u64][retention_bytes:u64]
+        if (response.data.len != 76) {
             return FloError.IncompleteResponse;
         }
 
@@ -199,7 +199,39 @@ pub const Stream = struct {
             .count = std.mem.readInt(u64, response.data[32..40], .little),
             .bytes = std.mem.readInt(u64, response.data[40..48], .little),
             .partition_count = std.mem.readInt(u32, response.data[48..52], .little),
+            .retention_age_s = std.mem.readInt(u64, response.data[52..60], .little),
+            .retention_count = std.mem.readInt(u64, response.data[60..68], .little),
         };
+    }
+
+    /// Create a stream with its settings. An append makes a stream too, with
+    /// none: a create of one an append made gives it these. Creating it
+    /// again with the same settings succeeds, as a retry does; with others
+    /// it is `FloError.Conflict` ("the stream exists with other settings"):
+    /// change them with `alter`. Once a stream has been altered, a create
+    /// must name the settings it has now, or it is refused the same way. A
+    /// name whose 64-bit hash another stream's name in the namespace has
+    /// is `FloError.Conflict` too: choose another name.
+    pub fn create(self: *Stream, stream_name: []const u8, options: types.StreamSettingsOptions) FloError!void {
+        return self.settings(.stream_create, stream_name, options);
+    }
+
+    /// Change a stream's retention: each bound set (not 0) replaces the
+    /// stream's; one left 0 stays as it stands. Works on a stream an append
+    /// made as well as one a create did. A stream that doesn't exist is
+    /// `FloError.NotFound`.
+    pub fn alter(self: *Stream, stream_name: []const u8, options: types.StreamSettingsOptions) FloError!void {
+        return self.settings(.stream_alter, stream_name, options);
+    }
+
+    fn settings(self: *Stream, op: types.OpCode, stream_name: []const u8, options: types.StreamSettingsOptions) FloError!void {
+        var opts_buf: [20]u8 = undefined;
+        var builder = wire.OptionsBuilder.init(&opts_buf);
+        if (options.retention_age_s > 0) try builder.addU64(.retention_age, options.retention_age_s);
+        if (options.retention_count > 0) try builder.addU64(.retention_count, options.retention_count);
+        var response = try self.client.sendRequest(op, self.client.getNamespace(options.namespace), stream_name, "", builder.getOptions());
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
     }
 
     /// Remove a stream's oldest records by exactly one bound: `before`,
@@ -1747,4 +1779,36 @@ test "steal, dead-letter page and dead-letter answers cut anywhere, overlong or 
         try std.testing.expectError(FloError.IncompleteResponse, c[0](a, c[1] ++ "\x00"));
         try std.testing.checkAllAllocationFailures(a, c[0], .{data});
     }
+}
+
+test "create and alter send the stream's retention as options; info reads it back" {
+    const test_server = @import("test_server.zig");
+    const a = std.testing.allocator;
+    const info_answer: []const u8 = &(le(@as(u64, 1)) ++ le(@as(u64, 2)) ++ le(@as(u64, 3)) ++ le(@as(u64, 4)) ++ le(@as(u64, 5)) ++ le(@as(u64, 6)) ++
+        le(@as(u32, 1)) ++ le(@as(u64, 3600)) ++ le(@as(u64, 1000)) ++ le(@as(u64, 0)));
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{ .{ .status = 0 }, .{ .status = 0 }, .{ .status = 0, .body = info_answer }, .{ .status = 0, .body = info_answer[0..52] } };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    try stream.create("events", .{ .retention_age_s = 3600, .retention_count = 1000 });
+    try std.testing.expectEqual(@as(u16, 0x13D), srv.last_op);
+    try std.testing.expectEqualStrings("", srv.lastValue());
+    try std.testing.expectEqualSlices(u8, "\x2a\x08" ++ le(@as(u64, 3600)) ++ "\x29\x08" ++ le(@as(u64, 1000)), srv.lastOptions());
+
+    // An alter sends only the bounds it changes.
+    try stream.alter("events", .{ .retention_count = 1000 });
+    try std.testing.expectEqual(@as(u16, 0x13F), srv.last_op);
+    try std.testing.expectEqualSlices(u8, "\x29\x08" ++ le(@as(u64, 1000)), srv.lastOptions());
+
+    const info = try stream.info("events", .{});
+    try std.testing.expectEqual(@as(u64, 3600), info.retention_age_s);
+    try std.testing.expectEqual(@as(u64, 1000), info.retention_count);
+    try std.testing.expectEqual(@as(u64, 5), info.count);
+    // An answer without the retention fields is cut short.
+    try std.testing.expectError(FloError.IncompleteResponse, stream.info("events", .{}));
 }

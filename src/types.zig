@@ -492,6 +492,8 @@ pub const OptionTag = enum(u8) {
     partition = 0x24, // u32: Explicit partition index
     partition_key = 0x25, // string: Key for partition routing
     max_age_seconds = 0x26, // u64: Maximum age in seconds for retention
+    retention_count = 0x29, // u64: A stream's retention: the most records it keeps
+    retention_age = 0x2A, // u64: A stream's retention: its oldest record's age, in seconds
     dry_run = 0x28, // void: Flag to preview what would be deleted without deleting
     force = 0x2C, // void: Flag to delete a stream that still holds records
 
@@ -1201,6 +1203,22 @@ pub const StreamInfo = struct {
     count: u64,
     bytes: u64,
     partition_count: u32 = 1,
+    /// Its retention: records older than this many seconds are trimmed;
+    /// 0 for none.
+    retention_age_s: u64 = 0,
+    /// Its retention: the most records it keeps; 0 for no bound.
+    retention_count: u64 = 0,
+};
+
+/// A stream's settings, for a create or an alter: its retention. 0 leaves
+/// a bound unset (a create) or as it stands (an alter).
+pub const StreamSettingsOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Trim records older than this many seconds (at most 100 years).
+    retention_age_s: u64 = 0,
+    /// Keep at most this many records.
+    retention_count: u64 = 0,
 };
 
 /// A header stored with a stream record.
