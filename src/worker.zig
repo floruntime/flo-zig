@@ -918,13 +918,25 @@ pub const ActionWorker = struct {
     /// timeout is sent again, unchanged, on a fresh connection, up to
     /// max_result_sends in all; a resend of one that already applied
     /// answers ok. A refusal is not sent again: the server answered, and a
-    /// stale report means the run has moved on.
+    /// stale report means the run has moved on. The exception is overloaded
+    /// without running: that is sent again, with a capped backoff, until
+    /// the server takes it or answers otherwise; a stopping worker gives up
+    /// after stopping_overloaded_ms. Only a report that would end a run a
+    /// workflow step called, refused while the caller's shard has no room
+    /// for the end, has the run's lease held meanwhile. For any other the
+    /// lease keeps running, and once it ends the run may be handed out
+    /// again, so the result is at-least-once. On the poll connection (a task
+    /// run inline, with concurrency 1) the worker heartbeats between tries:
+    /// nothing else on that thread does while it waits, and a worker silent
+    /// for the server's heartbeat timeout is marked unhealthy.
     /// Returns whether the server accepted it; otherwise the drop is logged
     /// and the task is left to its lease, so it may run again.
     fn report(self: *Self, conn: *Client, register: bool, task: *const TaskAssignment, rep: Report) bool {
         const kind = @tagName(rep);
         var actions = Actions.init(conn);
         var sends: u32 = 0;
+        var backoff = retry_mod.workerBackoff();
+        var stopping_since: ?std.time.Instant = null;
         while (true) {
             sends += 1;
             const result = switch (rep) {
@@ -939,6 +951,24 @@ pub const ActionWorker = struct {
                 }),
             };
             const err = if (result) return true else |e| e;
+            if (err == FloError.Overloaded and conn.refusedUnrun(err)) {
+                sends -= 1;
+                if (!@atomicLoad(bool, &self.running, .monotonic)) {
+                    const now = std.time.Instant.now() catch null;
+                    if (stopping_since == null) stopping_since = now;
+                    if (now != null and stopping_since != null and now.?.since(stopping_since.?) >= stopping_overloaded_ms * std.time.ns_per_ms) {
+                        types.logWorkerError("[flo-worker] {s} for run {s} still refused overloaded while stopping: {s}; dropped", .{ kind, task.run_id, conn.lastError().?.message });
+                        return false;
+                    }
+                }
+                const ms = backoff.next(conn.prng.random());
+                std.log.warn("[flo-worker] {s} for run {s} refused overloaded, not run: {s}; resending in {d}ms", .{ kind, task.run_id, conn.lastError().?.message, ms });
+                // `register` means `conn` is the poll connection, which the
+                // heartbeat uses; a slot's thread leaves it to the poll loop.
+                if (register) self.maybeHeartbeat();
+                std.Thread.sleep(ms * std.time.ns_per_ms);
+                continue;
+            }
             if (!client_mod.isConnectionError(err)) {
                 types.logWorkerError("[flo-worker] {s} for run {s} refused: {}; dropped", .{ kind, task.run_id, err });
                 return false;
@@ -963,6 +993,9 @@ pub const ActionWorker = struct {
 
 /// How long a stopping worker keeps trying to reconnect to resend a result.
 const stopping_reconnect_ms = 2_000;
+
+/// How long a stopping worker keeps resending a result refused overloaded.
+const stopping_overloaded_ms = 10_000;
 
 /// Sends of one result, the first included, before it is dropped.
 const max_result_sends = 3;
@@ -2116,6 +2149,72 @@ test "ActionWorker whose registration is outcome_pending returns it after one tr
     try std.testing.expectEqual(types.Reason.shard_halted, last.reason);
     try std.testing.expectEqual(types.Ran.unknown, last.ran);
     try std.testing.expectEqualStrings("shard 0 halted at this entry; a repair skips it. Don't resend it unchanged", last.message);
+}
+
+/// A worker's complete or fail that would end a called run, refused while
+/// the caller's shard has no room for the end.
+const outbox_full: @import("test_server.zig").Reply = .{ .status = 10, .body = "\x0c\x00\x00overloaded: the outbox to shard 3 is full; this request was not run \xe2\x80\x94 retry later" };
+
+test "ActionWorker resends a complete or fail refused overloaded with backoff until it is taken" {
+    for ([_]types.OpCode{ .action_complete, .action_fail }) |op| {
+        var srv = try ScriptServer.listen();
+        const rules = [_]ScriptServer.Rule{.{ .op = op, .nth = 0, .action = .{ .reply = outbox_full } }};
+        srv.rules = &rules;
+        try srv.start();
+        defer srv.deinit();
+
+        // Retrying off in the client, so each send the server sees is the worker's.
+        var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100, .retry = .{ .max_attempts = 1 } });
+        defer w.deinit();
+        w.running = true;
+        const task: TaskAssignment = .{ .run_id = "t1", .namespace = "default", .deliveries = 1, .term = 1, .index = 7, .action = "job", .created_at = 0, .attempt = 1, .lease_ms = 300, .payload = "", .allocator = std.testing.allocator };
+        const rep: ActionWorker.Report = if (op == .action_complete) .{ .complete = .{ .data = "done" } } else .{ .fail = .{ .message = "boom" } };
+        try std.testing.expect(w.report(&w.client, true, &task, rep));
+        try std.testing.expectEqual(@as(u32, 2), srv.countOf(op));
+        // The same report, on the same connection.
+        try std.testing.expect(@import("test_server.zig").sameApartFromId(srv.requestOf(op, 0), srv.requestOf(op, 1)));
+        try std.testing.expectEqual(@as(u32, 1), srv.connections.load(.monotonic));
+    }
+}
+
+test "ActionWorker resends a complete refused overloaded more than three times; it isn't a lost send" {
+    var srv = try ScriptServer.listen();
+    srv.rules = &.{
+        .{ .op = .action_complete, .nth = 0, .action = .{ .reply = outbox_full } },
+        .{ .op = .action_complete, .nth = 1, .action = .{ .reply = outbox_full } },
+        .{ .op = .action_complete, .nth = 2, .action = .{ .reply = outbox_full } },
+        .{ .op = .action_complete, .nth = 3, .action = .{ .reply = outbox_full } },
+    };
+    try srv.start();
+    defer srv.deinit();
+
+    var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100, .retry = .{ .max_attempts = 1 } });
+    defer w.deinit();
+    w.running = true;
+    const task: TaskAssignment = .{ .run_id = "t1", .namespace = "default", .deliveries = 1, .term = 1, .index = 7, .action = "job", .created_at = 0, .attempt = 1, .lease_ms = 300, .payload = "", .allocator = std.testing.allocator };
+    try std.testing.expect(w.report(&w.client, true, &task, .{ .complete = .{ .data = "done" } }));
+    try std.testing.expectEqual(@as(u32, 5), srv.countOf(.action_complete));
+}
+
+test "ActionWorker heartbeats between resends of a report refused overloaded on its poll connection, and not on a slot's" {
+    for ([_]bool{ true, false }) |register| {
+        var srv = try ScriptServer.listen();
+        srv.rules = &.{
+            .{ .op = .action_complete, .nth = 0, .action = .{ .reply = outbox_full } },
+            .{ .op = .action_complete, .nth = 1, .action = .{ .reply = outbox_full } },
+        };
+        try srv.start();
+        defer srv.deinit();
+
+        // Interval 0: every wait is past due for a heartbeat.
+        var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100, .heartbeat_interval_ms = 0, .retry = .{ .max_attempts = 1 } });
+        defer w.deinit();
+        w.running = true;
+        const task: TaskAssignment = .{ .run_id = "t1", .namespace = "default", .deliveries = 1, .term = 1, .index = 7, .action = "job", .created_at = 0, .attempt = 1, .lease_ms = 300, .payload = "", .allocator = std.testing.allocator };
+        try std.testing.expect(w.report(&w.client, register, &task, .{ .complete = .{ .data = "done" } }));
+        try std.testing.expectEqual(@as(u32, 3), srv.countOf(.action_complete));
+        try std.testing.expectEqual(@as(u32, if (register) 2 else 0), srv.countOf(.worker_heartbeat));
+    }
 }
 
 test "ActionWorker never resends a complete or fail a halted shard refused" {

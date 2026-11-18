@@ -182,8 +182,8 @@ pub const Stream = struct {
             return response.status.toError();
         }
 
-        // Parse response: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32][retention_age_s:u64][retention_count:u64][retention_bytes:u64]; the retention fields are not read yet
-        if (response.data.len < 52) {
+        // Parse response: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32][retention_age_s:u64][retention_count:u64][retention_bytes:u64]
+        if (response.data.len != 76) {
             return FloError.IncompleteResponse;
         }
 
@@ -199,7 +199,45 @@ pub const Stream = struct {
             .count = std.mem.readInt(u64, response.data[32..40], .little),
             .bytes = std.mem.readInt(u64, response.data[40..48], .little),
             .partition_count = std.mem.readInt(u32, response.data[48..52], .little),
+            .retention_age_s = std.mem.readInt(u64, response.data[52..60], .little),
+            .retention_count = std.mem.readInt(u64, response.data[60..68], .little),
         };
+    }
+
+    /// Create a stream with its settings. An append makes a stream too, with
+    /// none: a create of one an append made gives it these. Creating it
+    /// again with the same settings succeeds, as a retry does; with others
+    /// it is `FloError.Conflict` ("the stream exists with other settings"):
+    /// change them with `alter`. Once a stream has been altered, a create
+    /// must name the settings it has now, or it is refused the same way. A
+    /// name whose 64-bit hash another stream's name in the namespace has
+    /// is `FloError.Conflict` too: choose another name.
+    pub fn create(self: *Stream, stream_name: []const u8, options: types.StreamSettingsOptions) FloError!void {
+        return self.settings(.stream_create, stream_name, options);
+    }
+
+    /// Change a stream's retention: each bound set (not 0) replaces the
+    /// stream's; one left 0 stays as it stands. Works on a stream an append
+    /// made as well as one a create did. A stream that doesn't exist is
+    /// `FloError.NotFound`.
+    pub fn alter(self: *Stream, stream_name: []const u8, options: types.StreamSettingsOptions) FloError!void {
+        return self.settings(.stream_alter, stream_name, options);
+    }
+
+    fn settings(self: *Stream, op: types.OpCode, stream_name: []const u8, options: types.StreamSettingsOptions) FloError!void {
+        // The server's alter reads no partition count; sent, it would be
+        // dropped without a word.
+        if (op == .stream_alter and options.partitions > 0) return FloError.BadRequest;
+        var opts_buf: [20]u8 = undefined;
+        var builder = wire.OptionsBuilder.init(&opts_buf);
+        if (options.retention_age_s > 0) try builder.addU64(.retention_age, options.retention_age_s);
+        if (options.retention_count > 0) try builder.addU64(.retention_count, options.retention_count);
+        // A create's value is its partition count, a u32; none is one.
+        const partitions = std.mem.toBytes(std.mem.nativeToLittle(u32, options.partitions));
+        const value: []const u8 = if (options.partitions > 0) &partitions else "";
+        var response = try self.client.sendRequest(op, self.client.getNamespace(options.namespace), stream_name, value, builder.getOptions());
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
     }
 
     /// Remove a stream's oldest records by exactly one bound: `before`,
@@ -533,6 +571,142 @@ pub const Stream = struct {
         defer response.deinit();
         if (response.status != .ok) return response.status.toError();
         return decodeGroupMembers(self.client.allocator, response.data);
+    }
+
+    /// Take records another consumer holds and has left idle for at least
+    /// `min_idle_ms` (1 ms to 12 h): each gets a new delivery to `consumer`
+    /// under one new lease, its failures kept. Idle is the time since its
+    /// holder last touched it (its read, a steal, or any touch, even one
+    /// that leaves the lease as it stands), so a holder that touches more
+    /// often than `min_idle_ms` is never stolen from: refused `not_idle`.
+    /// Name each record with the deliveries its holder has; one delivered
+    /// since is refused `delivered_again`. An operator's command: a group
+    /// read takes expired records by itself.
+    /// **Caller owns the returned `GroupStealResult` and must call `result.deinit()`.**
+    pub fn groupSteal(
+        self: *Stream,
+        stream_name: []const u8,
+        group: []const u8,
+        consumer: []const u8,
+        min_idle_ms: u64,
+        records: []const types.LeasedRecord,
+        options: types.StreamGroupStealOptions,
+    ) FloError!types.GroupStealResult {
+        if (min_idle_ms < 1 or min_idle_ms > types.MAX_GROUP_LEASE_MS) return FloError.BadRequest;
+        if (options.lease_ms) |l| if (l < types.MIN_GROUP_LEASE_MS or l > types.MAX_GROUP_LEASE_MS) return FloError.BadRequest;
+        if (records.len > types.MAX_GROUP_BATCH) return FloError.BadRequest;
+        var buf: [4 + types.MAX_GROUP_NAME + types.MAX_GROUP_CONSUMER + 8 + 9 + 1 + types.MAX_GROUP_BATCH * 20]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeName(&w, group, types.MAX_GROUP_NAME);
+        try writeName(&w, consumer, types.MAX_GROUP_CONSUMER);
+        w.writeInt(u64, min_idle_ms, .little) catch unreachable;
+        if (options.lease_ms) |l| {
+            w.writeByte(1) catch unreachable;
+            w.writeInt(u64, l, .little) catch unreachable;
+        } else w.writeByte(0) catch unreachable;
+        w.writeByte(@intCast(records.len)) catch unreachable;
+        for (records) |rec| {
+            w.writeInt(u64, rec.id.timestamp_ms, .little) catch unreachable;
+            w.writeInt(u64, rec.id.sequence, .little) catch unreachable;
+            w.writeInt(u32, rec.deliveries, .little) catch unreachable;
+        }
+        var response = try self.client.sendRequest(.stream_group_steal, self.client.getNamespace(options.namespace), stream_name, w.buffered(), "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeSteal(self.client.allocator, response.data);
+    }
+
+    /// A page of the group's dead letters, oldest dead first, each with its
+    /// deliveries, failures, when it died and its last error. Pass the
+    /// page's `cursor` as `options.after` until it is null. A group the
+    /// stream doesn't have is `FloError.NotFound`.
+    /// **Caller owns the returned `GroupDlqPage` and must call `page.deinit()`.**
+    pub fn groupDlqList(
+        self: *Stream,
+        stream_name: []const u8,
+        group: []const u8,
+        options: types.GroupDlqListOptions,
+    ) FloError!types.GroupDlqPage {
+        if (options.limit < 1 or options.limit > types.MAX_DLQ_PAGE) return FloError.BadRequest;
+        var buf: [2 + types.MAX_GROUP_NAME + 5 + 25]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeName(&w, group, types.MAX_GROUP_NAME);
+        w.writeByte(1) catch unreachable;
+        w.writeInt(u32, options.limit, .little) catch unreachable;
+        if (options.after) |c| {
+            w.writeByte(1) catch unreachable;
+            w.writeInt(u64, c.dead_ns, .little) catch unreachable;
+            w.writeInt(u64, c.ms, .little) catch unreachable;
+            w.writeInt(u64, c.seq, .little) catch unreachable;
+        } else w.writeByte(0) catch unreachable;
+        var response = try self.client.sendRequest(.stream_group_dlq_list, self.client.getNamespace(options.namespace), stream_name, w.buffered(), "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeGroupDlqPage(self.client.allocator, response.data);
+    }
+
+    /// Make dead letters ready again at once, their failures reset to 0
+    /// (deliveries and last error kept): those named in `records`, or with
+    /// `options.all` the group's oldest, up to `options.limit`, with
+    /// `more` set while others remain. One not dead is refused `not_dead`;
+    /// one not in the group, or trimmed from the stream since, `gone`.
+    /// **Caller owns the returned `GroupDlqResult` and must call `result.deinit()`.**
+    pub fn groupDlqRequeue(
+        self: *Stream,
+        stream_name: []const u8,
+        group: []const u8,
+        records: []const types.StreamID,
+        options: types.GroupDlqOptions,
+    ) FloError!types.GroupDlqResult {
+        if (options.dry_run) return FloError.BadRequest;
+        return self.groupDead(.stream_group_dlq_requeue, stream_name, group, records, options);
+    }
+
+    /// Delete dead letters for good: those named in `records`, or with
+    /// `options.all` the group's oldest, up to `options.limit`, with `more`
+    /// set while others remain. One not dead is refused `not_dead`; one not
+    /// in the group, `gone`. With `options.dry_run`, `applied` is how many
+    /// it would delete, and nothing is deleted.
+    /// **Caller owns the returned `GroupDlqResult` and must call `result.deinit()`.**
+    pub fn groupDlqDelete(
+        self: *Stream,
+        stream_name: []const u8,
+        group: []const u8,
+        records: []const types.StreamID,
+        options: types.GroupDlqOptions,
+    ) FloError!types.GroupDlqResult {
+        return self.groupDead(.stream_group_dlq_delete, stream_name, group, records, options);
+    }
+
+    fn groupDead(
+        self: *Stream,
+        op: types.OpCode,
+        stream_name: []const u8,
+        group: []const u8,
+        records: []const types.StreamID,
+        options: types.GroupDlqOptions,
+    ) FloError!types.GroupDlqResult {
+        // Records or all, as the server takes them.
+        if (options.all == (records.len > 0)) return FloError.BadRequest;
+        if (records.len > types.MAX_GROUP_BATCH) return FloError.BadRequest;
+        if (options.limit < 1 or options.limit > types.MAX_GROUP_BATCH) return FloError.BadRequest;
+        var buf: [2 + types.MAX_GROUP_NAME + 2 + types.MAX_GROUP_BATCH * 16 + 2 + 5 + 2]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeName(&w, group, types.MAX_GROUP_NAME);
+        if (records.len > 0) {
+            w.writeAll(&.{ 1, @intCast(records.len) }) catch unreachable;
+            for (records) |id| {
+                w.writeInt(u64, id.timestamp_ms, .little) catch unreachable;
+                w.writeInt(u64, id.sequence, .little) catch unreachable;
+            }
+        } else w.writeByte(0) catch unreachable;
+        w.writeAll(&.{ 1, @intFromBool(options.all), 1 }) catch unreachable;
+        w.writeInt(u32, options.limit, .little) catch unreachable;
+        if (op == .stream_group_dlq_delete) w.writeAll(&.{ 1, @intFromBool(options.dry_run) }) catch unreachable;
+        var response = try self.client.sendRequest(op, self.client.getNamespace(options.namespace), stream_name, w.buffered(), "");
+        defer response.deinit();
+        if (response.status != .ok) return response.status.toError();
+        return decodeGroupDead(self.client.allocator, response.data);
     }
 };
 
@@ -1014,6 +1188,111 @@ fn decodeGroupMembers(allocator: std.mem.Allocator, data: []const u8) FloError!t
     return .{ .members = members, .more = more, .allocator = allocator };
 }
 
+/// A refusal's smallest encoding: an empty reason.
+const min_command_refusal = 8 + 8 + 1 + 1;
+/// The longest reason a refusal carries.
+const max_refusal_reason = 128;
+
+/// A refused list (u8 count), each {ms, seq, why, reason (u8 len)}.
+fn decodeCommandRefusals(allocator: std.mem.Allocator, r: *Reader) FloError![]types.GroupCommandRefusal {
+    const n = try r.int(u8);
+    if (n > types.MAX_GROUP_BATCH or n > r.remaining() / min_command_refusal) return FloError.IncompleteResponse;
+    const refused = try allocator.alloc(types.GroupCommandRefusal, n);
+    var got: usize = 0;
+    errdefer {
+        for (refused[0..got]) |f| allocator.free(f.reason);
+        allocator.free(refused);
+    }
+    while (got < n) : (got += 1) {
+        const ms = try r.int(u64);
+        const seq = try r.int(u64);
+        // A why this SDK predates is kept as its number.
+        const why: types.GroupRefusalWhy = @enumFromInt(try r.int(u8));
+        const reason = try r.lenBytes(u8);
+        if (reason.len > max_refusal_reason) return FloError.IncompleteResponse;
+        refused[got] = .{ .id = .{ .timestamp_ms = ms, .sequence = seq }, .why = why, .reason = try allocator.dupe(u8, reason) };
+    }
+    return refused;
+}
+
+/// stream.group.steal's answer: term, index, expires_at_ms, stolen (u8
+/// count), each {ms, seq, deliveries}, then refused.
+fn decodeSteal(allocator: std.mem.Allocator, data: []const u8) FloError!types.GroupStealResult {
+    var r: Reader = .{ .data = data };
+    const term = try r.int(u64);
+    const index = try r.int(u64);
+    const expires_at_ms = try r.int(i64);
+    const n = try r.int(u8);
+    if (n > types.MAX_GROUP_BATCH or n > r.remaining() / 20) return FloError.IncompleteResponse;
+    // Records with no payload or headers, so an ack, nack or touch takes
+    // them as it takes a read's; freeing their empty slices is a no-op.
+    const stolen = try allocator.alloc(types.StreamRecord, n);
+    errdefer allocator.free(stolen);
+    for (stolen) |*t| {
+        const ms = try r.int(u64);
+        const seq = try r.int(u64);
+        t.* = .{ .id = .{ .timestamp_ms = ms, .sequence = seq }, .payload = "", .deliveries = try r.int(u32) };
+    }
+    const refused = try decodeCommandRefusals(allocator, &r);
+    errdefer {
+        for (refused) |f| allocator.free(f.reason);
+        allocator.free(refused);
+    }
+    try r.end();
+    return .{ .lease = .{ .term = term, .index = index }, .expires_at_ms = expires_at_ms, .stolen = stolen, .refused = refused, .allocator = allocator };
+}
+
+/// A dead letter's smallest encoding: an empty error.
+const min_group_dead = 8 + 8 + 4 + 4 + 8 + 2;
+
+/// stream.group.dlq_list's answer: dead (u8 count), each {ms, seq,
+/// deliveries, failures, dead_at_ms, error (u16 len)}, then cursor?
+/// {dead_ns, ms, seq}.
+fn decodeGroupDlqPage(allocator: std.mem.Allocator, data: []const u8) FloError!types.GroupDlqPage {
+    var r: Reader = .{ .data = data };
+    const n = try r.int(u8);
+    if (n > types.MAX_DLQ_PAGE or n > r.remaining() / min_group_dead) return FloError.IncompleteResponse;
+    const letters = try allocator.alloc(types.GroupDeadLetter, n);
+    var got: usize = 0;
+    errdefer {
+        for (letters[0..got]) |l| allocator.free(l.error_message);
+        allocator.free(letters);
+    }
+    while (got < n) : (got += 1) {
+        const ms = try r.int(u64);
+        const seq = try r.int(u64);
+        const deliveries = try r.int(u32);
+        const failures = try r.int(u32);
+        const dead_at_ms = try r.int(i64);
+        const err_text = try r.lenBytes(u16);
+        if (err_text.len > types.MAX_DLQ_ERROR) return FloError.IncompleteResponse;
+        letters[got] = .{
+            .id = .{ .timestamp_ms = ms, .sequence = seq },
+            .deliveries = deliveries,
+            .failures = failures,
+            .dead_at_ms = dead_at_ms,
+            .error_message = try allocator.dupe(u8, err_text),
+        };
+    }
+    const cursor: ?types.GroupDlqCursor = if (try r.boolean()) .{ .dead_ns = try r.int(u64), .ms = try r.int(u64), .seq = try r.int(u64) } else null;
+    try r.end();
+    return .{ .letters = letters, .cursor = cursor, .allocator = allocator };
+}
+
+/// A dead-letter requeue's or delete's answer: applied, refused, more.
+fn decodeGroupDead(allocator: std.mem.Allocator, data: []const u8) FloError!types.GroupDlqResult {
+    var r: Reader = .{ .data = data };
+    const applied = try r.int(u32);
+    const refused = try decodeCommandRefusals(allocator, &r);
+    errdefer {
+        for (refused) |f| allocator.free(f.reason);
+        allocator.free(refused);
+    }
+    const more = try r.boolean();
+    try r.end();
+    return .{ .applied = applied, .refused = refused, .more = more, .allocator = allocator };
+}
+
 const le = std.mem.toBytes;
 
 /// Group "g": 2 members, 5 pending, created at 10, 30 s ack timeout, 4
@@ -1302,6 +1581,16 @@ test "a group read at its held cap is GroupHeldFull, sent once and not retried" 
     try std.testing.expect(!client.refusedUnrun(FloError.Overloaded));
 }
 
+test "a group report's not_dead and not_idle decode by name, and a why this SDK predates as its number" {
+    const data = le(@as(u32, 0)) ++ le(@as(u32, 3)) ++ le(@as(u64, 1)) ++ le(@as(u64, 1)) ++ "\x06" ++
+        le(@as(u64, 1)) ++ le(@as(u64, 2)) ++ "\x07" ++ le(@as(u64, 1)) ++ le(@as(u64, 3)) ++ "\x2a";
+    var r = try decodeGroupReport(std.testing.allocator, data, false);
+    defer r.deinit();
+    try std.testing.expectEqual(types.GroupRefusalWhy.not_dead, r.refused[0].why);
+    try std.testing.expectEqual(types.GroupRefusalWhy.not_idle, r.refused[1].why);
+    try std.testing.expectEqual(@as(u8, 42), @intFromEnum(r.refused[2].why));
+}
+
 test "a group report answer cut anywhere or overlong is refused" {
     const a = std.testing.allocator;
     const body = le(@as(i64, 1)) ++ le(@as(u32, 0)) ++ le(@as(u32, 1)) ++ le(@as(u64, 100)) ++ le(@as(u64, 7)) ++ "\x01";
@@ -1346,4 +1635,192 @@ test "group create sends its lease and attempts, delete and info read their answ
     try std.testing.expectEqual(@as(u32, 4), srv.requests.load(.acquire));
 
     inline for (.{ "groupJoin", "groupLeave", "groupClaim", "groupConfigureSweeper" }) |name| try std.testing.expect(!@hasDecl(Stream, name));
+}
+
+/// A steal under lease (4, 11), expiring at 9000: took (5, 1) at 3
+/// deliveries; refused (5, 2) not_idle.
+const test_steal = le(@as(u64, 4)) ++ le(@as(u64, 11)) ++ le(@as(i64, 9000)) ++
+    "\x01" ++ le(@as(u64, 5)) ++ le(@as(u64, 1)) ++ le(@as(u32, 3)) ++
+    "\x01" ++ le(@as(u64, 5)) ++ le(@as(u64, 2)) ++ "\x07" ++ "\x04idle";
+
+/// Dead letter (5, 1): 3 deliveries, 3 failures, died at 700, error "boom";
+/// then a cursor.
+const test_group_dlq = "\x01" ++ le(@as(u64, 5)) ++ le(@as(u64, 1)) ++ le(@as(u32, 3)) ++ le(@as(u32, 3)) ++ le(@as(i64, 700)) ++
+    le(@as(u16, 4)) ++ "boom" ++ "\x01" ++ le(@as(u64, 700_000_000)) ++ le(@as(u64, 5)) ++ le(@as(u64, 1));
+
+/// Applied 1; refused (5, 2) not_dead; more.
+const test_group_dead = le(@as(u32, 1)) ++ "\x01" ++ le(@as(u64, 5)) ++ le(@as(u64, 2)) ++ "\x06" ++ "\x08not dead" ++ "\x01";
+
+test "groupSteal sends group, consumer, idle time, lease and records, and reads what it took and refused" {
+    const test_server = @import("test_server.zig");
+    const a = std.testing.allocator;
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{ .{ .status = 0, .body = test_steal }, .{ .status = 0, .body = test_steal } };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    const named = [_]types.LeasedRecord{ .{ .id = .{ .timestamp_ms = 5, .sequence = 1 }, .deliveries = 2 }, .{ .id = .{ .timestamp_ms = 5, .sequence = 2 }, .deliveries = 1 } };
+    var got = try stream.groupSteal("events", "g", "rescue", 1_000, &named, .{ .lease_ms = 60_000 });
+    defer got.deinit();
+    try std.testing.expectEqual(@as(u16, 0x15F), srv.last_op);
+    try std.testing.expectEqualStrings("events", srv.lastKey());
+    try std.testing.expectEqualSlices(u8, le(@as(u16, 1)) ++ "g" ++ le(@as(u16, 6)) ++ "rescue" ++ le(@as(u64, 1_000)) ++ "\x01" ++ le(@as(u64, 60_000)) ++
+        "\x02" ++ le(@as(u64, 5)) ++ le(@as(u64, 1)) ++ le(@as(u32, 2)) ++ le(@as(u64, 5)) ++ le(@as(u64, 2)) ++ le(@as(u32, 1)), srv.lastBody());
+    try std.testing.expectEqual(types.GroupLease{ .term = 4, .index = 11 }, got.lease);
+    try std.testing.expectEqual(@as(i64, 9000), got.expires_at_ms);
+    try std.testing.expectEqual(@as(usize, 1), got.stolen.len);
+    try std.testing.expectEqual(@as(u32, 3), got.stolen[0].deliveries);
+    try std.testing.expectEqual(types.GroupRefusalWhy.not_idle, got.refused[0].why);
+    try std.testing.expectEqualStrings("idle", got.refused[0].reason);
+
+    // No lease named: the group's.
+    var again = try stream.groupSteal("events", "g", "rescue", 1, named[0..1], .{});
+    defer again.deinit();
+    try std.testing.expectEqualSlices(u8, le(@as(u16, 1)) ++ "g" ++ le(@as(u16, 6)) ++ "rescue" ++ le(@as(u64, 1)) ++ "\x00" ++
+        "\x01" ++ le(@as(u64, 5)) ++ le(@as(u64, 1)) ++ le(@as(u32, 2)), srv.lastBody());
+
+    // Refused before sending, as the server would.
+    try std.testing.expectError(FloError.BadRequest, stream.groupSteal("events", "g", "rescue", 0, &named, .{}));
+    try std.testing.expectError(FloError.BadRequest, stream.groupSteal("events", "g", "rescue", 43_200_001, &named, .{}));
+    try std.testing.expectError(FloError.BadRequest, stream.groupSteal("events", "g", "rescue", 1, &named, .{ .lease_ms = 4_999 }));
+    const many = [_]types.LeasedRecord{.{ .id = .{}, .deliveries = 1 }} ** 101;
+    try std.testing.expectError(FloError.BadRequest, stream.groupSteal("events", "g", "rescue", 1, &many, .{}));
+    try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.monotonic));
+}
+
+test "groupDlqList sends group, limit and cursor, and reads the page and its cursor" {
+    const test_server = @import("test_server.zig");
+    const a = std.testing.allocator;
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{ .{ .status = 0, .body = test_group_dlq }, .{ .status = 0, .body = "\x00\x00" } };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    var page = try stream.groupDlqList("events", "g", .{ .limit = 1 });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(u16, 0x160), srv.last_op);
+    try std.testing.expectEqualSlices(u8, le(@as(u16, 1)) ++ "g" ++ "\x01" ++ le(@as(u32, 1)) ++ "\x00", srv.lastBody());
+    try std.testing.expectEqual(@as(usize, 1), page.letters.len);
+    const d = page.letters[0];
+    try std.testing.expectEqual(types.StreamID{ .timestamp_ms = 5, .sequence = 1 }, d.id);
+    try std.testing.expectEqual(@as(u32, 3), d.deliveries);
+    try std.testing.expectEqual(@as(u32, 3), d.failures);
+    try std.testing.expectEqual(@as(i64, 700), d.dead_at_ms);
+    try std.testing.expectEqualStrings("boom", d.error_message);
+    try std.testing.expectEqual(types.GroupDlqCursor{ .dead_ns = 700_000_000, .ms = 5, .seq = 1 }, page.cursor.?);
+
+    var next = try stream.groupDlqList("events", "g", .{ .after = page.cursor });
+    defer next.deinit();
+    try std.testing.expectEqualSlices(u8, le(@as(u16, 1)) ++ "g" ++ "\x01" ++ le(@as(u32, 100)) ++ "\x01" ++ le(@as(u64, 700_000_000)) ++ le(@as(u64, 5)) ++ le(@as(u64, 1)), srv.lastBody());
+    try std.testing.expectEqual(@as(usize, 0), next.letters.len);
+    try std.testing.expectEqual(@as(?types.GroupDlqCursor, null), next.cursor);
+
+    try std.testing.expectError(FloError.BadRequest, stream.groupDlqList("events", "g", .{ .limit = 0 }));
+    try std.testing.expectError(FloError.BadRequest, stream.groupDlqList("events", "g", .{ .limit = 101 }));
+}
+
+test "groupDlqRequeue and groupDlqDelete name records or all, and read applied, refused and more" {
+    const test_server = @import("test_server.zig");
+    const a = std.testing.allocator;
+    var srv = try test_server.OkServer.listen();
+    srv.body = test_group_dead;
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    const ids = [_]types.StreamID{ .{ .timestamp_ms = 5, .sequence = 1 }, .{ .timestamp_ms = 5, .sequence = 2 } };
+    var requeued = try stream.groupDlqRequeue("events", "g", &ids, .{});
+    defer requeued.deinit();
+    try std.testing.expectEqual(@as(u16, 0x161), srv.last_op);
+    try std.testing.expectEqualSlices(u8, le(@as(u16, 1)) ++ "g" ++ "\x01\x02" ++ le(@as(u64, 5)) ++ le(@as(u64, 1)) ++ le(@as(u64, 5)) ++ le(@as(u64, 2)) ++
+        "\x01\x00" ++ "\x01" ++ le(@as(u32, 100)), srv.lastBody());
+    try std.testing.expectEqual(@as(u32, 1), requeued.applied);
+    try std.testing.expectEqual(types.GroupRefusalWhy.not_dead, requeued.refused[0].why);
+    try std.testing.expectEqualStrings("not dead", requeued.refused[0].reason);
+    try std.testing.expect(requeued.more);
+
+    var deleted = try stream.groupDlqDelete("events", "g", &.{}, .{ .all = true, .limit = 10, .dry_run = true });
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(u16, 0x162), srv.last_op);
+    try std.testing.expectEqualSlices(u8, le(@as(u16, 1)) ++ "g" ++ "\x00" ++ "\x01\x01" ++ "\x01" ++ le(@as(u32, 10)) ++ "\x01\x01", srv.lastBody());
+
+    // Records or all, not both or neither; a requeue has no dry run.
+    try std.testing.expectError(FloError.BadRequest, stream.groupDlqRequeue("events", "g", &.{}, .{}));
+    try std.testing.expectError(FloError.BadRequest, stream.groupDlqDelete("events", "g", &ids, .{ .all = true }));
+    try std.testing.expectError(FloError.BadRequest, stream.groupDlqRequeue("events", "g", &ids, .{ .dry_run = true }));
+    try std.testing.expectError(FloError.BadRequest, stream.groupDlqDelete("events", "g", &.{}, .{ .all = true, .limit = 0 }));
+    try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.monotonic));
+}
+
+test "steal, dead-letter page and dead-letter answers cut anywhere, overlong or short of memory are refused and leak nothing" {
+    const a = std.testing.allocator;
+    const Run = struct {
+        fn steal(al: std.mem.Allocator, d: []const u8) !void {
+            var x = try decodeSteal(al, d);
+            x.deinit();
+        }
+        fn page(al: std.mem.Allocator, d: []const u8) !void {
+            var x = try decodeGroupDlqPage(al, d);
+            x.deinit();
+        }
+        fn dead(al: std.mem.Allocator, d: []const u8) !void {
+            var x = try decodeGroupDead(al, d);
+            x.deinit();
+        }
+    };
+    inline for (.{ .{ Run.steal, test_steal }, .{ Run.page, test_group_dlq }, .{ Run.dead, test_group_dead } }) |c| {
+        const data: []const u8 = c[1];
+        for (0..data.len) |n| try std.testing.expectError(FloError.IncompleteResponse, c[0](a, data[0..n]));
+        try std.testing.expectError(FloError.IncompleteResponse, c[0](a, c[1] ++ "\x00"));
+        try std.testing.checkAllAllocationFailures(a, c[0], .{data});
+    }
+}
+
+test "create and alter send the stream's retention as options, a create its partition count as the value; info reads them back" {
+    const test_server = @import("test_server.zig");
+    const a = std.testing.allocator;
+    const info_answer: []const u8 = &(le(@as(u64, 1)) ++ le(@as(u64, 2)) ++ le(@as(u64, 3)) ++ le(@as(u64, 4)) ++ le(@as(u64, 5)) ++ le(@as(u64, 6)) ++
+        le(@as(u32, 1)) ++ le(@as(u64, 3600)) ++ le(@as(u64, 1000)) ++ le(@as(u64, 0)));
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{ .{ .status = 0 }, .{ .status = 0 }, .{ .status = 0 }, .{ .status = 0, .body = info_answer }, .{ .status = 0, .body = info_answer[0..52] } };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(a, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    try stream.create("events", .{ .retention_age_s = 3600, .retention_count = 1000 });
+    try std.testing.expectEqual(@as(u16, 0x13D), srv.last_op);
+    try std.testing.expectEqualStrings("", srv.lastValue());
+    try std.testing.expectEqualSlices(u8, "\x2a\x08" ++ le(@as(u64, 3600)) ++ "\x29\x08" ++ le(@as(u64, 1000)), srv.lastOptions());
+
+    try stream.create("parted", .{ .partitions = 3 });
+    try std.testing.expectEqualSlices(u8, &le(@as(u32, 3)), srv.lastValue());
+    try std.testing.expectEqualStrings("", srv.lastOptions());
+
+    // An alter sends only the bounds it changes, and never a partition count.
+    try std.testing.expectError(FloError.BadRequest, stream.alter("events", .{ .partitions = 2 }));
+    try stream.alter("events", .{ .retention_count = 1000 });
+    try std.testing.expectEqual(@as(u16, 0x13F), srv.last_op);
+    try std.testing.expectEqualStrings("", srv.lastValue());
+    try std.testing.expectEqualSlices(u8, "\x29\x08" ++ le(@as(u64, 1000)), srv.lastOptions());
+
+    const info = try stream.info("events", .{});
+    try std.testing.expectEqual(@as(u64, 3600), info.retention_age_s);
+    try std.testing.expectEqual(@as(u64, 1000), info.retention_count);
+    try std.testing.expectEqual(@as(u64, 5), info.count);
+    // An answer without the retention fields is cut short.
+    try std.testing.expectError(FloError.IncompleteResponse, stream.info("events", .{}));
 }

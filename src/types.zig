@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0x17f3632347cd6dd9;
+pub const TABLE_HASH: u64 = 0xac07f1f7338c66bd;
 
 /// Why the server refused a request. Mirrors the server's list. A reason
 /// this SDK predates still decodes, as its number (`_`), with the status
@@ -322,10 +322,13 @@ pub const OpCode = enum(u16) {
     stream_group_delete = 0x15C,
     stream_group_list = 0x15D,
     stream_group_members = 0x15E,
+    stream_group_steal = 0x15F,
+    stream_group_dlq_list = 0x160,
+    stream_group_dlq_requeue = 0x161,
+    stream_group_dlq_delete = 0x162,
 
     // ── Queues (0x170 – 0x19F) ──
     queue_enqueue = 0x170,
-    queue_dlq_list = 0x176,
     queue_stats = 0x17B,
     queue_purge = 0x17F,
     queue_peek = 0x180,
@@ -333,6 +336,9 @@ pub const OpCode = enum(u16) {
     queue_complete = 0x182,
     queue_fail = 0x183,
     queue_touch = 0x184,
+    queue_dlq_list = 0x185,
+    queue_dlq_requeue = 0x186,
+    queue_dlq_delete = 0x187,
     queue_list = 0x198,
 
     // ── Time-Series (0x1A0 – 0x1BF) ──
@@ -486,6 +492,8 @@ pub const OptionTag = enum(u8) {
     partition = 0x24, // u32: Explicit partition index
     partition_key = 0x25, // string: Key for partition routing
     max_age_seconds = 0x26, // u64: Maximum age in seconds for retention
+    retention_count = 0x29, // u64: A stream's retention: the most records it keeps
+    retention_age = 0x2A, // u64: A stream's retention: its oldest record's age, in seconds
     dry_run = 0x28, // void: Flag to preview what would be deleted without deleting
     force = 0x2C, // void: Flag to delete a stream that still holds records
 
@@ -782,6 +790,11 @@ pub const QueueRefusalWhy = enum(u8) {
     released = 4,
     /// Nobody holds it.
     not_held = 5,
+    /// A dead-letter requeue or delete named it, and it isn't dead.
+    not_dead = 6,
+    /// A group steal named it, and its holder touched it within the idle
+    /// time named. Not answered for a queue; the list is shared.
+    not_idle = 7,
     _,
 };
 
@@ -980,44 +993,85 @@ pub const PurgeOptions = struct {
 /// The most dead letters one DLQ list page holds.
 pub const MAX_DLQ_PAGE: u32 = 100;
 
+/// Where a queue's dead-letter list goes on. Opaque: pass back the one a
+/// page answered.
+pub const DlqCursor = struct {
+    dead_ns: u64,
+    seq: u64,
+};
+
 /// Options for DLQ list operations
 pub const DlqListOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
     /// Dead letters per page, 1 to 100.
     limit: u32 = MAX_DLQ_PAGE,
-    /// The previous page's `last_seq`; null for the first page.
-    after: ?u64 = null,
+    /// The previous page's cursor; null for the first page.
+    after: ?DlqCursor = null,
 };
 
-/// A message moved to a queue's dead letter queue.
+/// A queue's dead letter: a message failed or expired as many times as its
+/// attempts, or failed dead.
 pub const DeadLetter = struct {
     seq: u64,
+    priority: u32,
+    /// Times it was delivered.
+    deliveries: u32,
+    /// Times it failed: failed by its consumer, or its lease ran out.
+    failures: u32,
+    enqueued_at_ms: i64,
+    /// When it died, in Unix milliseconds.
+    dead_at_ms: i64,
     /// The payload's whole length; `payload` holds at most 4 KiB of it.
     size: u32,
     payload: []const u8,
-    enqueued_at_ms: i64,
-    /// Times it was delivered.
-    deliveries: u32,
-    priority: u8,
-    /// When it was moved to the DLQ, in Unix milliseconds.
-    moved_at_ms: i64,
+    /// Its last error, at most its first 256 bytes.
+    error_message: []const u8,
 };
 
-/// One page of a queue's dead letters, oldest first. Free with `deinit`.
+/// One page of a queue's dead letters, oldest dead first. Free with
+/// `deinit`.
 pub const DlqPage = struct {
     letters: []DeadLetter,
-    /// Dead letters the queue holds in all.
-    total: u64,
-    /// More follow: ask again with `after` set to `last_seq`.
-    has_more: bool,
-    /// The seq of the page's last dead letter.
-    last_seq: u64,
+    /// Where the next page starts; null on the last page.
+    cursor: ?DlqCursor,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *DlqPage) void {
-        for (self.letters) |l| self.allocator.free(l.payload);
+        for (self.letters) |l| {
+            self.allocator.free(l.payload);
+            self.allocator.free(l.error_message);
+        }
         self.allocator.free(self.letters);
+    }
+};
+
+/// Options for a queue's dead-letter requeue or delete.
+pub const DlqOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Instead of messages named by seq: the queue's oldest dead letters, a
+    /// batch of up to `limit`. Name messages or set this, not both.
+    all: bool = false,
+    /// With `all`, the most one batch takes, 1 to 100.
+    limit: u32 = MAX_QUEUE_BATCH,
+    /// Delete only: say what it would delete, and delete nothing.
+    dry_run: bool = false,
+};
+
+/// What a dead-letter requeue or delete did. Free with `deinit`.
+pub const DlqResult = struct {
+    /// How many it applied to; with dry_run, how many it would delete.
+    applied: u32,
+    /// The rest, and why: `gone` (not in the queue) or `not_dead`.
+    refused: []QueueRefusal,
+    /// With `all`: dead letters remain past this batch.
+    more: bool,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *DlqResult) void {
+        for (self.refused) |f| self.allocator.free(f.reason);
+        self.allocator.free(self.refused);
     }
 };
 
@@ -1149,6 +1203,26 @@ pub const StreamInfo = struct {
     count: u64,
     bytes: u64,
     partition_count: u32 = 1,
+    /// Its retention: records older than this many seconds are trimmed;
+    /// 0 for none.
+    retention_age_s: u64 = 0,
+    /// Its retention: the most records it keeps; 0 for no bound.
+    retention_count: u64 = 0,
+};
+
+/// A stream's settings, for a create or an alter: its partitions (a
+/// create's alone) and its retention. 0 leaves a bound unset (a create) or
+/// as it stands (an alter).
+pub const StreamSettingsOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// A create's partition count; 0 is one. Fixed once the stream exists:
+    /// an alter naming it is `FloError.BadRequest`, sent nowhere.
+    partitions: u32 = 0,
+    /// Trim records older than this many seconds (at most 100 years).
+    retention_age_s: u64 = 0,
+    /// Keep at most this many records.
+    retention_count: u64 = 0,
 };
 
 /// A header stored with a stream record.
@@ -1325,6 +1399,11 @@ pub const GroupRefusalWhy = enum(u8) {
     released = 4,
     /// Nobody holds it.
     not_held = 5,
+    /// A dead-letter requeue or delete named it, and it isn't dead.
+    not_dead = 6,
+    /// A steal named it, and its holder touched it (its read, a steal or
+    /// any touch) within the idle time named.
+    not_idle = 7,
     _,
 };
 
@@ -1430,6 +1509,133 @@ pub const StreamGroupMembers = struct {
     }
 };
 
+/// A record a group steal names: its id and the deliveries its holder has.
+pub const LeasedRecord = struct {
+    id: StreamID,
+    deliveries: u32,
+};
+
+/// Options for a group steal.
+pub const StreamGroupStealOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// The lease the records are taken for, 5 s to 12 h; the group's when
+    /// null.
+    lease_ms: ?u64 = null,
+};
+
+/// A record a steal or a dead-letter command left as it was: why, and the
+/// same said for a person.
+pub const GroupCommandRefusal = struct {
+    id: StreamID,
+    why: GroupRefusalWhy,
+    reason: []const u8,
+};
+
+fn freeCommandRefusals(allocator: std.mem.Allocator, refused: []GroupCommandRefusal) void {
+    for (refused) |f| allocator.free(f.reason);
+    allocator.free(refused);
+}
+
+/// What a group steal took, under one new lease, and what it left. Ack,
+/// nack or touch `stolen` naming `lease`, as for a group read: each record
+/// carries its id and new deliveries, but no payload or headers (read the
+/// stream for those). Free with `deinit`.
+pub const GroupStealResult = struct {
+    lease: GroupLease,
+    /// When the new lease runs out without a touch, in Unix milliseconds;
+    /// 0 when it took nothing.
+    expires_at_ms: i64,
+    stolen: []StreamRecord,
+    refused: []GroupCommandRefusal,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *GroupStealResult) void {
+        for (self.stolen) |*r| r.deinit(self.allocator);
+        self.allocator.free(self.stolen);
+        freeCommandRefusals(self.allocator, self.refused);
+    }
+};
+
+/// The most of a dead letter's last error a list shows, of a group or a
+/// queue.
+pub const MAX_DLQ_ERROR: usize = 256;
+
+/// Where a group's dead-letter list goes on. Opaque: pass back the one a
+/// page answered.
+pub const GroupDlqCursor = struct {
+    dead_ns: u64,
+    ms: u64,
+    seq: u64,
+};
+
+/// Options for a group's dead-letter list.
+pub const GroupDlqListOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Dead letters per page, 1 to 100.
+    limit: u32 = MAX_DLQ_PAGE,
+    /// The previous page's cursor; null for the first page.
+    after: ?GroupDlqCursor = null,
+};
+
+/// A group's dead letter: a record nacked or expired as many times as the
+/// group's attempts, or nacked dead.
+pub const GroupDeadLetter = struct {
+    id: StreamID,
+    /// Times it was delivered.
+    deliveries: u32,
+    /// Times it failed: nacked, or its lease ran out.
+    failures: u32,
+    /// When it died, in Unix milliseconds.
+    dead_at_ms: i64,
+    /// Its last error, at most its first 256 bytes.
+    error_message: []const u8,
+};
+
+/// One page of a group's dead letters, oldest dead first. Free with
+/// `deinit`.
+pub const GroupDlqPage = struct {
+    letters: []GroupDeadLetter,
+    /// Where the next page starts; null on the last page.
+    cursor: ?GroupDlqCursor,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *GroupDlqPage) void {
+        for (self.letters) |l| self.allocator.free(l.error_message);
+        self.allocator.free(self.letters);
+    }
+};
+
+/// Options for a group's dead-letter requeue or delete.
+pub const GroupDlqOptions = struct {
+    /// Override client's default namespace
+    namespace: ?[]const u8 = null,
+    /// Instead of records named by id: the group's oldest dead letters, a
+    /// batch of up to `limit`. Name records or set this, not both.
+    all: bool = false,
+    /// With `all`, the most one batch takes, 1 to 100.
+    limit: u32 = MAX_GROUP_BATCH,
+    /// Delete only: say what it would delete, and delete nothing.
+    dry_run: bool = false,
+};
+
+/// What a dead-letter requeue or delete did. Free with `deinit`.
+pub const GroupDlqResult = struct {
+    /// How many it applied to; with dry_run, how many it would delete.
+    applied: u32,
+    /// The rest, and why: `gone` (not in the group, or a requeue of one a
+    /// trim cut) or `not_dead`.
+    refused: []GroupCommandRefusal,
+    /// With `all`: dead letters remain past this batch.
+    more: bool,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *GroupDlqResult) void {
+        freeCommandRefusals(self.allocator, self.refused);
+    }
+};
+
 // =============================================================================
 // Action/Worker Types
 // =============================================================================
@@ -1503,7 +1709,10 @@ pub const TaskAssignment = struct {
 /// the worker holding the run, or last holding it; null until one takes it.
 /// Only the leader knows a take at once: another node may answer null, or
 /// an earlier worker, until the run's next update reaches it. `outcome` is
-/// the outcome a completed run's worker named; null for success.
+/// the outcome a completed run's worker named; null for success. `held`
+/// says why a lease past due isn't ended yet: the run's end waits for room
+/// on the shard of the workflow that called it, and the run isn't handed to
+/// another worker meanwhile.
 pub const ActionRunStatus = struct {
     run_id: []const u8,
     status: RunStatus,
@@ -1515,6 +1724,7 @@ pub const ActionRunStatus = struct {
     error_message: ?[]const u8,
     worker_id: ?[]const u8,
     outcome: ?[]const u8,
+    held: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ActionRunStatus) void {
@@ -1523,6 +1733,7 @@ pub const ActionRunStatus = struct {
         if (self.error_message) |e| self.allocator.free(e);
         if (self.worker_id) |w| self.allocator.free(w);
         if (self.outcome) |o| self.allocator.free(o);
+        if (self.held) |h| self.allocator.free(h);
     }
 };
 
@@ -1794,6 +2005,8 @@ pub const WorkerDrainOptions = struct {
 pub const MAX_AWAIT_ACTIONS: usize = 64;
 /// The longest action name a task or report carries.
 pub const MAX_ACTION_NAME: usize = 256;
+/// The longest note `ActionRunStatus.held` carries.
+pub const MAX_HELD_NOTE: usize = 128;
 /// The longest await request key.
 pub const MAX_REQUEST_KEY: usize = 64;
 /// The longest result a complete carries, and error a fail carries.

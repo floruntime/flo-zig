@@ -829,7 +829,8 @@ fn decodeWorkerInfoAnswer(allocator: std.mem.Allocator, data: []const u8) FloErr
 /// action.status's answer: [status:u8][created_at:i64][started_at:?i64]
 /// [completed_at:?i64][attempt:u32][output:?(u16 len, bytes)]
 /// [error_message:?(u16 len, bytes)][worker_id:?(u16 len, bytes)]
-/// [outcome:?(u16 len, bytes)], each optional behind a presence byte.
+/// [outcome:?(u16 len, bytes)][held:?(u8 len, bytes)], each optional behind
+/// a presence byte.
 fn parseActionRunStatus(allocator: std.mem.Allocator, run_id: []const u8, data: []const u8) FloError!types.ActionRunStatus {
     var r: Reader = .{ .data = data };
     const status = std.meta.intToEnum(types.RunStatus, try r.int(u8)) catch return FloError.IncompleteResponse;
@@ -843,6 +844,8 @@ fn parseActionRunStatus(allocator: std.mem.Allocator, run_id: []const u8, data: 
     if (worker_id) |w| if (w.len > max_worker_id) return FloError.IncompleteResponse;
     const outcome = if (try r.boolean()) try r.lenBytes(u16) else null;
     if (outcome) |o| if (o.len > types.MAX_ACTION_NAME) return FloError.IncompleteResponse;
+    const held = if (try r.boolean()) try r.lenBytes(u8) else null;
+    if (held) |h| if (h.len > types.MAX_HELD_NOTE) return FloError.IncompleteResponse;
     try r.end();
 
     const run_id_copy = allocator.dupe(u8, run_id) catch return FloError.OutOfMemory;
@@ -854,6 +857,8 @@ fn parseActionRunStatus(allocator: std.mem.Allocator, run_id: []const u8, data: 
     const worker_copy = if (worker_id) |w| allocator.dupe(u8, w) catch return FloError.OutOfMemory else null;
     errdefer if (worker_copy) |w| allocator.free(w);
     const outcome_copy = if (outcome) |o| try allocator.dupe(u8, o) else null;
+    errdefer if (outcome_copy) |o| allocator.free(o);
+    const held_copy = if (held) |h| try allocator.dupe(u8, h) else null;
     return .{
         .run_id = run_id_copy,
         .status = status,
@@ -865,6 +870,7 @@ fn parseActionRunStatus(allocator: std.mem.Allocator, run_id: []const u8, data: 
         .error_message = error_copy,
         .worker_id = worker_copy,
         .outcome = outcome_copy,
+        .held = held_copy,
         .allocator = allocator,
     };
 }
@@ -1128,7 +1134,8 @@ const completed_status_answer = "\x02" ++ // completed
     "\x01\x02\x00ok" ++ // output "ok"
     "\x00" ++ // no error
     "\x01\x02\x00w1" ++ // worker "w1"
-    "\x01\x08\x00approved"; // outcome "approved"
+    "\x01\x08\x00approved" ++ // outcome "approved"
+    "\x00"; // not held
 
 test "a completed run's status carries its times, attempt and output" {
     var st = try parseActionRunStatus(std.testing.allocator, "run-1", completed_status_answer);
@@ -1143,6 +1150,7 @@ test "a completed run's status carries its times, attempt and output" {
     try std.testing.expectEqual(@as(?[]const u8, null), st.error_message);
     try std.testing.expectEqualStrings("w1", st.worker_id.?);
     try std.testing.expectEqualStrings("approved", st.outcome.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), st.held);
 }
 
 test "a pending run's status names no worker" {
@@ -1152,7 +1160,8 @@ test "a pending run's status names no worker" {
         "\x00\x00\x00\x00" ++ // attempt 0
         "\x00\x00" ++ // no output, no error
         "\x00" ++ // no worker
-        "\x00"; // no outcome
+        "\x00" ++ // no outcome
+        "\x00"; // not held
     var st = try parseActionRunStatus(std.testing.allocator, "run-1", answer);
     defer st.deinit();
     try std.testing.expectEqual(types.RunStatus.pending, st.status);
@@ -1160,9 +1169,30 @@ test "a pending run's status names no worker" {
     try std.testing.expectEqual(@as(?[]const u8, null), st.outcome);
 }
 
+test "a run whose past-due lease waits to end says why it's held" {
+    const answer = "\x01" ++ // running
+        "\x64\x00\x00\x00\x00\x00\x00\x00" ++ // created_at 100
+        "\x01\x6e\x00\x00\x00\x00\x00\x00\x00" ++ // started_at 110
+        "\x00" ++ // not completed
+        "\x01\x00\x00\x00" ++ // attempt 1
+        "\x00\x00" ++ // no output, no error
+        "\x01\x02\x00w1" ++ // held by "w1"
+        "\x00" ++ // no outcome
+        "\x01\x04wait"; // held: "wait"
+    var st = try parseActionRunStatus(std.testing.allocator, "run-1", answer);
+    defer st.deinit();
+    try std.testing.expectEqual(types.RunStatus.running, st.status);
+    try std.testing.expectEqualStrings("wait", st.held.?);
+    for (0..answer.len) |n| try std.testing.expectError(FloError.IncompleteResponse, parseStatusAndFree(std.testing.allocator, answer[0..n]));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseStatusAndFree, .{@as([]const u8, answer)});
+    // A note past the server's bound.
+    const long = answer[0 .. answer.len - 6] ++ "\x01\x81" ++ "x" ** 129;
+    try std.testing.expectError(FloError.IncompleteResponse, parseActionRunStatus(std.testing.allocator, "run-1", long));
+}
+
 test "a status answer with a worker id over the server's bound is refused" {
     const answer = "\x00" ++ "\x64\x00\x00\x00\x00\x00\x00\x00" ++ "\x00\x00" ++ "\x00\x00\x00\x00" ++ "\x00\x00" ++
-        "\x01\x01\x10" ++ "w" ** 4097 ++ "\x00";
+        "\x01\x01\x10" ++ "w" ** 4097 ++ "\x00\x00";
     try std.testing.expectError(FloError.IncompleteResponse, parseActionRunStatus(std.testing.allocator, "run-1", answer));
 }
 
@@ -1174,7 +1204,8 @@ test "a failed run's status carries its error and no output" {
         "\x00" ++ // no output
         "\x01\x04\x00boom" ++ // error "boom"
         "\x01\x02\x00w1" ++ // last held by "w1"
-        "\x00"; // no outcome
+        "\x00" ++ // no outcome
+        "\x00"; // not held
     var st = try parseActionRunStatus(std.testing.allocator, "run-1", answer);
     defer st.deinit();
     try std.testing.expectEqual(types.RunStatus.failed, st.status);

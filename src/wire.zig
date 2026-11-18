@@ -234,7 +234,7 @@ pub fn isTableOp(op: OpCode) bool {
     return switch (op) {
         .namespace_create, .namespace_delete, .namespace_list, .namespace_info => true,
         .kv_put, .kv_get, .kv_mget, .kv_delete, .kv_scan, .kv_history, .kv_incr, .kv_json_get, .kv_json_set, .kv_json_del, .kv_txn_begin, .kv_txn_commit, .kv_txn_rollback, .kv_expire, .kv_exists => true,
-        .stream_group_list, .stream_group_members, .queue_peek, .queue_dequeue, .queue_complete, .queue_fail, .queue_touch => true,
+        .stream_group_list, .stream_group_members, .stream_group_steal, .stream_group_dlq_list, .stream_group_dlq_requeue, .stream_group_dlq_delete, .queue_peek, .queue_dequeue, .queue_complete, .queue_fail, .queue_touch, .queue_dlq_list, .queue_dlq_requeue, .queue_dlq_delete => true,
         .action_status, .action_await, .action_complete, .action_fail, .action_touch, .action_info => true,
         .worker_list, .worker_info, .processing_remove => true,
         .ts_read, .ts_info => true,
@@ -463,7 +463,7 @@ test "serializeRequest basic" {
     const header = @as(*align(1) const RequestHeader, @ptrCast(serialized.ptr)).*;
     try std.testing.expectEqual(types.MAGIC, header.magic);
     try std.testing.expectEqual(types.VERSION, header.version);
-    try std.testing.expectEqual(@as(u64, 0x17f3632347cd6dd9), header.table_hash);
+    try std.testing.expectEqual(@as(u64, 0xac07f1f7338c66bd), header.table_hash);
     try std.testing.expectEqual(@as(u64, 42), header.request_id);
 }
 

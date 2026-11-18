@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased
+
+- **Breaking:** pinned to the table hash of flo `1fd555dc` (`0xac07f1f7338c66bd`);
+  this SDK and older servers refuse each other.
+- `ActionRunStatus` gains `held`: why a run's lease, past due, isn't ended
+  yet. The end of a run a workflow step called waits for room on the
+  calling workflow's shard, and meanwhile the run isn't handed to another
+  worker. Null otherwise.
+- The action worker sends a complete or fail refused overloaded, without
+  running, again, unchanged, with a backoff capped at 5 s, until the server
+  takes it or answers otherwise, logging each wait; these resends don't
+  count toward the three sends a lost result gets. A stopping worker gives
+  up after 10 s. With concurrency 1, where the task runs on the poll
+  thread, it heartbeats between tries, so a long wait doesn't get it marked
+  unhealthy. Only a report that would end a run a workflow step called,
+  refused while the calling workflow's shard has no room for the end, has
+  the run's lease held meanwhile; for any other the lease keeps running and
+  the run may be handed out again once it ends, so the result is
+  at-least-once.
+- `QueueRefusalWhy` and `GroupRefusalWhy` name `not_dead` (6): a dead-letter
+  requeue or delete named something that isn't dead; and `not_idle` (7): a
+  group steal named a record its holder touched within the idle time named.
+- New `Stream.groupSteal`: take records another consumer holds and has
+  left idle for at least `min_idle_ms`, each named with the deliveries its
+  holder has. Idle is the time since the holder's read, a steal or any
+  touch. What it takes is leased to the new consumer under one new lease
+  (`GroupStealResult.lease`, `stolen` with the new deliveries), to ack, nack
+  or touch as after a read; the rest are refused `not_idle`,
+  `delivered_again`, `gone`, ... with a reason.
+- New `Stream.groupDlqList`, `groupDlqRequeue` and `groupDlqDelete`: page a
+  group's dead letters (deliveries, failures, when it died, its last error)
+  by an opaque cursor, make them ready again with their failures reset, or
+  delete them (`dry_run` says what it would). Requeue and delete take
+  records by id, or `.all = true` for the oldest up to `limit`, answering
+  applied, refused (`not_dead`, `gone`) and `more`.
+- **Breaking:** queue dead letters moved to the server's op table
+  (`queue.dlq_list`, 0x185). `dlqList` keeps its name: a page holds up to
+  100, oldest dead first, and goes on by an opaque `DlqCursor` (`page.cursor`
+  as the next `after`, until null); `total`, `has_more` and `last_seq` are
+  gone. `DeadLetter` gains `failures`, `dead_at_ms` (was `moved_at_ms`) and
+  `error_message` (its first 256 bytes); `priority` is a `u32`. A queue that
+  doesn't exist is `error.NotFound`.
+- New `Queue.dlqRequeue` and `dlqDelete`: make dead letters ready again with
+  their failures reset, or delete them (`dry_run` says what it would). Each
+  takes seqs, or `.all = true` for the oldest up to `limit`, answering
+  applied, refused (`not_dead`, `gone`) and `more`.
+- New `Stream.create` and `Stream.alter`, taking `StreamSettingsOptions`
+  (`partitions`, a create's alone, and `retention_age_s`,
+  `retention_count`); `StreamInfo` gains the retention. An alter naming
+  `partitions` is `error.BadRequest`, sent nowhere. An alter
+  works on a stream an append made (the server used to answer not found).
+  Creating a stream again with the settings it has succeeds; with others,
+  including after an alter changed them, it is `error.Conflict` ("the stream
+  exists with other settings"). A create whose name's 64-bit hash another
+  stream's name has is `error.Conflict` too. `info` now requires the
+  server's whole answer, retention included.
+
 ## 0.1.0-dev.5 - 2026-11-16
 
 - A non-blocking `stream.read` of a stream that isn't there, and a `ts.read`
