@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-dev.6 - 2026-11-18
+
+Works with flo v0.1.0-dev.19.
 
 - **Breaking:** pinned to the table hash of flo `1fd555dc` (`0xac07f1f7338c66bd`);
   this SDK and older servers refuse each other.
