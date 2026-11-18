@@ -8,13 +8,17 @@
   yet. The end of a run a workflow step called waits for room on the
   calling workflow's shard, and meanwhile the run isn't handed to another
   worker. Null otherwise.
-- A worker's complete or fail that would end a run a workflow step called
-  can be refused overloaded, without running, while the calling workflow's
-  shard has no room for the end. The action worker now sends the same
-  report again, with a backoff capped at 5 s, until the server takes it or
-  answers otherwise, logging each wait; these resends don't count toward
-  the three sends a lost result gets. A stopping worker gives up after
-  10 s.
+- The action worker sends a complete or fail refused overloaded, without
+  running, again, unchanged, with a backoff capped at 5 s, until the server
+  takes it or answers otherwise, logging each wait; these resends don't
+  count toward the three sends a lost result gets. A stopping worker gives
+  up after 10 s. With concurrency 1, where the task runs on the poll
+  thread, it heartbeats between tries, so a long wait doesn't get it marked
+  unhealthy. Only a report that would end a run a workflow step called,
+  refused while the calling workflow's shard has no room for the end, has
+  the run's lease held meanwhile; for any other the lease keeps running and
+  the run may be handed out again once it ends, so the result is
+  at-least-once.
 - `QueueRefusalWhy` and `GroupRefusalWhy` name `not_dead` (6): a dead-letter
   requeue or delete named something that isn't dead; and `not_idle` (7): a
   group steal named a record its holder touched within the idle time named.

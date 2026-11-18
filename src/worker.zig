@@ -919,11 +919,16 @@ pub const ActionWorker = struct {
     /// max_result_sends in all; a resend of one that already applied
     /// answers ok. A refusal is not sent again: the server answered, and a
     /// stale report means the run has moved on. The exception is overloaded
-    /// without running: a report that would end a run a workflow step
-    /// called waits for room on the caller's shard, and the run's lease
-    /// doesn't expire meanwhile, so it is sent again, with a capped backoff,
-    /// until the server takes it or answers otherwise; a stopping worker
-    /// gives up after stopping_overloaded_ms.
+    /// without running: that is sent again, with a capped backoff, until
+    /// the server takes it or answers otherwise; a stopping worker gives up
+    /// after stopping_overloaded_ms. Only a report that would end a run a
+    /// workflow step called, refused while the caller's shard has no room
+    /// for the end, has the run's lease held meanwhile. For any other the
+    /// lease keeps running, and once it ends the run may be handed out
+    /// again, so the result is at-least-once. On the poll connection (a task
+    /// run inline, with concurrency 1) the worker heartbeats between tries:
+    /// nothing else on that thread does while it waits, and a worker silent
+    /// for the server's heartbeat timeout is marked unhealthy.
     /// Returns whether the server accepted it; otherwise the drop is logged
     /// and the task is left to its lease, so it may run again.
     fn report(self: *Self, conn: *Client, register: bool, task: *const TaskAssignment, rep: Report) bool {
@@ -958,6 +963,9 @@ pub const ActionWorker = struct {
                 }
                 const ms = backoff.next(conn.prng.random());
                 std.log.warn("[flo-worker] {s} for run {s} refused overloaded, not run: {s}; resending in {d}ms", .{ kind, task.run_id, conn.lastError().?.message, ms });
+                // `register` means `conn` is the poll connection, which the
+                // heartbeat uses; a slot's thread leaves it to the poll loop.
+                if (register) self.maybeHeartbeat();
                 std.Thread.sleep(ms * std.time.ns_per_ms);
                 continue;
             }
@@ -2186,6 +2194,27 @@ test "ActionWorker resends a complete refused overloaded more than three times; 
     const task: TaskAssignment = .{ .run_id = "t1", .namespace = "default", .deliveries = 1, .term = 1, .index = 7, .action = "job", .created_at = 0, .attempt = 1, .lease_ms = 300, .payload = "", .allocator = std.testing.allocator };
     try std.testing.expect(w.report(&w.client, true, &task, .{ .complete = .{ .data = "done" } }));
     try std.testing.expectEqual(@as(u32, 5), srv.countOf(.action_complete));
+}
+
+test "ActionWorker heartbeats between resends of a report refused overloaded on its poll connection, and not on a slot's" {
+    for ([_]bool{ true, false }) |register| {
+        var srv = try ScriptServer.listen();
+        srv.rules = &.{
+            .{ .op = .action_complete, .nth = 0, .action = .{ .reply = outbox_full } },
+            .{ .op = .action_complete, .nth = 1, .action = .{ .reply = outbox_full } },
+        };
+        try srv.start();
+        defer srv.deinit();
+
+        // Interval 0: every wait is past due for a heartbeat.
+        var w = try ActionWorker.init(std.testing.allocator, .{ .endpoint = srv.endpoint, .block_ms = 100, .heartbeat_interval_ms = 0, .retry = .{ .max_attempts = 1 } });
+        defer w.deinit();
+        w.running = true;
+        const task: TaskAssignment = .{ .run_id = "t1", .namespace = "default", .deliveries = 1, .term = 1, .index = 7, .action = "job", .created_at = 0, .attempt = 1, .lease_ms = 300, .payload = "", .allocator = std.testing.allocator };
+        try std.testing.expect(w.report(&w.client, register, &task, .{ .complete = .{ .data = "done" } }));
+        try std.testing.expectEqual(@as(u32, 3), srv.countOf(.action_complete));
+        try std.testing.expectEqual(@as(u32, if (register) 2 else 0), srv.countOf(.worker_heartbeat));
+    }
 }
 
 test "ActionWorker never resends a complete or fail a halted shard refused" {
