@@ -1210,11 +1210,15 @@ pub const StreamInfo = struct {
     retention_count: u64 = 0,
 };
 
-/// A stream's settings, for a create or an alter: its retention. 0 leaves
-/// a bound unset (a create) or as it stands (an alter).
+/// A stream's settings, for a create or an alter: its partitions (a
+/// create's alone) and its retention. 0 leaves a bound unset (a create) or
+/// as it stands (an alter).
 pub const StreamSettingsOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
+    /// A create's partition count; 0 is one. Fixed once the stream exists:
+    /// an alter naming it is `FloError.BadRequest`, sent nowhere.
+    partitions: u32 = 0,
     /// Trim records older than this many seconds (at most 100 years).
     retention_age_s: u64 = 0,
     /// Keep at most this many records.

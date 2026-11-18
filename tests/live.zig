@@ -1880,4 +1880,13 @@ test "live: an alter on a stream an append made works, and info shows it; a crea
     try testing.expectEqual(@as(u64, 10), (try stream.info("appended-too", .{})).retention_count);
 
     try testing.expectError(flo.FloError.NotFound, stream.alter("never-made", .{ .retention_count = 1 }));
+
+    // A stream of three partitions: info shows them, the same create again
+    // succeeds, and one naming fewer is refused.
+    try stream.create("parted", .{ .partitions = 3, .retention_count = 100 });
+    try testing.expectEqual(@as(u32, 3), (try stream.info("parted", .{})).partition_count);
+    try stream.create("parted", .{ .partitions = 3, .retention_count = 100 });
+    try testing.expectError(flo.FloError.Conflict, stream.create("parted", .{ .retention_count = 100 }));
+    try testing.expectError(flo.FloError.BadRequest, stream.alter("parted", .{ .partitions = 4 }));
+    try testing.expectEqual(@as(u32, 3), (try stream.info("parted", .{})).partition_count);
 }

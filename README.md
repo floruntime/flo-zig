@@ -365,19 +365,21 @@ _ = trimmed.removed;
 try stream.delete("events", .{ .force = true });
 ```
 
-An append makes its stream if there is none, with no retention. `create`
-makes one with its retention (`retention_age_s`, `retention_count`), and
-`alter` changes it on any stream, one an append made included: each bound
+An append makes its stream if there is none, with one partition and no
+retention. `create` makes one with its partitions (`partitions`, fixed once
+it exists; 0 is one) and retention (`retention_age_s`, `retention_count`),
+and `alter` changes the retention on any stream, one an append made
+included (an alter naming `partitions` is `error.BadRequest`): each bound
 set replaces the stream's, one left 0 stays. Creating a stream again with
 the settings it has succeeds, as a retry does; with others it is
 `error.Conflict` ("the stream exists with other settings"). So once a stream
 has been altered, a create must name its settings as they are now. A create
 of a stream an append made and nothing altered gives it the settings named.
 A name whose 64-bit hash another stream's name in the namespace has is
-`error.Conflict` too: choose another name. `info` shows the retention.
+`error.Conflict` too: choose another name. `info` shows both.
 
 ```zig
-try stream.create("audit", .{ .retention_age_s = 7 * 24 * 3600 });
+try stream.create("audit", .{ .partitions = 4, .retention_age_s = 7 * 24 * 3600 });
 try stream.alter("events", .{ .retention_count = 1_000_000 });
 const settings = try stream.info("events", .{});
 std.debug.print("keeps {d} records\n", .{settings.retention_count});

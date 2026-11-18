@@ -225,11 +225,17 @@ pub const Stream = struct {
     }
 
     fn settings(self: *Stream, op: types.OpCode, stream_name: []const u8, options: types.StreamSettingsOptions) FloError!void {
+        // The server's alter reads no partition count; sent, it would be
+        // dropped without a word.
+        if (op == .stream_alter and options.partitions > 0) return FloError.BadRequest;
         var opts_buf: [20]u8 = undefined;
         var builder = wire.OptionsBuilder.init(&opts_buf);
         if (options.retention_age_s > 0) try builder.addU64(.retention_age, options.retention_age_s);
         if (options.retention_count > 0) try builder.addU64(.retention_count, options.retention_count);
-        var response = try self.client.sendRequest(op, self.client.getNamespace(options.namespace), stream_name, "", builder.getOptions());
+        // A create's value is its partition count, a u32; none is one.
+        const partitions = std.mem.toBytes(std.mem.nativeToLittle(u32, options.partitions));
+        const value: []const u8 = if (options.partitions > 0) &partitions else "";
+        var response = try self.client.sendRequest(op, self.client.getNamespace(options.namespace), stream_name, value, builder.getOptions());
         defer response.deinit();
         if (response.status != .ok) return response.status.toError();
     }
@@ -1781,13 +1787,13 @@ test "steal, dead-letter page and dead-letter answers cut anywhere, overlong or 
     }
 }
 
-test "create and alter send the stream's retention as options; info reads it back" {
+test "create and alter send the stream's retention as options, a create its partition count as the value; info reads them back" {
     const test_server = @import("test_server.zig");
     const a = std.testing.allocator;
     const info_answer: []const u8 = &(le(@as(u64, 1)) ++ le(@as(u64, 2)) ++ le(@as(u64, 3)) ++ le(@as(u64, 4)) ++ le(@as(u64, 5)) ++ le(@as(u64, 6)) ++
         le(@as(u32, 1)) ++ le(@as(u64, 3600)) ++ le(@as(u64, 1000)) ++ le(@as(u64, 0)));
     var srv = try test_server.OkServer.listen();
-    srv.replies = &.{ .{ .status = 0 }, .{ .status = 0 }, .{ .status = 0, .body = info_answer }, .{ .status = 0, .body = info_answer[0..52] } };
+    srv.replies = &.{ .{ .status = 0 }, .{ .status = 0 }, .{ .status = 0 }, .{ .status = 0, .body = info_answer }, .{ .status = 0, .body = info_answer[0..52] } };
     try srv.start();
     defer srv.deinit();
     var client = Client.init(a, srv.endpoint, .{});
@@ -1800,9 +1806,15 @@ test "create and alter send the stream's retention as options; info reads it bac
     try std.testing.expectEqualStrings("", srv.lastValue());
     try std.testing.expectEqualSlices(u8, "\x2a\x08" ++ le(@as(u64, 3600)) ++ "\x29\x08" ++ le(@as(u64, 1000)), srv.lastOptions());
 
-    // An alter sends only the bounds it changes.
+    try stream.create("parted", .{ .partitions = 3 });
+    try std.testing.expectEqualSlices(u8, &le(@as(u32, 3)), srv.lastValue());
+    try std.testing.expectEqualStrings("", srv.lastOptions());
+
+    // An alter sends only the bounds it changes, and never a partition count.
+    try std.testing.expectError(FloError.BadRequest, stream.alter("events", .{ .partitions = 2 }));
     try stream.alter("events", .{ .retention_count = 1000 });
     try std.testing.expectEqual(@as(u16, 0x13F), srv.last_op);
+    try std.testing.expectEqualStrings("", srv.lastValue());
     try std.testing.expectEqualSlices(u8, "\x29\x08" ++ le(@as(u64, 1000)), srv.lastOptions());
 
     const info = try stream.info("events", .{});
