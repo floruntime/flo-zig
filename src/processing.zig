@@ -51,6 +51,8 @@ pub const Processing = struct {
 
     /// Submit a processing job from a YAML definition.
     /// Returns the server-assigned job ID (caller owns the slice).
+    /// The server refuses a definition whose `name` is over 4096 bytes
+    /// (`FloError.BadRequest`).
     pub fn submit(
         self: *Self,
         allocator: Allocator,

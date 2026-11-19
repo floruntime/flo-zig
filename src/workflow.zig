@@ -156,7 +156,9 @@ pub const Workflow = struct {
     // Core Operations
     // =========================================================================
 
-    /// Create (or replace) a workflow from a YAML definition.
+    /// Create (or replace) a workflow from a YAML definition. The server
+    /// refuses a definition whose `version` is over 256 bytes
+    /// (`FloError.BadRequest`).
     pub fn create(
         self: *Self,
         name: []const u8,

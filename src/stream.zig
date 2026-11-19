@@ -217,8 +217,9 @@ pub const Stream = struct {
     }
 
     /// Change a stream's retention: each bound set (not 0) replaces the
-    /// stream's; one left 0 stays as it stands. Works on a stream an append
-    /// made as well as one a create did. A stream that doesn't exist is
+    /// stream's; one left 0 stays as it stands; `clear_retention_age` and
+    /// `clear_retention_count` drop one. Works on a stream an append made as
+    /// well as one a create did. A stream that doesn't exist is
     /// `FloError.NotFound`.
     pub fn alter(self: *Stream, stream_name: []const u8, options: types.StreamSettingsOptions) FloError!void {
         return self.settings(.stream_alter, stream_name, options);
@@ -228,10 +229,15 @@ pub const Stream = struct {
         // The server's alter reads no partition count; sent, it would be
         // dropped without a word.
         if (op == .stream_alter and options.partitions > 0) return FloError.BadRequest;
-        var opts_buf: [20]u8 = undefined;
+        // The server refuses an alter that sets and clears the same bound.
+        if (options.clear_retention_age and options.retention_age_s > 0) return FloError.BadRequest;
+        if (options.clear_retention_count and options.retention_count > 0) return FloError.BadRequest;
+        var opts_buf: [24]u8 = undefined;
         var builder = wire.OptionsBuilder.init(&opts_buf);
         if (options.retention_age_s > 0) try builder.addU64(.retention_age, options.retention_age_s);
         if (options.retention_count > 0) try builder.addU64(.retention_count, options.retention_count);
+        if (options.clear_retention_age) try builder.addFlag(.retention_age_clear);
+        if (options.clear_retention_count) try builder.addFlag(.retention_count_clear);
         // A create's value is its partition count, a u32; none is one.
         const partitions = std.mem.toBytes(std.mem.nativeToLittle(u32, options.partitions));
         const value: []const u8 = if (options.partitions > 0) &partitions else "";
@@ -581,7 +587,8 @@ pub const Stream = struct {
     /// often than `min_idle_ms` is never stolen from: refused `not_idle`.
     /// Name each record with the deliveries its holder has; one delivered
     /// since is refused `delivered_again`. An operator's command: a group
-    /// read takes expired records by itself.
+    /// read takes expired records by itself. Naming no records is answered
+    /// at once: nothing stolen, and a lease of zeros.
     /// **Caller owns the returned `GroupStealResult` and must call `result.deinit()`.**
     pub fn groupSteal(
         self: *Stream,
@@ -1581,6 +1588,24 @@ test "a group read at its held cap is GroupHeldFull, sent once and not retried" 
     try std.testing.expect(!client.refusedUnrun(FloError.Overloaded));
 }
 
+test "a refusal for a request a repair skipped decodes its reason by name" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    // conflict, reason skipped_by_repair (38), ran no.
+    srv.replies = &.{.{ .status = @intFromEnum(types.StatusCode.conflict), .body = "\x26\x00\x00conflict: a repair at entry 9 skipped message seq 4" }};
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    try std.testing.expectError(FloError.Conflict, stream.append("events", "x", .{}));
+    const last = client.lastError().?;
+    try std.testing.expectEqual(types.Reason.skipped_by_repair, last.reason);
+    try std.testing.expectEqual(types.Ran.no, last.ran);
+}
+
 test "a group report's not_dead and not_idle decode by name, and a why this SDK predates as its number" {
     const data = le(@as(u32, 0)) ++ le(@as(u32, 3)) ++ le(@as(u64, 1)) ++ le(@as(u64, 1)) ++ "\x06" ++
         le(@as(u64, 1)) ++ le(@as(u64, 2)) ++ "\x07" ++ le(@as(u64, 1)) ++ le(@as(u64, 3)) ++ "\x2a";
@@ -1823,4 +1848,33 @@ test "create and alter send the stream's retention as options, a create its part
     try std.testing.expectEqual(@as(u64, 5), info.count);
     // An answer without the retention fields is cut short.
     try std.testing.expectError(FloError.IncompleteResponse, stream.info("events", .{}));
+}
+
+test "an alter's clears are void options; setting and clearing one bound is refused unsent" {
+    const test_server = @import("test_server.zig");
+    var srv = try test_server.OkServer.listen();
+    srv.replies = &.{ .{ .status = 0 }, .{ .status = 0 }, .{ .status = 0 } };
+    try srv.start();
+    defer srv.deinit();
+    var client = Client.init(std.testing.allocator, srv.endpoint, .{});
+    defer client.deinit();
+    try client.connect();
+    var stream = Stream.init(&client);
+
+    try stream.alter("events", .{ .clear_retention_age = true, .clear_retention_count = true });
+    try std.testing.expectEqual(@as(u16, 0x13F), srv.last_op);
+    try std.testing.expectEqualSlices(u8, "\x2d\x00\x2e\x00", srv.lastOptions());
+
+    // A clear goes with a set of the other bound.
+    try stream.alter("events", .{ .retention_age_s = 60, .clear_retention_count = true });
+    try std.testing.expectEqualSlices(u8, "\x2a\x08" ++ le(@as(u64, 60)) ++ "\x2e\x00", srv.lastOptions());
+
+    try std.testing.expectError(FloError.BadRequest, stream.alter("events", .{ .retention_age_s = 60, .clear_retention_age = true }));
+    try std.testing.expectError(FloError.BadRequest, stream.alter("events", .{ .retention_count = 5, .clear_retention_count = true }));
+    try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.acquire));
+
+    // A create sends a clear as given: the server refuses it.
+    try stream.create("events", .{ .clear_retention_age = true });
+    try std.testing.expectEqual(@as(u16, 0x13D), srv.last_op);
+    try std.testing.expectEqualSlices(u8, "\x2d\x00", srv.lastOptions());
 }

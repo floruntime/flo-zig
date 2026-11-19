@@ -3,6 +3,22 @@
 ## Unreleased
 
 - The server's op table hash is now `0xc65b793b2a6d82be`, the hash of flo `cff5d066`; this SDK and older servers refuse each other. Run ids may now be up to 42 bytes (`{prefix}{bits}-{shard}-{term}`); treat them as opaque.
+- `StreamSettingsOptions` gains `clear_retention_age` and
+  `clear_retention_count`: an alter drops that bound. Leaving a bound 0
+  still leaves it as it stands. An alter that sets and clears the same bound
+  is `BadRequest`, sent nowhere. The server refuses a create that sends a
+  clear, and a `retention_count` of the u64 max ("retention bound too
+  large").
+- `Reason` names `skipped_by_repair` (38): a repair skipped the log entry or
+  channel message that carried the request, so it never runs, on any node.
+- A stream deleted and made again under the same name, while the server
+  still holds the deleted one's mark, continues its ids past the old
+  stream's rather than starting over. The mark goes once its records are
+  removed and no group counts it.
+- A `groupSteal` naming no records is answered at once: nothing stolen, and
+  a lease of zeros.
+- The server refuses a processing job whose `name` is over 4096 bytes, and
+  a workflow definition whose `version` is over 256 bytes (`BadRequest`).
 
 ## 0.1.0-dev.6 - 2026-11-18
 
