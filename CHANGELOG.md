@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- The server's op table hash is now `0xe394286115044c9d`, the hash of flo `19cfe003`; this SDK and older servers refuse each other. Run ids may now be up to 42 bytes (`{prefix}{bits}-{shard}-{term}`); treat them as opaque.
+- The server's op table hash is now `0xc65b793b2a6d82be`, the hash of flo `cff5d066`; this SDK and older servers refuse each other. Run ids may now be up to 42 bytes (`{prefix}{bits}-{shard}-{term}`); treat them as opaque.
 
 ## 0.1.0-dev.6 - 2026-11-18
 
