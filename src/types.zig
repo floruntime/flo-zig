@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0xe394286115044c9d;
+pub const TABLE_HASH: u64 = 0xdc7e06b2a9f89c65;
 
 /// Why the server refused a request. Mirrors the server's list. A reason
 /// this SDK predates still decodes, as its number (`_`), with the status
@@ -98,6 +98,10 @@ pub const Reason = enum(u16) {
     /// together, or the shard's queues and groups together hold their cap
     /// of bytes. See `FloError.GroupHeldFull`; never retried.
     group_held_full = 37,
+    /// Status conflict: a repair skipped the log entry, or the channel
+    /// message, that carried the request, so it never runs, on any node.
+    /// The message names the repair's entry and the message's seq.
+    skipped_by_repair = 38,
 
     _,
 };
@@ -496,6 +500,8 @@ pub const OptionTag = enum(u8) {
     retention_age = 0x2A, // u64: A stream's retention: its oldest record's age, in seconds
     dry_run = 0x28, // void: Flag to preview what would be deleted without deleting
     force = 0x2C, // void: Flag to delete a stream that still holds records
+    retention_age_clear = 0x2D, // void: An alter drops the stream's age bound
+    retention_count_clear = 0x2E, // void: An alter drops the stream's count bound
 
     // Consumer Group Options (0x30 - 0x3F)
     ack_timeout_ms = 0x30, // u32: A group's lease: a record not acked this long is redelivered (5 s to 12 h)
@@ -1212,7 +1218,7 @@ pub const StreamInfo = struct {
 
 /// A stream's settings, for a create or an alter: its partitions (a
 /// create's alone) and its retention. 0 leaves a bound unset (a create) or
-/// as it stands (an alter).
+/// as it stands (an alter); only a clear drops one.
 pub const StreamSettingsOptions = struct {
     /// Override client's default namespace
     namespace: ?[]const u8 = null,
@@ -1221,8 +1227,17 @@ pub const StreamSettingsOptions = struct {
     partitions: u32 = 0,
     /// Trim records older than this many seconds (at most 100 years).
     retention_age_s: u64 = 0,
-    /// Keep at most this many records.
+    /// Keep at most this many records. The server refuses the u64 max
+    /// ("retention bound too large").
     retention_count: u64 = 0,
+    /// An alter's: drop the stream's age bound. With `retention_age_s` set
+    /// too it is `FloError.BadRequest`, sent nowhere. The server refuses a
+    /// create that sends it.
+    clear_retention_age: bool = false,
+    /// An alter's: drop the stream's count bound. With `retention_count`
+    /// set too it is `FloError.BadRequest`, sent nowhere. The server
+    /// refuses a create that sends it.
+    clear_retention_count: bool = false,
 };
 
 /// A header stored with a stream record.
@@ -2452,11 +2467,13 @@ test "limit is its own terminal error, its reasons decode by name, and the txn r
         .{ 35, .too_many_workflow_runs },
     }) |c| try std.testing.expectEqual(c[1], std.enums.fromInt(Reason, c[0]).?);
     // One this SDK predates is kept as its number.
-    const next: Reason = @enumFromInt(38);
-    try std.testing.expectEqual(@as(u16, 38), @intFromEnum(next));
+    const next: Reason = @enumFromInt(39);
+    try std.testing.expectEqual(@as(u16, 39), @intFromEnum(next));
     try std.testing.expect(std.enums.tagName(Reason, next) == null);
     try std.testing.expectEqual(Reason.queue_full, @as(Reason, @enumFromInt(36)));
     try std.testing.expectEqual(Reason.group_held_full, @as(Reason, @enumFromInt(37)));
+    try std.testing.expectEqual(Reason.skipped_by_repair, std.enums.fromInt(Reason, 38).?);
+    try std.testing.expectEqualStrings("skipped_by_repair", std.enums.tagName(Reason, @enumFromInt(38)).?);
     try std.testing.expect(!@hasField(Reason, "wrong_routing_key"));
     // The removed group ops are gone from the SDK.
     for ([_]u16{ 0x151, 0x152, 0x155, 0x157 }) |code| {

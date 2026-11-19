@@ -1784,6 +1784,14 @@ test "live: a steal takes an idle holder's records under a new lease, and refuse
     try testing.expectEqual(@as(u32, 1), acked.applied);
 
     try testing.expectError(flo.FloError.NotFound, stream.groupSteal("stolen", "nobody", "c2", 1, &.{a}, .{}));
+
+    // Naming no records takes nothing, and logs nothing: no lease.
+    var none = try stream.groupSteal("stolen", "g", "c2", 1, &.{}, .{});
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.stolen.len);
+    try testing.expectEqual(@as(usize, 0), none.refused.len);
+    try testing.expectEqual(@as(u64, 0), none.lease.index);
+    try testing.expectEqual(@as(i64, 0), none.expires_at_ms);
 }
 
 test "live: a group's dead letters list by page, requeue with failures reset, and delete; one not dead is refused not_dead" {
@@ -1889,4 +1897,59 @@ test "live: an alter on a stream an append made works, and info shows it; a crea
     try testing.expectError(flo.FloError.Conflict, stream.create("parted", .{ .retention_count = 100 }));
     try testing.expectError(flo.FloError.BadRequest, stream.alter("parted", .{ .partitions = 4 }));
     try testing.expectEqual(@as(u32, 3), (try stream.info("parted", .{})).partition_count);
+}
+
+fn le64(v: u64) [8]u8 {
+    return std.mem.toBytes(std.mem.nativeToLittle(u64, v));
+}
+
+test "live: an alter clears a retention bound; set and clear together, a create's clear and a bound of u64 max are refused" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var stream = flo.Stream.init(&live.client);
+    try stream.create("bounded", .{ .retention_age_s = 3600, .retention_count = 100 });
+
+    // Each clear drops its bound alone; 0 left the other as it stood.
+    try stream.alter("bounded", .{ .clear_retention_age = true });
+    const no_age = try stream.info("bounded", .{});
+    try testing.expectEqual(@as(u64, 0), no_age.retention_age_s);
+    try testing.expectEqual(@as(u64, 100), no_age.retention_count);
+    try stream.alter("bounded", .{ .clear_retention_count = true });
+    const none = try stream.info("bounded", .{});
+    try testing.expectEqual(@as(u64, 0), none.retention_age_s);
+    try testing.expectEqual(@as(u64, 0), none.retention_count);
+    // A clear and a set of the other bound go together.
+    try stream.alter("bounded", .{ .retention_age_s = 60, .clear_retention_count = true });
+    try testing.expectEqual(@as(u64, 60), (try stream.info("bounded", .{})).retention_age_s);
+
+    // Set and clear of one bound: the SDK refuses it unsent, and so does
+    // the server when it is sent.
+    try testing.expectError(flo.FloError.BadRequest, stream.alter("bounded", .{ .retention_count = 5, .clear_retention_count = true }));
+    for ([_][]const u8{
+        "\x2a\x08" ++ le64(60) ++ "\x2d\x00",
+        "\x29\x08" ++ le64(5) ++ "\x2e\x00",
+    }) |opts| {
+        var resp = try live.client.sendRequest(.stream_alter, live.namespace, "bounded", "", opts);
+        resp.deinit();
+        try testing.expectEqual(flo.StatusCode.bad_request, resp.status);
+        try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "both sets and clears") != null);
+    }
+    try testing.expectEqual(@as(u64, 60), (try stream.info("bounded", .{})).retention_age_s);
+
+    // Only an alter drops a bound: a create sending a clear is refused.
+    try testing.expectError(flo.FloError.BadRequest, stream.create("cleared", .{ .clear_retention_count = true }));
+    try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "only an alter drops") != null);
+    try testing.expectError(flo.FloError.NotFound, stream.info("cleared", .{}));
+
+    // A count of u64 max is how a clear is logged: refused on create and alter.
+    const max = std.math.maxInt(u64);
+    try testing.expectError(flo.FloError.BadRequest, stream.create("huge", .{ .retention_count = max }));
+    try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "retention bound too large") != null);
+    try testing.expectError(flo.FloError.BadRequest, stream.alter("bounded", .{ .retention_count = max }));
+    try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "retention bound too large") != null);
+    // An age of u64 max is past the 100-year cap, refused for that first.
+    try testing.expectError(flo.FloError.BadRequest, stream.alter("bounded", .{ .retention_age_s = max }));
+    try testing.expect(std.mem.indexOf(u8, live.client.lastError().?.message, "over 100 years") != null);
+    try testing.expectEqual(@as(u64, 60), (try stream.info("bounded", .{})).retention_age_s);
 }
