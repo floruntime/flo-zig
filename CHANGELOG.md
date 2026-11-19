@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- The server's op table hash is now `0xc65b793b2a6d82be`, the hash of flo `cff5d066`; this SDK and older servers refuse each other. Run ids may now be up to 42 bytes (`{prefix}{bits}-{shard}-{term}`); treat them as opaque.
+- The server's op table hash is now `0xdc7e06b2a9f89c65`, the hash of flo `08d51612`; this SDK and older servers refuse each other. Run ids may now be up to 42 bytes (`{prefix}{bits}-{shard}-{term}`); treat them as opaque.
 - `StreamSettingsOptions` gains `clear_retention_age` and
   `clear_retention_count`: an alter drops that bound. Leaving a bound 0
   still leaves it as it stands. An alter that sets and clears the same bound
