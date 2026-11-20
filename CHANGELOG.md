@@ -22,6 +22,9 @@
   a lease of zeros.
 - The server refuses a processing job whose `name` is over 4096 bytes, and
   a workflow definition whose `version` is over 256 bytes (`BadRequest`).
+- A delete now drops a key's earlier versions: after put, delete, put, `history` is the new version and the delete's tombstone. The server removes old tombstones in time.
+- A workflow signal is taken by one wait: a wait takes the oldest signal of its type the run holds, and a run keeps at most 64 that no wait has taken (one more is refused) until a wait takes them or the run ends.
+- Idempotency keys starting with `_` are reserved for the server and refused on a workflow start.
 
 ## 0.1.0-dev.6 - 2026-11-18
 

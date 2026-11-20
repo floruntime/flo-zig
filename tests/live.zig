@@ -129,6 +129,7 @@ test "live: a key set with a TTL reads back with its expiry" {
     try testing.expectEqual(@as(?i64, null), plain.expires_at_ms);
 }
 
+// A delete frees what the key held, so the version before it is gone.
 test "live: a key's history marks the version a delete wrote" {
     var live: Live = .{ .client = undefined };
     try live.init();
@@ -141,12 +142,10 @@ test "live: a key's history marks the version a delete wrote" {
     defer history.deinit();
     const versions = history.versions;
     try testing.expect(!history.more and !history.stale);
-    try testing.expectEqual(@as(usize, 3), versions.len);
+    try testing.expectEqual(@as(usize, 2), versions.len);
     try testing.expect(!versions[0].deleted);
     try testing.expectEqualStrings("two", versions[0].value);
     try testing.expect(versions[1].deleted);
-    try testing.expect(!versions[2].deleted);
-    try testing.expectEqualStrings("one", versions[2].value);
 }
 
 test "live: worker info shows a worker's row, metadata and processes" {

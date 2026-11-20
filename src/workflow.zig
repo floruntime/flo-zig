@@ -311,7 +311,10 @@ pub const Workflow = struct {
         return parseWorkflowStatus(allocator, response.data) catch |err| answerError(err);
     }
 
-    /// Send a signal to a running workflow.
+    /// Send a signal to a running workflow. Each signal ends one wait: a
+    /// wait takes the oldest signal of its type the run holds. The run keeps
+    /// signals no wait has taken (at most 64; one more is refused) until a
+    /// wait takes them or the run ends.
     pub fn signal(
         self: *Self,
         run_id: []const u8,

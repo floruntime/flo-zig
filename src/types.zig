@@ -2098,6 +2098,8 @@ pub const WorkflowGetDefinitionOptions = struct {
 
 pub const WorkflowStartOptions = struct {
     namespace: ?[]const u8 = null,
+    /// The same key answers with the run it started. Keys starting with '_'
+    /// are reserved for the server and refused.
     idempotency_key: ?[]const u8 = null,
     run_id: ?[]const u8 = null,
     version: ?[]const u8 = null,

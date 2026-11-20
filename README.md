@@ -163,7 +163,9 @@ while (true) {
 // Version history, newest first, a page at a time (limit 1-65, default 10);
 // each entry has version, at_ms (write time), deleted (a delete wrote it;
 // value is empty) and value. A missing key has no versions. While `more` is
-// set, ask again with before_version set to the page's last version.
+// set, ask again with before_version set to the page's last version. A
+// delete drops the versions before it, so history ends at its tombstone,
+// and the server removes old tombstones in time.
 var before: ?u64 = null;
 while (true) {
     var history = try kv.history("key", .{ .limit = 10, .before_version = before });
@@ -700,7 +702,8 @@ defer allocator.free(run_id);
 var status = try workflow.status(allocator, run_id, .{});
 defer status.deinit(allocator);
 
-// Send a signal to a running workflow
+// Send a signal to a running workflow. Each signal ends one wait (the
+// oldest of its type is taken); untaken ones are kept until the run ends.
 try workflow.signal(run_id, "approval", "{\"approved\": true}", .{});
 
 // Cancel a running workflow
