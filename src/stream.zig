@@ -228,10 +228,10 @@ pub const Stream = struct {
     fn settings(self: *Stream, op: types.OpCode, stream_name: []const u8, options: types.StreamSettingsOptions) FloError!void {
         // The server's alter reads no partition count; sent, it would be
         // dropped without a word.
-        if (op == .stream_alter and options.partitions > 0) return FloError.BadRequest;
+        if (op == .stream_alter and options.partitions > 0) return self.client.refuse("an alter can't change a stream's partitions");
         // The server refuses an alter that sets and clears the same bound.
-        if (options.clear_retention_age and options.retention_age_s > 0) return FloError.BadRequest;
-        if (options.clear_retention_count and options.retention_count > 0) return FloError.BadRequest;
+        if (options.clear_retention_age and options.retention_age_s > 0) return self.client.refuse("a retention age can't be set and cleared at once");
+        if (options.clear_retention_count and options.retention_count > 0) return self.client.refuse("a retention count can't be set and cleared at once");
         var opts_buf: [24]u8 = undefined;
         var builder = wire.OptionsBuilder.init(&opts_buf);
         if (options.retention_age_s > 0) try builder.addU64(.retention_age, options.retention_age_s);
@@ -1871,6 +1871,12 @@ test "an alter's clears are void options; setting and clearing one bound is refu
 
     try std.testing.expectError(FloError.BadRequest, stream.alter("events", .{ .retention_age_s = 60, .clear_retention_age = true }));
     try std.testing.expectError(FloError.BadRequest, stream.alter("events", .{ .retention_count = 5, .clear_retention_count = true }));
+    try std.testing.expectEqualStrings("a retention count can't be set and cleared at once", client.lastError().?.message);
+    try std.testing.expectError(FloError.BadRequest, stream.create("events", .{ .retention_age_s = 60, .clear_retention_age = true }));
+    try std.testing.expectEqualStrings("a retention age can't be set and cleared at once", client.lastError().?.message);
+    try std.testing.expectEqual(@as(u8, 3), client.lastError().?.code);
+    try std.testing.expectError(FloError.BadRequest, stream.alter("events", .{ .partitions = 4 }));
+    try std.testing.expectEqualStrings("an alter can't change a stream's partitions", client.lastError().?.message);
     try std.testing.expectEqual(@as(u32, 2), srv.requests.load(.acquire));
 
     // A create sends a clear as given: the server refuses it.

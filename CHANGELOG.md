@@ -9,6 +9,9 @@
   is `BadRequest`, sent nowhere. The server refuses a create that sends a
   clear, and a `retention_count` of the u64 max ("retention bound too
   large").
+- A create or alter the SDK refuses before sending (a bound both set and
+  cleared, an alter naming partitions) now leaves its reason in
+  `client.lastError()`, instead of no message or the previous request's.
 - `Reason` names `skipped_by_repair` (38): a repair skipped the log entry or
   channel message that carried the request, so it never runs, on any node.
 - A stream deleted and made again under the same name, while the server
