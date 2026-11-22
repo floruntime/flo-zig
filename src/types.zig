@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0xdc7e06b2a9f89c65;
+pub const TABLE_HASH: u64 = 0x2440b62edffe27a6;
 
 /// Why the server refused a request. Mirrors the server's list. A reason
 /// this SDK predates still decodes, as its number (`_`), with the status
@@ -2098,6 +2098,8 @@ pub const WorkflowGetDefinitionOptions = struct {
 
 pub const WorkflowStartOptions = struct {
     namespace: ?[]const u8 = null,
+    /// The same key answers with the run it started. Keys starting with '_'
+    /// are reserved for the server and refused.
     idempotency_key: ?[]const u8 = null,
     run_id: ?[]const u8 = null,
     version: ?[]const u8 = null,

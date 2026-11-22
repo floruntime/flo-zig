@@ -398,6 +398,17 @@ pub const Client = struct {
         return .{ .code = self.last_error_code, .reason = self.last_error_reason, .ran = self.last_error_ran, .message = self.last_error_buf[0..self.last_error_len] };
     }
 
+    /// Refuse a request before it is sent, as the server would: lastError
+    /// then says why, instead of naming the previous request's refusal.
+    pub fn refuse(self: *Self, message: []const u8) FloError {
+        self.last_error_code = @intFromEnum(StatusCode.bad_request);
+        self.last_error_reason = .unclassified;
+        self.last_error_ran = .no;
+        self.last_error_len = @min(message.len, self.last_error_buf.len);
+        @memcpy(self.last_error_buf[0..self.last_error_len], message[0..self.last_error_len]);
+        return FloError.BadRequest;
+    }
+
     /// Get the next request ID
     pub fn nextRequestId(self: *Self) u64 {
         const id = self.request_id;
