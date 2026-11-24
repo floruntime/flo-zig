@@ -216,7 +216,9 @@ pub const WorkflowDefinitionEntry = types.WorkflowDefinitionEntry;
 pub const WorkflowListDefinitionsResult = types.WorkflowListDefinitionsResult;
 pub const WorkflowSignalOptions = types.WorkflowSignalOptions;
 pub const WorkflowCancelOptions = types.WorkflowCancelOptions;
-pub const WorkflowHistoryOptions = types.WorkflowHistoryOptions;
+pub const RunHistoryOptions = types.RunHistoryOptions;
+pub const RunHistoryEvent = types.RunHistoryEvent;
+pub const RunHistoryPage = types.RunHistoryPage;
 pub const WorkflowListRunsOptions = types.WorkflowListRunsOptions;
 pub const WorkflowRunEntry = types.WorkflowRunEntry;
 pub const WorkflowListRunsResult = types.WorkflowListRunsResult;
@@ -277,4 +279,6 @@ test {
     _ = @import("actions.zig");
     _ = @import("worker.zig");
     _ = @import("stream_worker.zig");
+    _ = @import("workflow.zig");
+    _ = @import("run_history.zig");
 }

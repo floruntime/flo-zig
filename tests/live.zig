@@ -725,6 +725,53 @@ test "live: action round trip" {
     try testing.expectError(flo.FloError.NotFound, actions.info("no-such-action", .{}));
 }
 
+test "live: an action run's status holds a preview of a long result, and its history the whole, a page at a time" {
+    var live: Live = .{ .client = undefined };
+    try live.init();
+    defer live.deinit();
+    var actions = flo.Actions.init(&live.client);
+
+    try actions.registerAction("echo", .user, .{ .timeout_ms = 5000 });
+    var invoked = try actions.invoke("echo", "ping", .{});
+    defer invoked.deinit();
+    var task = try awaitOne(&actions, "w1", null);
+    defer task.deinit();
+    const result = "r" ** 300;
+    try actions.complete("w1", task.delivery(), result, .{ .outcome = "approved" });
+
+    var st = try actions.getStatus(invoked.run_id, .{});
+    defer st.deinit();
+    try testing.expectEqual(flo.RunStatus.completed, st.status);
+    try testing.expectEqualStrings(result[0..256], st.output.?);
+    try testing.expect(st.output_truncated and !st.error_truncated);
+
+    var page = try actions.history(invoked.run_id, .{});
+    defer page.deinit();
+    try testing.expect(!page.has_more and page.cursor == null);
+    const want = [_][]const u8{ "action_invoked", "action_delivered", "action_settled", "action_ended" };
+    try testing.expectEqual(want.len, page.events.len);
+    for (want, page.events) |w, e| try testing.expectEqualStrings(w, e.event_type);
+    try testing.expectEqualStrings("ping", page.events[0].detail);
+    try testing.expectEqualStrings(result, page.events[2].detail);
+    try testing.expectEqualStrings("approved", page.events[2].extra);
+
+    // One event a page: the same events, each once, then no cursor.
+    var cursor: ?u64 = null;
+    var seen: usize = 0;
+    while (true) : (seen += 1) {
+        try testing.expect(seen < want.len);
+        var one = try actions.history(invoked.run_id, .{ .limit = 1, .cursor = cursor });
+        defer one.deinit();
+        try testing.expectEqual(@as(usize, 1), one.events.len);
+        try testing.expectEqualStrings(want[seen], one.events[0].event_type);
+        if (!one.has_more) break;
+        cursor = one.cursor.?;
+    }
+    try testing.expectEqual(want.len - 1, seen);
+
+    try testing.expectError(flo.FloError.NotFound, actions.history("act-0-0", .{}));
+}
+
 const Echo = struct {
     var input: [64]u8 = undefined;
     var input_len: usize = 0;
@@ -1359,9 +1406,8 @@ test "live: a run started with a client-chosen id is found by that id, and a lat
         defer st.deinit(testing.allocator);
         try testing.expectEqualStrings(id, st.run_id);
         try testing.expectEqualStrings("chosen-a", st.workflow);
-
-        const hist = try workflow.history(testing.allocator, id, .{});
-        testing.allocator.free(hist);
+        // A running run keeps its input.
+        try testing.expectEqualStrings("{}", st.input);
 
         try workflow.signal(id, "nudge", "{}", .{});
 
@@ -1375,6 +1421,22 @@ test "live: a run started with a client-chosen id is found by that id, and a lat
         defer after.deinit(testing.allocator);
         try testing.expectEqualStrings("cancelled", after.status);
         try testing.expectEqualStrings("chosen-a", after.workflow);
+        // An ended run's input is in its history, not its status.
+        try testing.expectEqualStrings("", after.input);
+        try testing.expect(!after.output_truncated);
+
+        var hist = try workflow.history(testing.allocator, id, .{});
+        defer hist.deinit();
+        try testing.expect(!hist.has_more and hist.cursor == null);
+        try testing.expect(hist.events.len >= 2);
+        try testing.expectEqualStrings("workflow_started", hist.events[0].event_type);
+        try testing.expectEqualStrings("workflow_cancelled", hist.events[hist.events.len - 1].event_type);
+        for (hist.events[1..], hist.events[0 .. hist.events.len - 1]) |e, before| try testing.expect(e.timestamp_ms >= before.timestamp_ms);
+        // Newest first is the same events the other way round.
+        var back = try workflow.history(testing.allocator, id, .{ .newest_first = true });
+        defer back.deinit();
+        try testing.expectEqual(hist.events.len, back.events.len);
+        for (hist.events, 0..) |e, i| try testing.expectEqualStrings(e.event_type, back.events[back.events.len - 1 - i].event_type);
     }
 }
 

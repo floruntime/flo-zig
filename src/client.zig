@@ -447,6 +447,7 @@ fn blockingWaitMs(op_code: OpCode, value: []const u8, options: []const u8) u64 {
     if (op_code == .kv_get) return if (value.len >= 9 and value[0] == 1) std.mem.readInt(u64, value[1..9], .little) else 0;
     if (op_code == .action_await) return @import("actions.zig").awaitBodyBlockMs(value);
     if (op_code == .queue_dequeue) return @import("queue.zig").dequeueBodyBlockMs(value);
+    if (op_code == .workflow_history or op_code == .action_history) return @import("run_history.zig").HOLD_MS;
     var longest: u64 = 0;
     var it = wire.OptionsIterator.init(options);
     while (it.next()) |opt| {
@@ -625,6 +626,11 @@ test "an action await's and a kv.get's waits are read from their bodies" {
     body[0] = 1;
     std.mem.writeInt(u64, body[1..9], 5000, .little);
     try std.testing.expectEqual(@as(u64, 5000), blockingWaitMs(.kv_get, &body, ""));
+}
+
+test "a history read's deadline covers the server's hold" {
+    try std.testing.expectEqual(@as(u64, 5000), blockingWaitMs(.workflow_history, "", ""));
+    try std.testing.expectEqual(@as(u64, 5000), blockingWaitMs(.action_history, "", ""));
 }
 
 test "an answer from another op table is refused unread, naming both tables" {
