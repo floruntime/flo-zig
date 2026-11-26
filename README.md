@@ -570,7 +570,8 @@ handler goes past its lease without touching it is taken back and run again;
 from when it arrived, from a thread on its own connection while the handler runs; that
 thread allocates, so the worker's allocator must then be thread-safe. It's off by
 default; without it, call `ctx.touch()` from long handlers, at least every half lease.
-An action's `owner` is at most 256 bytes.
+An action's `owner` is at most 256 bytes, and so is its name: a longer name is
+refused (`error.BadRequest`).
 
 A handler that returns an error fails the run with retry: it runs again while attempts
 are left (return `error.NonRetryable` to fail it for good). `stop()` stops taking work:
@@ -605,9 +606,19 @@ defer gpu_run.deinit();
 var status = try actions.getStatus(invoked.run_id, .{});
 defer status.deinit();
 std.debug.print("Status: {s}, attempt {d}\n", .{ @tagName(status.status), status.attempt });
+// output and error_message are their first 256 bytes; output_truncated and
+// error_truncated say when more was cut, and the run's history holds the whole
 if (status.output) |out| std.debug.print("Output: {s}\n", .{out});
 // The outcome a completed run's worker named; null for success
 if (status.outcome) |o| std.debug.print("Outcome: {s}\n", .{o});
+
+// The run's history, a page at a time: its invoke, deliveries, failures and
+// result, in order. `action_settled` carries the whole result, its extra the
+// outcome named; a delivery's, retried failure's or hand-back's extra is
+// "truncated" when its detail is only the first 256 bytes.
+var history = try actions.history(invoked.run_id, .{});
+defer history.deinit();
+for (history.events) |e| std.debug.print("{d} {s}: {s}\n", .{ e.timestamp_ms, e.event_type, e.detail });
 
 // An action's definition, its runs by status and how long completed ones took
 var info = try actions.info("send-email", .{});
@@ -690,17 +701,29 @@ long to list together, or a machine id over 255 bytes is `field_too_long`.
 ```zig
 var workflow = flo.Workflow.init(&client);
 
-// Create workflow from YAML. A definition whose version is over 256 bytes
-// is refused (error.BadRequest).
+// Create workflow from YAML. A definition whose name or version is over 256
+// bytes is refused (error.BadRequest).
 try workflow.create("my-workflow", yaml_bytes, .{});
 
-// Start a workflow run
+// Start a workflow run (a name over 256 bytes is refused)
 const run_id = try workflow.start(allocator, "my-workflow", input_json, .{});
 defer allocator.free(run_id);
 
-// Get run status
+// Get run status. An ended run's input is empty and its output a 256-byte
+// preview (output_truncated says when more was cut)
 var status = try workflow.status(allocator, run_id, .{});
 defer status.deinit(allocator);
+
+// The run's history, a page at a time; workflow_output carries its whole
+// output. Ask again with the page's cursor while has_more is set
+var cursor: ?u64 = null;
+while (true) {
+    var page = try workflow.history(allocator, run_id, .{ .limit = 100, .cursor = cursor });
+    defer page.deinit();
+    for (page.events) |e| std.debug.print("{s}: {s}\n", .{ e.event_type, e.detail });
+    if (!page.has_more) break;
+    cursor = page.cursor;
+}
 
 // Send a signal to a running workflow. Each signal ends one wait (the
 // oldest of its type is taken); untaken ones are kept until the run ends.
@@ -708,7 +731,17 @@ try workflow.signal(run_id, "approval", "{\"approved\": true}", .{});
 
 // Cancel a running workflow
 try workflow.cancel(run_id, "no longer needed", .{});
+```
 
+`workflow.history` and `actions.history` answer the same page (`RunHistoryPage`).
+`RunHistoryOptions` fields left null take the server's defaults: 100 events, oldest
+first; a `limit` outside 1 to 1000 is refused as `BadRequest` before sending. A history
+read may be held up to 5 s while the run's history catches up. `history_lost` and
+`history_missing` events mark a gap: events a repair skipped or the log no longer
+holds, or not landed in time. A definition calling an action named over 256 bytes is
+refused at create, and a step whose call target is longer than an action name fails.
+
+```zig
 // List workflow definitions, a page at a time. A page can be short while
 // more remain: stop on has_more, not on the page's size.
 var defs_cursor: ?[]u8 = null;
@@ -799,7 +832,7 @@ All operations return `flo.FloError` which includes:
 - `OutcomePending` - The write committed but hasn't applied, because its shard halted (never retried)
 - `StaleNotFound` - A not-found answer marked stale: `get` or `jsonGet` on a halted shard (the key is missing as of the halt, which isn't the same as missing), or a `stream.read` or `ts.read` whose stream or series the answering node hasn't seen yet. It may exist: read again rather than treat it as gone
 - `StaleReport` - An action complete, fail or touch for a delivery that has moved on (never resent)
-- `Limit` - The node or shard is at a limit on what it holds (status `limit`); `lastError().?.reason` names which: `memory_budget`, `too_many_actions` (counted per shard), `too_many_workflow_definitions` or `too_many_workflow_runs`. The limits are built into the server, not settings: retrying won't clear it until something is deleted (or, for the memory budget, the node gets more memory), so nothing retries it. It doesn't mean permanent. It never ran
+- `Limit` - The node is at a limit on what it holds (status `limit`); `lastError().?.reason` names which: `memory_budget`, which a register or create past memory gets like any other write. The limit is built into the server, not a setting: retrying won't clear it until something is deleted or the node gets more memory, so nothing retries it. It doesn't mean permanent. It never ran
 - `GroupHeldFull` - A group read took nothing new (status `overloaded`, reason `group_held_full`): the group is at its caps, leased, ready and dead records together, or the shard's queues and groups are at their shared cap. Not retried. It clears as the group's records are acked or nacked, its dead records removed (deleting the group, or a stream trim), or, at the shard's cap, as this group's records and the shard's other groups and queues are acked, consumed or purged
 - `UnexpectedResponse` - Unexpected response format
 - `ServerError` - Generic server error, including status codes this SDK doesn't know

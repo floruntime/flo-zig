@@ -15,7 +15,7 @@ pub const VERSION: u8 = 0x03;
 /// and its answers carry its own hash, which this SDK refuses. Bump it in
 /// the same commit as FLO_REF in .github/flo-ref.env, so the live tests run
 /// against a server built with it.
-pub const TABLE_HASH: u64 = 0xe188239e79bb6bef;
+pub const TABLE_HASH: u64 = 0xaaef4dfa38d45632;
 
 /// Why the server refused a request. Mirrors the server's list. A reason
 /// this SDK predates still decodes, as its number (`_`), with the status
@@ -81,14 +81,9 @@ pub const Reason = enum(u16) {
     admin_only = 30,
     /// A processing remove of a job still running: stop or cancel it first.
     job_running = 31,
-    /// Status limit: the node's memory budget is spent.
+    /// Status limit: the node's memory budget is spent. A register or
+    /// create past memory is refused with it, like any other write.
     memory_budget = 32,
-    /// Status limit: the shard holds as many actions as it registers.
-    too_many_actions = 33,
-    /// Status limit: the node holds as many workflow definitions as it keeps.
-    too_many_workflow_definitions = 34,
-    /// Status limit: the node holds as many workflow runs as it keeps.
-    too_many_workflow_runs = 35,
     /// Status overloaded: the queue holds as many messages or bytes as its
     /// caps allow, or the shard's queues and groups together do. It drains
     /// as messages are acked, so the client retries it.
@@ -367,6 +362,7 @@ pub const OpCode = enum(u16) {
     action_fail = 0x30C,
     action_touch = 0x30D,
     action_info = 0x30F,
+    action_history = 0x310,
 
     // ── Workers (0x320 – 0x33F) ──
     worker_register = 0x320,
@@ -591,13 +587,12 @@ pub const FloError = error{
     /// (status conflict, reason stale_report); Client.lastError's message
     /// says how. Not resent: it would be refused again.
     StaleReport,
-    /// The node or shard is at a limit on what it holds (status limit);
-    /// the reason (`Client.lastError`) names which: memory_budget,
-    /// too_many_actions (counted per shard), too_many_workflow_definitions
-    /// or too_many_workflow_runs, and its message says more. The limits are
-    /// built into the server, not settings: retrying won't clear it until
-    /// something is deleted (or, for the memory budget, the node is given
-    /// more memory), so it is never retried. Not permanent. It never ran.
+    /// The node is at a limit on what it holds (status limit); the reason
+    /// (`Client.lastError`) names which, memory_budget, and its message
+    /// says more. A register or create past memory gets it, like any other
+    /// write. The limit is built into the server, not a setting: retrying
+    /// won't clear it until something is deleted or the node is given more
+    /// memory, so it is never retried. Not permanent. It never ran.
     Limit,
     /// A group read took nothing new (status overloaded, reason
     /// group_held_full): the group holds as many records as its caps
@@ -1720,7 +1715,10 @@ pub const TaskAssignment = struct {
 
 /// An action run's status. Times are ms since the epoch; `attempt` counts
 /// from 1 once a worker has taken the run. `output` is a completed run's
-/// result, and `error_message` the last failure's message. `worker_id` is
+/// result, and `error_message` the last failure's message, each its first
+/// 256 bytes: `output_truncated` and `error_truncated` say when more was
+/// cut. The whole result is the run's `action_settled` history event, and
+/// the whole error is in its history too (`Actions.history`). `worker_id` is
 /// the worker holding the run, or last holding it; null until one takes it.
 /// Only the leader knows a take at once: another node may answer null, or
 /// an earlier worker, until the run's next update reaches it. `outcome` is
@@ -1740,6 +1738,8 @@ pub const ActionRunStatus = struct {
     worker_id: ?[]const u8,
     outcome: ?[]const u8,
     held: ?[]const u8 = null,
+    output_truncated: bool = false,
+    error_truncated: bool = false,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ActionRunStatus) void {
@@ -2109,6 +2109,10 @@ pub const WorkflowStatusOptions = struct {
     namespace: ?[]const u8 = null,
 };
 
+/// A workflow run's status. An ended run's `input` comes back empty, and
+/// its `output` is a preview, its first 256 bytes: `output_truncated` says
+/// when more was cut. The run's history holds both whole; the full output
+/// is its `workflow_output` event (`Workflow.history`).
 pub const WorkflowStatusResult = struct {
     run_id: []const u8,
     workflow: []const u8,
@@ -2120,6 +2124,9 @@ pub const WorkflowStatusResult = struct {
     started_at: ?i64 = null,
     completed_at: ?i64 = null,
     wait_signal: ?[]const u8 = null,
+    /// What the run's definition composed as its output; null until it has one.
+    output: ?[]const u8 = null,
+    output_truncated: bool = false,
 
     /// Free all allocated fields.
     pub fn deinit(self: *const WorkflowStatusResult, allocator: std.mem.Allocator) void {
@@ -2130,6 +2137,7 @@ pub const WorkflowStatusResult = struct {
         allocator.free(self.current_step);
         allocator.free(self.input);
         if (self.wait_signal) |ws| allocator.free(ws);
+        if (self.output) |o| allocator.free(o);
     }
 };
 
@@ -2141,9 +2149,54 @@ pub const WorkflowCancelOptions = struct {
     namespace: ?[]const u8 = null,
 };
 
-pub const WorkflowHistoryOptions = struct {
+/// Options for a page of a run's history, a workflow's or an action's.
+/// A field left null is the server's default.
+pub const RunHistoryOptions = struct {
     namespace: ?[]const u8 = null,
-    limit: u32 = 100,
+    /// The most events to answer, 1 to 1000 (others are refused as
+    /// BadRequest before sending); null for the server's default of 100.
+    limit: ?u32 = null,
+    /// The cursor the previous page answered; null for the start (or, newest
+    /// first, the end).
+    cursor: ?u64 = null,
+    /// Newest first, going back from the cursor; the server's default is
+    /// oldest first.
+    newest_first: ?bool = null,
+};
+
+/// One event in a run's history.
+pub const RunHistoryEvent = struct {
+    /// What happened. `history_lost` and `history_missing` mark a gap:
+    /// events a repair skipped or the log no longer holds, or not landed by
+    /// the read's deadline; `detail` says which. A workflow run's
+    /// `workflow_output` carries its whole output.
+    event_type: []const u8,
+    /// Its detail: an input, a result, an error, a worker.
+    detail: []const u8,
+    /// An action's settle: the outcome its worker named. An action's
+    /// delivery, retried failure or hand-back: "truncated" when `detail` is
+    /// only the first 256 bytes. Empty otherwise.
+    extra: []const u8,
+    timestamp_ms: i64,
+};
+
+/// One page of a run's history, in the order asked. While `has_more` is
+/// set, ask again with `cursor`. Free with `deinit`.
+pub const RunHistoryPage = struct {
+    events: []RunHistoryEvent,
+    has_more: bool,
+    /// Pass as `RunHistoryOptions.cursor` for the next page.
+    cursor: ?u64,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *RunHistoryPage) void {
+        for (self.events) |e| {
+            self.allocator.free(e.event_type);
+            self.allocator.free(e.detail);
+            self.allocator.free(e.extra);
+        }
+        self.allocator.free(self.events);
+    }
 };
 
 pub const WorkflowListRunsOptions = struct {
@@ -2464,10 +2517,10 @@ test "limit is its own terminal error, its reasons decode by name, and the txn r
     for ([_]struct { u16, Reason }{
         .{ 18, .keys_not_colocated },
         .{ 32, .memory_budget },
-        .{ 33, .too_many_actions },
-        .{ 34, .too_many_workflow_definitions },
-        .{ 35, .too_many_workflow_runs },
     }) |c| try std.testing.expectEqual(c[1], std.enums.fromInt(Reason, c[0]).?);
+    // The count caps' reasons are gone; nothing after them renumbered.
+    for ([_]u16{ 33, 34, 35 }) |code| try std.testing.expect(std.enums.tagName(Reason, @enumFromInt(code)) == null);
+    try std.testing.expect(!@hasField(Reason, "too_many_actions"));
     // One this SDK predates is kept as its number.
     const next: Reason = @enumFromInt(39);
     try std.testing.expectEqual(@as(u16, 39), @intFromEnum(next));

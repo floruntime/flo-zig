@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+- The server's op table hash is now `0xaaef4dfa38d45632`, the hash of flo `0bc90b34`; this SDK and older servers refuse each other.
+- **Breaking:** `Workflow.history` returns a `RunHistoryPage`, not raw bytes,
+  and takes `RunHistoryOptions` (`WorkflowHistoryOptions` is gone): `limit`,
+  `cursor` and `newest_first`, each null for the server's default (100
+  events, oldest first; a `limit` outside 1 to 1000 is refused as
+  `BadRequest` before sending). The page holds `events`, each `event_type`, `detail`, `extra`
+  and `timestamp_ms`, then `has_more` and the `cursor` that asks for the
+  rest. It is sent as a table op (`0x345`).
+- New `Actions.history` (`0x310`): a page of an action run's history, its
+  invoke, deliveries, failures and result, in the same `RunHistoryPage`. An
+  `action_settled` event carries the whole result, its `extra` the outcome
+  the worker named; a delivery's, retried failure's or hand-back's `extra` is
+  `"truncated"` when its `detail` is only the first 256 bytes.
+- A history read may be held up to 5 s while the run's history catches up.
+  `history_lost` and `history_missing` events mark a gap: events a repair
+  skipped or the log no longer holds, or not landed in time. A workflow run's
+  `workflow_output` event carries its whole output.
+- `ActionRunStatus.output` and `error_message` are their first 256 bytes;
+  new `output_truncated` and `error_truncated` say when more was cut. The
+  whole is in the run's history.
+- `WorkflowStatusResult` gains `output` and `output_truncated`. An ended
+  run's `input` comes back empty and its `output` is a 256-byte preview;
+  its history holds both whole. The status decoder now refuses bytes past
+  the output.
+- **Breaking:** `Reason` loses `too_many_actions` (33),
+  `too_many_workflow_definitions` (34) and `too_many_workflow_runs` (35);
+  nothing renumbers. A register or create past memory is `error.Limit` with
+  reason `memory_budget`, like any other write.
+- The server refuses a workflow or action name over 256 bytes at create,
+  start or register (`BadRequest`), and a definition calling an action named
+  over 256 bytes. A step whose call target is longer than an action name
+  fails.
+
 ## 0.1.0-dev.7 - 2026-11-24
 
 Works with flo v0.1.0-dev.21.

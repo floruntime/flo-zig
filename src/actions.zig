@@ -12,6 +12,7 @@ const types = @import("types.zig");
 const wire = @import("wire.zig");
 const Client = @import("client.zig").Client;
 const Reader = @import("kv.zig").Reader;
+const run_history = @import("run_history.zig");
 
 const FloError = types.FloError;
 
@@ -120,6 +121,16 @@ pub const Actions = struct {
         }
 
         return parseActionRunStatus(self.client.allocator, run_id, response.data);
+    }
+
+    /// A page of an action run's history: its invoke, deliveries, failures
+    /// and result, in order (newest first with `options.newest_first`).
+    /// While the page's `has_more` is set, ask again with its `cursor`. The
+    /// read may be held up to 5 s while the run's history catches up. A run
+    /// the server doesn't know is `FloError.NotFound`.
+    /// **Caller owns the returned page and must call `page.deinit()`.**
+    pub fn history(self: *Self, run_id: []const u8, options: types.RunHistoryOptions) FloError!types.RunHistoryPage {
+        return run_history.read(self.client, self.client.allocator, .action_history, run_id, options);
     }
 
     /// A page of the namespace's registered action names. Pass the page's
@@ -830,7 +841,7 @@ fn decodeWorkerInfoAnswer(allocator: std.mem.Allocator, data: []const u8) FloErr
 /// [completed_at:?i64][attempt:u32][output:?(u16 len, bytes)]
 /// [error_message:?(u16 len, bytes)][worker_id:?(u16 len, bytes)]
 /// [outcome:?(u16 len, bytes)][held:?(u8 len, bytes)], each optional behind
-/// a presence byte.
+/// a presence byte, then [output_truncated:bool][error_truncated:bool].
 fn parseActionRunStatus(allocator: std.mem.Allocator, run_id: []const u8, data: []const u8) FloError!types.ActionRunStatus {
     var r: Reader = .{ .data = data };
     const status = std.meta.intToEnum(types.RunStatus, try r.int(u8)) catch return FloError.IncompleteResponse;
@@ -846,6 +857,8 @@ fn parseActionRunStatus(allocator: std.mem.Allocator, run_id: []const u8, data: 
     if (outcome) |o| if (o.len > types.MAX_ACTION_NAME) return FloError.IncompleteResponse;
     const held = if (try r.boolean()) try r.lenBytes(u8) else null;
     if (held) |h| if (h.len > types.MAX_HELD_NOTE) return FloError.IncompleteResponse;
+    const output_truncated = try r.boolean();
+    const error_truncated = try r.boolean();
     try r.end();
 
     const run_id_copy = allocator.dupe(u8, run_id) catch return FloError.OutOfMemory;
@@ -871,6 +884,8 @@ fn parseActionRunStatus(allocator: std.mem.Allocator, run_id: []const u8, data: 
         .worker_id = worker_copy,
         .outcome = outcome_copy,
         .held = held_copy,
+        .output_truncated = output_truncated,
+        .error_truncated = error_truncated,
         .allocator = allocator,
     };
 }
@@ -1135,7 +1150,8 @@ const completed_status_answer = "\x02" ++ // completed
     "\x00" ++ // no error
     "\x01\x02\x00w1" ++ // worker "w1"
     "\x01\x08\x00approved" ++ // outcome "approved"
-    "\x00"; // not held
+    "\x00" ++ // not held
+    "\x00\x00"; // output and error whole
 
 test "a completed run's status carries its times, attempt and output" {
     var st = try parseActionRunStatus(std.testing.allocator, "run-1", completed_status_answer);
@@ -1151,6 +1167,28 @@ test "a completed run's status carries its times, attempt and output" {
     try std.testing.expectEqualStrings("w1", st.worker_id.?);
     try std.testing.expectEqualStrings("approved", st.outcome.?);
     try std.testing.expectEqual(@as(?[]const u8, null), st.held);
+    try std.testing.expect(!st.output_truncated and !st.error_truncated);
+}
+
+test "a status whose output or error is a preview says which was cut" {
+    // A completed run whose output is its first 256 bytes; then a failed one
+    // whose error is.
+    const preview = "o" ** 256;
+    const cut_output = "\x02" ++ "\x64\x00\x00\x00\x00\x00\x00\x00" ++ "\x00\x00" ++ "\x01\x00\x00\x00" ++
+        "\x01\x00\x01" ++ preview ++ "\x00" ++ "\x00" ++ "\x00" ++ "\x00" ++ "\x01\x00";
+    var st = try parseActionRunStatus(std.testing.allocator, "run-1", cut_output);
+    defer st.deinit();
+    try std.testing.expectEqualStrings(preview, st.output.?);
+    try std.testing.expect(st.output_truncated and !st.error_truncated);
+
+    const cut_error = "\x03" ++ "\x64\x00\x00\x00\x00\x00\x00\x00" ++ "\x00\x00" ++ "\x03\x00\x00\x00" ++
+        "\x00" ++ "\x01\x04\x00boom" ++ "\x00" ++ "\x00" ++ "\x00" ++ "\x00\x01";
+    var failed = try parseActionRunStatus(std.testing.allocator, "run-1", cut_error);
+    defer failed.deinit();
+    try std.testing.expect(!failed.output_truncated and failed.error_truncated);
+    // A flag that isn't 0 or 1, or an answer that stops before the flags.
+    try std.testing.expectError(FloError.IncompleteResponse, parseActionRunStatus(std.testing.allocator, "run-1", cut_error[0 .. cut_error.len - 1] ++ "\x02"));
+    try std.testing.expectError(FloError.IncompleteResponse, parseActionRunStatus(std.testing.allocator, "run-1", cut_error[0 .. cut_error.len - 2]));
 }
 
 test "a pending run's status names no worker" {
@@ -1161,7 +1199,8 @@ test "a pending run's status names no worker" {
         "\x00\x00" ++ // no output, no error
         "\x00" ++ // no worker
         "\x00" ++ // no outcome
-        "\x00"; // not held
+        "\x00" ++ // not held
+        "\x00\x00"; // nothing cut
     var st = try parseActionRunStatus(std.testing.allocator, "run-1", answer);
     defer st.deinit();
     try std.testing.expectEqual(types.RunStatus.pending, st.status);
@@ -1178,7 +1217,8 @@ test "a run whose past-due lease waits to end says why it's held" {
         "\x00\x00" ++ // no output, no error
         "\x01\x02\x00w1" ++ // held by "w1"
         "\x00" ++ // no outcome
-        "\x01\x04wait"; // held: "wait"
+        "\x01\x04wait" ++ // held: "wait"
+        "\x00\x00"; // nothing cut
     var st = try parseActionRunStatus(std.testing.allocator, "run-1", answer);
     defer st.deinit();
     try std.testing.expectEqual(types.RunStatus.running, st.status);
@@ -1186,7 +1226,7 @@ test "a run whose past-due lease waits to end says why it's held" {
     for (0..answer.len) |n| try std.testing.expectError(FloError.IncompleteResponse, parseStatusAndFree(std.testing.allocator, answer[0..n]));
     try std.testing.checkAllAllocationFailures(std.testing.allocator, parseStatusAndFree, .{@as([]const u8, answer)});
     // A note past the server's bound.
-    const long = answer[0 .. answer.len - 6] ++ "\x01\x81" ++ "x" ** 129;
+    const long = answer[0 .. answer.len - 8] ++ "\x01\x81" ++ "x" ** 129 ++ "\x00\x00";
     try std.testing.expectError(FloError.IncompleteResponse, parseActionRunStatus(std.testing.allocator, "run-1", long));
 }
 
@@ -1205,7 +1245,8 @@ test "a failed run's status carries its error and no output" {
         "\x01\x04\x00boom" ++ // error "boom"
         "\x01\x02\x00w1" ++ // last held by "w1"
         "\x00" ++ // no outcome
-        "\x00"; // not held
+        "\x00" ++ // not held
+        "\x00\x00"; // nothing cut
     var st = try parseActionRunStatus(std.testing.allocator, "run-1", answer);
     defer st.deinit();
     try std.testing.expectEqual(types.RunStatus.failed, st.status);
@@ -1563,10 +1604,10 @@ test "a registration carries every process, metadata and machine id; the server 
     try std.testing.expectEqual(@as(usize, 7 + 1025 * 4 + 2), many.len);
 }
 
-test "a node at its action limit refuses a registration with Limit and its reason, never retried" {
+test "a node out of memory refuses a registration with Limit and its reason, never retried" {
     var srv = try test_server.OkServer.listen();
-    // limit (15), reason too_many_actions (33), ran no.
-    srv.replies = &.{.{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions, the most it registers; delete one to register another" }};
+    // limit (15), reason memory_budget (32), ran no.
+    srv.replies = &.{.{ .status = 15, .body = "\x20\x00\x00shard 0 memory: 900 + 200 would pass its share 1000, the most it registers; delete one to register another" }};
     try srv.start();
     defer srv.deinit();
 
@@ -1580,8 +1621,8 @@ test "a node at its action limit refuses a registration with Limit and its reaso
     try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
     const last = client.lastError().?;
     try std.testing.expectEqual(@as(u8, 15), last.code);
-    try std.testing.expectEqual(types.Reason.too_many_actions, last.reason);
+    try std.testing.expectEqual(types.Reason.memory_budget, last.reason);
     try std.testing.expectEqual(types.Ran.no, last.ran);
-    try std.testing.expect(std.mem.startsWith(u8, last.message, "limit: this node holds 10000 actions"));
+    try std.testing.expect(std.mem.startsWith(u8, last.message, "shard 0 memory:"));
     try std.testing.expect(!client.refusedUnrun(FloError.Limit));
 }

@@ -22,14 +22,16 @@
 //! defer allocator.free(run_id);
 //!
 //! // Get status
-//! const status = try workflow.status(run_id, .{});
-//! defer allocator.free(status);
+//! const status = try workflow.status(allocator, run_id, .{});
+//! defer status.deinit(allocator);
 //! ```
 
 const std = @import("std");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
 const Client = @import("client.zig").Client;
+const Reader = @import("kv.zig").Reader;
+const run_history = @import("run_history.zig");
 
 const FloError = types.FloError;
 const Allocator = std.mem.Allocator;
@@ -38,108 +40,57 @@ const status_names = [_][]const u8{
     "pending", "running", "waiting", "completed", "failed", "cancelled", "timed_out",
 };
 
+/// workflow.status' answer:
+///   [run_id_len:u16][run_id][workflow_len:u16][workflow][version_len:u16][version]
+///   [status:u8][current_step_len:u16][current_step][input_len:u32][input]
+///   [created_at:i64][started_at:?i64][completed_at:?i64][wait_signal:?(u16 len, bytes)]
+///   [output:?([output_len:u32][output][output_truncated:bool])]
+/// each optional behind a presence byte. Bytes past the output are refused.
 fn parseWorkflowStatus(allocator: Allocator, data: []const u8) !types.WorkflowStatusResult {
-    var pos: usize = 0;
+    var r: Reader = .{ .data = data };
+    const run_id = try r.lenBytes(u16);
+    const workflow = try r.lenBytes(u16);
+    const version = try r.lenBytes(u16);
+    const status_byte = try r.int(u8);
+    const current_step = try r.lenBytes(u16);
+    const input = try r.lenBytes(u32);
+    const created_at = try r.int(i64);
+    const started_at = try r.opt(i64);
+    const completed_at = try r.opt(i64);
+    const wait_signal = if (try r.boolean()) try r.lenBytes(u16) else null;
+    const output = if (try r.boolean()) try r.lenBytes(u32) else null;
+    const output_truncated = if (output != null) try r.boolean() else false;
+    try r.end();
 
-    // Read run_id
-    if (pos + 2 > data.len) return error.UnexpectedEndOfData;
-    const run_id_len = std.mem.readInt(u16, data[pos..][0..2], .little);
-    pos += 2;
-    if (pos + run_id_len > data.len) return error.UnexpectedEndOfData;
-    const parsed_run_id = try allocator.dupe(u8, data[pos .. pos + run_id_len]);
-    errdefer allocator.free(parsed_run_id);
-    pos += run_id_len;
-
-    // Read workflow
-    if (pos + 2 > data.len) return error.UnexpectedEndOfData;
-    const workflow_len = std.mem.readInt(u16, data[pos..][0..2], .little);
-    pos += 2;
-    if (pos + workflow_len > data.len) return error.UnexpectedEndOfData;
-    const workflow = try allocator.dupe(u8, data[pos .. pos + workflow_len]);
-    errdefer allocator.free(workflow);
-    pos += workflow_len;
-
-    // Read version
-    if (pos + 2 > data.len) return error.UnexpectedEndOfData;
-    const version_len = std.mem.readInt(u16, data[pos..][0..2], .little);
-    pos += 2;
-    if (pos + version_len > data.len) return error.UnexpectedEndOfData;
-    const version = try allocator.dupe(u8, data[pos .. pos + version_len]);
-    errdefer allocator.free(version);
-    pos += version_len;
-
-    // Read status byte
-    if (pos >= data.len) return error.UnexpectedEndOfData;
-    const status_byte = data[pos];
-    pos += 1;
     const status_str = if (status_byte < status_names.len) status_names[status_byte] else "unknown";
-    const status_owned = try allocator.dupe(u8, status_str);
-    errdefer allocator.free(status_owned);
-
-    // Read current_step
-    if (pos + 2 > data.len) return error.UnexpectedEndOfData;
-    const step_len = std.mem.readInt(u16, data[pos..][0..2], .little);
-    pos += 2;
-    if (pos + step_len > data.len) return error.UnexpectedEndOfData;
-    const current_step = try allocator.dupe(u8, data[pos .. pos + step_len]);
-    errdefer allocator.free(current_step);
-    pos += step_len;
-
-    // Read input (u32 length)
-    if (pos + 4 > data.len) return error.UnexpectedEndOfData;
-    const input_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-    pos += 4;
-    if (pos + input_len > data.len) return error.UnexpectedEndOfData;
-    const input = try allocator.dupe(u8, data[pos .. pos + input_len]);
-    errdefer allocator.free(input);
-    pos += input_len;
-
-    // Read created_at (i64)
-    if (pos + 8 > data.len) return error.UnexpectedEndOfData;
-    const created_at = std.mem.readInt(i64, data[pos..][0..8], .little);
-    pos += 8;
-
-    var result = types.WorkflowStatusResult{
-        .run_id = parsed_run_id,
-        .workflow = workflow,
-        .version = version,
-        .status = status_owned,
-        .current_step = current_step,
-        .input = input,
+    const run_id_copy = try allocator.dupe(u8, run_id);
+    errdefer allocator.free(run_id_copy);
+    const workflow_copy = try allocator.dupe(u8, workflow);
+    errdefer allocator.free(workflow_copy);
+    const version_copy = try allocator.dupe(u8, version);
+    errdefer allocator.free(version_copy);
+    const status_copy = try allocator.dupe(u8, status_str);
+    errdefer allocator.free(status_copy);
+    const step_copy = try allocator.dupe(u8, current_step);
+    errdefer allocator.free(step_copy);
+    const input_copy = try allocator.dupe(u8, input);
+    errdefer allocator.free(input_copy);
+    const signal_copy = if (wait_signal) |w| try allocator.dupe(u8, w) else null;
+    errdefer if (signal_copy) |w| allocator.free(w);
+    return .{
+        .run_id = run_id_copy,
+        .workflow = workflow_copy,
+        .version = version_copy,
+        .status = status_copy,
+        .current_step = step_copy,
+        .input = input_copy,
         .created_at = created_at,
+        .started_at = started_at,
+        .completed_at = completed_at,
+        .wait_signal = signal_copy,
+        .output = if (output) |o| try allocator.dupe(u8, o) else null,
+        .output_truncated = output_truncated,
     };
-
-    // Optional: started_at
-    if (pos < data.len and data[pos] == 1) {
-        pos += 1;
-        if (pos + 8 > data.len) return error.UnexpectedEndOfData;
-        result.started_at = std.mem.readInt(i64, data[pos..][0..8], .little);
-        pos += 8;
-    } else if (pos < data.len) {
-        pos += 1;
-    }
-
-    // Optional: completed_at
-    if (pos < data.len and data[pos] == 1) {
-        pos += 1;
-        if (pos + 8 > data.len) return error.UnexpectedEndOfData;
-        result.completed_at = std.mem.readInt(i64, data[pos..][0..8], .little);
-        pos += 8;
-    } else if (pos < data.len) {
-        pos += 1;
-    }
-
-    // Optional: wait_signal
-    if (pos < data.len and data[pos] == 1) {
-        pos += 1;
-        if (pos + 2 > data.len) return error.UnexpectedEndOfData;
-        const ws_len = std.mem.readInt(u16, data[pos..][0..2], .little);
-        pos += 2;
-        if (pos + ws_len > data.len) return error.UnexpectedEndOfData;
-        result.wait_signal = try allocator.dupe(u8, data[pos .. pos + ws_len]);
-    }
-
-    return result;
 }
 
 /// Workflow operations for the Flo client.
@@ -157,8 +108,9 @@ pub const Workflow = struct {
     // =========================================================================
 
     /// Create (or replace) a workflow from a YAML definition. The server
-    /// refuses a definition whose `version` is over 256 bytes
-    /// (`FloError.BadRequest`).
+    /// refuses a definition whose name or `version` is over 256 bytes, or
+    /// one calling an action named over 256 bytes (`FloError.BadRequest`);
+    /// a step whose call target is longer than an action name fails.
     pub fn create(
         self: *Self,
         name: []const u8,
@@ -213,7 +165,8 @@ pub const Workflow = struct {
         return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
     }
 
-    /// Start a workflow run. Returns the run ID (caller owns the slice).
+    /// Start a workflow run. Returns the run ID (caller owns the slice). A
+    /// workflow name over 256 bytes is refused (`FloError.BadRequest`).
     pub fn start(
         self: *Self,
         allocator: Allocator,
@@ -286,7 +239,10 @@ pub const Workflow = struct {
         return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
     }
 
-    /// Get the status of a workflow run. Returns parsed status result (caller owns, call deinit).
+    /// Get the status of a workflow run. An ended run's input comes back
+    /// empty and its output is a 256-byte preview (`output_truncated` says
+    /// when more was cut): the full output is the run's `workflow_output`
+    /// history event. Returns parsed status result (caller owns, call deinit).
     pub fn status(
         self: *Self,
         allocator: Allocator,
@@ -373,33 +329,20 @@ pub const Workflow = struct {
         }
     }
 
-    /// Get the execution history of a workflow run.
-    /// Returns raw response bytes (caller owns).
+    /// A page of a workflow run's history: what happened to it, in order
+    /// (newest first with `options.newest_first`). While the page's
+    /// `has_more` is set, ask again with its `cursor`. A `workflow_output`
+    /// event carries the run's whole output. The read may be held up to 5 s
+    /// while the run's history catches up. A run the server doesn't know is
+    /// `FloError.NotFound`.
+    /// Caller owns the result; call deinit() when done.
     pub fn history(
         self: *Self,
         allocator: Allocator,
         run_id: []const u8,
-        options: types.WorkflowHistoryOptions,
-    ) FloError![]u8 {
-        const ns = self.client.getNamespace(options.namespace);
-
-        var value_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &value_buf, options.limit, .little);
-
-        var response = try self.client.sendRequest(
-            .workflow_history,
-            ns,
-            run_id,
-            &value_buf,
-            "",
-        );
-        defer response.deinit();
-
-        if (response.status != .ok) {
-            return response.status.toError();
-        }
-
-        return allocator.dupe(u8, response.data) catch return FloError.OutOfMemory;
+        options: types.RunHistoryOptions,
+    ) FloError!types.RunHistoryPage {
+        return run_history.read(self.client, allocator, .workflow_history, run_id, options);
     }
 
     /// List one page of workflow runs, newest first: one workflow's, or
@@ -756,9 +699,10 @@ fn answerError(err: anyerror) FloError {
 }
 
 test "status short of memory says so, not that the answer is bad" {
-    // run_id "r", workflow "", version "", status pending, step "", input "", created_at 0.
+    // run_id "r", workflow "", version "", status pending, step "", input "", created_at 0;
+    // not started or completed, no signal wait, no output.
     const answer = "\x01\x00r" ++ "\x00\x00" ++ "\x00\x00" ++ "\x00" ++ "\x00\x00" ++
-        "\x00\x00\x00\x00" ++ "\x00\x00\x00\x00\x00\x00\x00\x00";
+        "\x00\x00\x00\x00" ++ "\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x00\x00\x00\x00";
     var srv = try @import("test_server.zig").OkServer.listen();
     srv.body = answer;
     try srv.start();
@@ -921,4 +865,60 @@ test "listRuns sends every field, empty ones as length 0, and pages on past a sh
     try std.testing.expectEqual(@as(usize, 0), last.runs.len);
     try std.testing.expect(!last.has_more);
     try std.testing.expect(last.cursor == null);
+}
+
+/// An ended run's status: "r" of "wf" v"1", completed at step "done", input
+/// empty, created 5, started 5, completed 9, no signal wait, output "{}"
+/// whole.
+const ended_status = "\x01\x00r" ++ "\x02\x00wf" ++ "\x01\x001" ++ "\x03" ++ "\x04\x00done" ++
+    "\x00\x00\x00\x00" ++ "\x05\x00\x00\x00\x00\x00\x00\x00" ++
+    "\x01\x05\x00\x00\x00\x00\x00\x00\x00" ++ "\x01\x09\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ++
+    "\x01\x02\x00\x00\x00{}" ++ "\x00";
+
+test "an ended run's status carries its output and whether it was cut" {
+    const a = std.testing.allocator;
+    const st = try parseWorkflowStatus(a, ended_status);
+    defer st.deinit(a);
+    try std.testing.expectEqualStrings("r", st.run_id);
+    try std.testing.expectEqualStrings("completed", st.status);
+    try std.testing.expectEqualStrings("done", st.current_step);
+    try std.testing.expectEqualStrings("", st.input);
+    try std.testing.expectEqual(@as(?i64, 9), st.completed_at);
+    try std.testing.expectEqual(@as(?[]const u8, null), st.wait_signal);
+    try std.testing.expectEqualStrings("{}", st.output.?);
+    try std.testing.expect(!st.output_truncated);
+
+    const cut = try parseWorkflowStatus(a, ended_status[0 .. ended_status.len - 1] ++ "\x01");
+    defer cut.deinit(a);
+    try std.testing.expect(cut.output_truncated);
+}
+
+test "a waiting run's status names its signal and has no output" {
+    const a = std.testing.allocator;
+    const answer = "\x01\x00r" ++ "\x02\x00wf" ++ "\x01\x001" ++ "\x02" ++ "\x05\x00start" ++
+        "\x02\x00\x00\x00{}" ++ "\x05\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x01\x05\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ++ "\x01\x02\x00go" ++ "\x00";
+    const st = try parseWorkflowStatus(a, answer);
+    defer st.deinit(a);
+    try std.testing.expectEqualStrings("waiting", st.status);
+    try std.testing.expectEqualStrings("{}", st.input);
+    try std.testing.expectEqualStrings("go", st.wait_signal.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), st.output);
+    try std.testing.expect(!st.output_truncated);
+    // Nothing follows an absent output.
+    try std.testing.expectError(error.IncompleteResponse, parseWorkflowStatus(a, answer ++ "\x00"));
+}
+
+fn parseStatusAndFree(a: Allocator, data: []const u8) !void {
+    const st = try parseWorkflowStatus(a, data);
+    st.deinit(a);
+}
+
+test "a workflow status answer cut anywhere, overlong, or short of memory leaks nothing" {
+    const a = std.testing.allocator;
+    for (0..ended_status.len) |n| try std.testing.expect(std.meta.isError(parseStatusAndFree(a, ended_status[0..n])));
+    try std.testing.expectError(error.IncompleteResponse, parseStatusAndFree(a, ended_status ++ "\x00"));
+    // A truncated flag that isn't 0 or 1.
+    try std.testing.expectError(error.IncompleteResponse, parseStatusAndFree(a, ended_status[0 .. ended_status.len - 1] ++ "\x02"));
+    try std.testing.checkAllAllocationFailures(a, parseStatusAndFree, .{@as([]const u8, ended_status)});
 }

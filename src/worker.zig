@@ -2262,8 +2262,8 @@ test "ActionWorker backs off an await refused at a limit, logging it once, witho
 
 test "ActionWorker start fails with the limit error after one registration, awaiting nothing" {
     var srv = try ScriptServer.listen();
-    // limit, reason too_many_actions, ran no.
-    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions" } } }};
+    // limit, reason memory_budget, ran no.
+    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 15, .body = "\x20\x00\x00shard 0 memory: 900 + 200 would pass its share 1000" } } }};
     try srv.start();
     defer srv.deinit();
 
@@ -2278,13 +2278,13 @@ test "ActionWorker start fails with the limit error after one registration, awai
     try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
     try std.testing.expectEqual(@as(u32, 0), srv.countOf(.action_await));
     const last = w.client.lastError().?;
-    try std.testing.expectEqual(types.Reason.too_many_actions, last.reason);
-    try std.testing.expectEqualStrings("limit: this node holds 10000 actions", last.message);
+    try std.testing.expectEqual(types.Reason.memory_budget, last.reason);
+    try std.testing.expectEqualStrings("shard 0 memory: 900 + 200 would pass its share 1000", last.message);
 }
 
-test "ActionWorker.registerAction refused at the action limit returns the limit error after one request, keeping no handler" {
+test "ActionWorker.registerAction refused at the memory limit returns the limit error after one request, keeping no handler" {
     var srv = try ScriptServer.listen();
-    srv.rules = &.{.{ .op = .action_register, .action = .{ .reply = .{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions" } } }};
+    srv.rules = &.{.{ .op = .action_register, .action = .{ .reply = .{ .status = 15, .body = "\x20\x00\x00shard 0 memory: 900 + 200 would pass its share 1000" } } }};
     try srv.start();
     defer srv.deinit();
 
@@ -2292,7 +2292,7 @@ test "ActionWorker.registerAction refused at the action limit returns the limit 
     defer w.deinit();
     try std.testing.expectError(FloError.Limit, w.registerAction("job", test_handlers.ok, .{}));
     try std.testing.expectEqual(@as(u32, 1), srv.countOf(.action_register));
-    try std.testing.expectEqual(types.Reason.too_many_actions, w.client.lastError().?.reason);
+    try std.testing.expectEqual(types.Reason.memory_budget, w.client.lastError().?.reason);
     try std.testing.expect(!w.handlers.contains("job"));
 }
 

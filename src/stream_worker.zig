@@ -1650,8 +1650,8 @@ test "StreamWorker acks each record naming the read's lease, the record and its 
 
 test "StreamWorker backs off a group read refused at a limit, logging it once, and the client never retries it" {
     const ScriptServer = @import("test_server.zig").ScriptServer;
-    // limit, reason too_many_actions, ran no.
-    const limit: @import("test_server.zig").Reply = .{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions" };
+    // limit, reason memory_budget, ran no.
+    const limit: @import("test_server.zig").Reply = .{ .status = 15, .body = "\x20\x00\x00shard 0 memory: 900 + 200 would pass its share 1000" };
     var srv = try ScriptServer.listen();
     srv.rules = &.{.{ .op = .stream_group_read, .action = .{ .reply = limit } }};
     try srv.start();
@@ -1664,7 +1664,7 @@ test "StreamWorker backs off a group read refused at a limit, logging it once, a
     w.running = true;
     try std.testing.expectError(FloError.Limit, w.pollAndProcess("events"));
     try std.testing.expectEqual(@as(u32, 1), srv.countOf(.stream_group_read));
-    try std.testing.expectEqual(types.Reason.too_many_actions, w.client.lastError().?.reason);
+    try std.testing.expectEqual(types.Reason.memory_budget, w.client.lastError().?.reason);
 
     const thread = try std.Thread.spawn(.{}, runWorker, .{&w});
     std.Thread.sleep(700 * std.time.ns_per_ms);
@@ -1673,7 +1673,7 @@ test "StreamWorker backs off a group read refused at a limit, logging it once, a
     // Backing off from 100 ms, doubling: a handful of reads, not a spin.
     const reads = srv.countOf(.stream_group_read);
     try std.testing.expect(reads >= 2 and reads <= 8);
-    try std.testing.expect(w.limit_notice.logged(.too_many_actions));
+    try std.testing.expect(w.limit_notice.logged(.memory_budget));
 }
 
 test "a limit notice logs each reason once until cleared, even when reasons alternate" {
@@ -1684,17 +1684,19 @@ test "a limit notice logs each reason once until cleared, even when reasons alte
         }
     };
     var n: types.LimitNotice = .{};
-    var f: Fake = .{ .reason = .too_many_actions };
+    // A reason this SDK predates is a reason of its own.
+    const newer: types.Reason = @enumFromInt(39);
+    var f: Fake = .{ .reason = newer };
     for (0..3) |_| {
-        f.reason = .too_many_actions;
+        f.reason = newer;
         n.note(&f, "test");
         f.reason = .memory_budget;
         n.note(&f, "test");
     }
     try std.testing.expectEqual(@as(usize, 2), n.seen_len);
-    try std.testing.expect(n.logged(.too_many_actions) and n.logged(.memory_budget));
+    try std.testing.expect(n.logged(newer) and n.logged(.memory_budget));
     n.clear();
-    try std.testing.expect(!n.logged(.too_many_actions));
+    try std.testing.expect(!n.logged(newer));
 }
 
 test "StreamWorker touch intervals: a sixth of the lease, at least 100 ms; the lease read off the expiry within the server's bounds" {
@@ -1741,8 +1743,8 @@ test "StreamWorker with auto_touch touches a record on its own connection while 
 test "StreamWorker start fails with the limit error after one registration, reading nothing" {
     const ScriptServer = @import("test_server.zig").ScriptServer;
     var srv = try ScriptServer.listen();
-    // limit, reason too_many_actions, ran no.
-    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 15, .body = "\x21\x00\x00limit: this node holds 10000 actions" } } }};
+    // limit, reason memory_budget, ran no.
+    srv.rules = &.{.{ .op = .worker_register, .action = .{ .reply = .{ .status = 15, .body = "\x20\x00\x00shard 0 memory: 900 + 200 would pass its share 1000" } } }};
     try srv.start();
     defer srv.deinit();
 
@@ -1755,8 +1757,8 @@ test "StreamWorker start fails with the limit error after one registration, read
     try std.testing.expectError(FloError.Limit, halted_start_test.result);
     try std.testing.expectEqual(@as(u32, 1), srv.countOf(.worker_register));
     try std.testing.expectEqual(@as(u32, 0), srv.countOf(.stream_group_read));
-    try std.testing.expectEqual(types.Reason.too_many_actions, w.client.lastError().?.reason);
-    try std.testing.expectEqualStrings("limit: this node holds 10000 actions", w.client.lastError().?.message);
+    try std.testing.expectEqual(types.Reason.memory_budget, w.client.lastError().?.reason);
+    try std.testing.expectEqualStrings("shard 0 memory: 900 + 200 would pass its share 1000", w.client.lastError().?.message);
 }
 
 test "StreamWorker start fails with a terminal refusal of its registration after one request, reading nothing" {
